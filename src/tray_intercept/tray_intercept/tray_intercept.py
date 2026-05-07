@@ -94,6 +94,7 @@ class MiniSnapshot:
     tcp_values: dict[str, float] = field(default_factory=lambda: {name: 0.0 for name in TCP_FIELDS})
     tcp_stamp: float | None = None
     busy: bool = False
+    armed: bool = False
     action_text: str = 'Ready'
     tray_seq: int = 0
     has_last_tray: bool = False
@@ -326,6 +327,7 @@ class RelMovLMiniNode(Node):
                 tcp_values=dict(self._snapshot.tcp_values),
                 tcp_stamp=self._snapshot.tcp_stamp,
                 busy=self._snapshot.busy,
+                armed=self._tray_watch_armed,
                 action_text=self._snapshot.action_text,
                 tray_seq=self._tray_vector_seq,
                 has_last_tray=self._last_tray_target is not None,
@@ -1577,6 +1579,10 @@ class RelMovLMiniNode(Node):
         with self._lock:
             return bool(self._cancel_requested)
 
+    def is_manual_stop_inflight(self) -> bool:
+        with self._lock:
+            return bool(self._manual_stop_inflight)
+
     def request_manual_stop(self) -> bool:
         with self._lock:
             if self._manual_stop_inflight:
@@ -2440,6 +2446,21 @@ class RelMovLMiniGui:
             wraplength=260,
         ).grid(row=10, column=0, sticky='w', pady=(8, 0))
 
+        self._arm_locked_setting_controls = [
+            self.tray_watch_timeout_scale,
+            self.post_stop_x_offset_scale,
+            self.post_stop_y_offset_scale,
+            self.post_stop_z_offset_scale,
+            self.command_hysteresis_scale,
+            self.ee_final_pose_angle_scale,
+            self.follow_distance_scale,
+            self.post_follow_z_up_scale,
+            self.tray_preview_length_scale,
+            self.tray_preview_width_scale,
+            self.tray_preview_border_scale,
+            self.intercept_dot_diameter_scale,
+        ]
+
         self._register_runtime_setting_traces()
         self._load_runtime_settings()
         self.node.set_command_hysteresis_sec(float(self.command_hysteresis_var.get()))
@@ -2531,6 +2552,10 @@ class RelMovLMiniGui:
             return False
         else:
             self._set_stop_button_enabled(True)
+            self.run_button.configure(state=tk.DISABLED)
+            self._sync_tf_only_button(is_busy=True)
+            self._sync_release_grip_button(is_busy=True)
+            self._set_arm_locked_setting_controls_enabled(False)
             return True
 
     def _stop_clicked(self) -> None:
@@ -2555,6 +2580,18 @@ class RelMovLMiniGui:
     @staticmethod
     def _clamp(value: float, lower: float, upper: float) -> float:
         return max(lower, min(upper, float(value)))
+
+    def _is_ui_locked(self) -> bool:
+        snapshot = self.node.snapshot()
+        return bool(snapshot.armed or snapshot.busy or self.node.is_manual_stop_inflight())
+
+    def _set_arm_locked_setting_controls_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for control in self._arm_locked_setting_controls:
+            try:
+                control.configure(state=state)
+            except tk.TclError:
+                pass
 
     def _register_runtime_setting_traces(self) -> None:
         tracked_vars = [
@@ -2615,8 +2652,10 @@ class RelMovLMiniGui:
             float(self.tray_preview_length_var.get()),
             float(self.tray_preview_width_var.get()),
         )
-        self._sync_tf_only_button(is_busy=False)
-        self._sync_release_grip_button(is_busy=False)
+        ui_locked = self._is_ui_locked()
+        self._sync_tf_only_button(is_busy=ui_locked)
+        self._sync_release_grip_button(is_busy=ui_locked)
+        self._set_arm_locked_setting_controls_enabled(not ui_locked)
         self._draw_intercept_preview()
         self._schedule_runtime_settings_save()
 
@@ -2758,6 +2797,8 @@ class RelMovLMiniGui:
         result: tuple[float, float, bool, str, str] | None,
     ) -> None:
         self._fetch_tray_size_inflight = False
+        if self._is_ui_locked():
+            return
         if result is not None:
             x_size_mm, y_size_mm, _live_detection, _tray_name, _message = result
             clamped_x_size_mm = self._clamp(
@@ -2787,6 +2828,8 @@ class RelMovLMiniGui:
             )
 
     def _on_preview_canvas_clicked(self, event: tk.Event) -> None:
+        if self._is_ui_locked():
+            return
         transform = self._preview_canvas_transform
         if transform is None:
             return
@@ -2948,11 +2991,15 @@ class RelMovLMiniGui:
 
     def _refresh(self) -> None:
         snapshot = self.node.snapshot()
-        self._sync_tf_only_button(is_busy=bool(snapshot.busy))
-        self._sync_release_grip_button(is_busy=bool(snapshot.busy))
-        self._maybe_auto_fetch_tray_size()
+        stop_inflight = self.node.is_manual_stop_inflight()
+        ui_locked = bool(snapshot.armed or snapshot.busy or stop_inflight)
+        self._sync_tf_only_button(is_busy=ui_locked)
+        self._sync_release_grip_button(is_busy=ui_locked)
+        self._set_arm_locked_setting_controls_enabled(not ui_locked)
+        if not ui_locked:
+            self._maybe_auto_fetch_tray_size()
 
-        if bool(self.tf_only_var.get()) and not snapshot.busy and snapshot.has_last_tray:
+        if bool(self.tf_only_var.get()) and not ui_locked and snapshot.has_last_tray:
             preview_signature = (
                 snapshot.tray_seq,
                 round(float(self.ee_final_pose_angle_var.get()), 3),
@@ -2978,8 +3025,8 @@ class RelMovLMiniGui:
 
         self.action_var.set(snapshot.action_text)
         self._draw_intercept_preview()
-        self.run_button.configure(state=tk.DISABLED if snapshot.busy else tk.NORMAL)
-        self._set_stop_button_enabled(bool(snapshot.busy))
+        self.run_button.configure(state=tk.DISABLED if ui_locked else tk.NORMAL)
+        self._set_stop_button_enabled(bool(snapshot.busy) and not stop_inflight)
 
         if not self._closed:
             self.root.after(100, self._refresh)

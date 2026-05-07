@@ -228,6 +228,7 @@ class ItemPickSnapshot:
     tcp_values: dict[str, float] = field(default_factory=lambda: {name: 0.0 for name in TCP_FIELDS})
     tcp_stamp: float | None = None
     busy: bool = False
+    armed: bool = False
     action_text: str = 'Ready'
     item_pose_seq: int = 0
     has_last_item: bool = False
@@ -551,6 +552,7 @@ class ItemPickNode(Node):
                 tcp_values=dict(self._snapshot.tcp_values),
                 tcp_stamp=self._snapshot.tcp_stamp,
                 busy=self._snapshot.busy,
+                armed=self._item_pose_watch_armed,
                 action_text=self._snapshot.action_text,
                 item_pose_seq=self._item_pose_seq,
                 has_last_item=self._last_item_target is not None,
@@ -2897,7 +2899,7 @@ class ItemPickGui:
         tk.Label(tool_offset_frame, text='X').grid(row=1, column=0, sticky='w')
         tk.Label(tool_offset_frame, text='Y').grid(row=1, column=1, sticky='w')
         tk.Label(tool_offset_frame, text='Z').grid(row=1, column=2, sticky='w')
-        tk.Spinbox(
+        self.tool_offset_x_spinbox = tk.Spinbox(
             tool_offset_frame,
             from_=TOOL_OFFSET_TRANSLATION_MIN_MM,
             to=TOOL_OFFSET_TRANSLATION_MAX_MM,
@@ -2905,8 +2907,9 @@ class ItemPickGui:
             textvariable=self.tool_offset_x_var,
             width=9,
             format='%.1f',
-        ).grid(row=2, column=0, sticky='ew', padx=(0, 4))
-        tk.Spinbox(
+        )
+        self.tool_offset_x_spinbox.grid(row=2, column=0, sticky='ew', padx=(0, 4))
+        self.tool_offset_y_spinbox = tk.Spinbox(
             tool_offset_frame,
             from_=TOOL_OFFSET_TRANSLATION_MIN_MM,
             to=TOOL_OFFSET_TRANSLATION_MAX_MM,
@@ -2914,8 +2917,9 @@ class ItemPickGui:
             textvariable=self.tool_offset_y_var,
             width=9,
             format='%.1f',
-        ).grid(row=2, column=1, sticky='ew', padx=(0, 4))
-        tk.Spinbox(
+        )
+        self.tool_offset_y_spinbox.grid(row=2, column=1, sticky='ew', padx=(0, 4))
+        self.tool_offset_z_spinbox = tk.Spinbox(
             tool_offset_frame,
             from_=TOOL_OFFSET_TRANSLATION_MIN_MM,
             to=TOOL_OFFSET_TRANSLATION_MAX_MM,
@@ -2923,12 +2927,13 @@ class ItemPickGui:
             textvariable=self.tool_offset_z_var,
             width=9,
             format='%.1f',
-        ).grid(row=2, column=2, sticky='ew')
+        )
+        self.tool_offset_z_spinbox.grid(row=2, column=2, sticky='ew')
 
         tk.Label(tool_offset_frame, text='Rx').grid(row=3, column=0, sticky='w', pady=(8, 0))
         tk.Label(tool_offset_frame, text='Ry').grid(row=3, column=1, sticky='w', pady=(8, 0))
         tk.Label(tool_offset_frame, text='Rz').grid(row=3, column=2, sticky='w', pady=(8, 0))
-        tk.Spinbox(
+        self.tool_offset_rx_spinbox = tk.Spinbox(
             tool_offset_frame,
             from_=TOOL_OFFSET_ROTATION_MIN_DEG,
             to=TOOL_OFFSET_ROTATION_MAX_DEG,
@@ -2936,8 +2941,9 @@ class ItemPickGui:
             textvariable=self.tool_offset_rx_var,
             width=9,
             format='%.1f',
-        ).grid(row=4, column=0, sticky='ew', padx=(0, 4))
-        tk.Spinbox(
+        )
+        self.tool_offset_rx_spinbox.grid(row=4, column=0, sticky='ew', padx=(0, 4))
+        self.tool_offset_ry_spinbox = tk.Spinbox(
             tool_offset_frame,
             from_=TOOL_OFFSET_ROTATION_MIN_DEG,
             to=TOOL_OFFSET_ROTATION_MAX_DEG,
@@ -2945,8 +2951,9 @@ class ItemPickGui:
             textvariable=self.tool_offset_ry_var,
             width=9,
             format='%.1f',
-        ).grid(row=4, column=1, sticky='ew', padx=(0, 4))
-        tk.Spinbox(
+        )
+        self.tool_offset_ry_spinbox.grid(row=4, column=1, sticky='ew', padx=(0, 4))
+        self.tool_offset_rz_spinbox = tk.Spinbox(
             tool_offset_frame,
             from_=TOOL_OFFSET_ROTATION_MIN_DEG,
             to=TOOL_OFFSET_ROTATION_MAX_DEG,
@@ -2954,7 +2961,8 @@ class ItemPickGui:
             textvariable=self.tool_offset_rz_var,
             width=9,
             format='%.1f',
-        ).grid(row=4, column=2, sticky='ew')
+        )
+        self.tool_offset_rz_spinbox.grid(row=4, column=2, sticky='ew')
 
         tool_offset_button_frame = tk.Frame(tool_offset_frame)
         tool_offset_button_frame.grid(row=5, column=0, columnspan=3, sticky='ew', pady=(10, 0))
@@ -2992,6 +3000,20 @@ class ItemPickGui:
             justify=tk.LEFT,
             wraplength=430,
         ).grid(row=6, column=0, columnspan=3, sticky='ew', pady=(8, 0))
+
+        self._arm_locked_setting_controls = [
+            self.item_pose_watch_timeout_scale,
+            self.post_stop_z_offset_scale,
+            self.approach_z_up_scale,
+            self.final_z_up_scale,
+            self.settling_time_scale,
+            self.tool_offset_x_spinbox,
+            self.tool_offset_y_spinbox,
+            self.tool_offset_z_spinbox,
+            self.tool_offset_rx_spinbox,
+            self.tool_offset_ry_spinbox,
+            self.tool_offset_rz_spinbox,
+        ]
 
         self._register_runtime_setting_traces()
         self._load_runtime_settings()
@@ -3083,6 +3105,12 @@ class ItemPickGui:
             return False
         else:
             self._set_stop_button_enabled(True)
+            self.run_button.configure(state=tk.DISABLED)
+            self.release_button.configure(state=tk.DISABLED)
+            self.show_tool_tf_button.configure(state=tk.DISABLED)
+            self.save_tool_offset_button.configure(state=tk.DISABLED)
+            self._sync_tf_only_button(is_busy=True)
+            self._set_arm_locked_setting_controls_enabled(False)
             return True
 
     def _stop_clicked(self) -> None:
@@ -3395,7 +3423,10 @@ class ItemPickGui:
     def _on_runtime_setting_changed(self, *_args) -> None:
         if self._suspend_runtime_settings_events:
             return
-        self._sync_tf_only_button(is_busy=False)
+        snapshot = self.node.snapshot()
+        ui_locked = bool(snapshot.armed or snapshot.busy or self.node.is_manual_stop_inflight())
+        self._sync_tf_only_button(is_busy=ui_locked)
+        self._set_arm_locked_setting_controls_enabled(not ui_locked)
         self._update_profile_tool_offset_status()
         self._schedule_runtime_settings_save()
 
@@ -3490,29 +3521,39 @@ class ItemPickGui:
                 f'Failed to save item pick runtime settings at "{self._runtime_settings_path}": {exc}'
             )
 
+    def _set_arm_locked_setting_controls_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for control in self._arm_locked_setting_controls:
+            try:
+                control.configure(state=state)
+            except tk.TclError:
+                pass
+
     def _refresh(self) -> None:
-        self._sync_profile_tool_offsets_from_state()
         snapshot = self.node.snapshot()
         stop_inflight = self.node.is_manual_stop_inflight()
-        self._sync_tf_only_button(is_busy=bool(snapshot.busy) or stop_inflight)
         release_inflight = self.node.is_manual_release_inflight()
+        ui_locked = bool(snapshot.armed or snapshot.busy or stop_inflight)
+        if not ui_locked:
+            self._sync_profile_tool_offsets_from_state()
+        self._sync_tf_only_button(is_busy=ui_locked)
+        self._set_arm_locked_setting_controls_enabled(not ui_locked)
         can_arm = self._can_arm_sequence()
         can_save_tool_offset = (
             self._active_item_profile_key is not None
-            and not snapshot.busy
-            and not stop_inflight
+            and not ui_locked
         )
 
         self.action_var.set(snapshot.action_text)
         self.run_button.configure(
-            state=tk.NORMAL if (not snapshot.busy and not stop_inflight and can_arm) else tk.DISABLED
+            state=tk.NORMAL if (not ui_locked and can_arm) else tk.DISABLED
         )
         self._set_stop_button_enabled(bool(snapshot.busy) and not stop_inflight)
         self.release_button.configure(
-            state=tk.DISABLED if (snapshot.busy or stop_inflight or release_inflight) else tk.NORMAL
+            state=tk.DISABLED if (ui_locked or release_inflight) else tk.NORMAL
         )
         self.show_tool_tf_button.configure(
-            state=tk.DISABLED if (snapshot.busy or stop_inflight) else tk.NORMAL
+            state=tk.DISABLED if ui_locked else tk.NORMAL
         )
         self.save_tool_offset_button.configure(
             state=tk.NORMAL if can_save_tool_offset else tk.DISABLED
