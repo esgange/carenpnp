@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -83,10 +84,14 @@ private:
     const rclcpp::Time & stamp,
     const std::string & frame_id,
     const std::unordered_map<VoxelKey, VoxelAccumulator, VoxelKeyHash> & voxels);
+  void cameraStatusCallback();
 
   image_geometry::PinholeCameraModel cam_model_;
 
   const std::string output_frame_{"calibrated_camera_link"};
+  std::string color_topic_;
+  std::string depth_topic_;
+  std::string camera_info_topic_;
   double voxel_size_{0.05};
   double min_range_{0.15};
   double max_range_{2.5};
@@ -111,6 +116,8 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::TimerBase::SharedPtr camera_status_timer_;
+  std::chrono::steady_clock::time_point last_camera_frame_time_;
 };
 
 }  // namespace obstacle_perception

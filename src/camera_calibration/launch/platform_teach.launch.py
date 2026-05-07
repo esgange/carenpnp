@@ -1,0 +1,114 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    platform_name = LaunchConfiguration("platform_name")
+    base_frame = LaunchConfiguration("base_frame")
+    camera_frame = LaunchConfiguration("camera_frame")
+    observed_board_frame = LaunchConfiguration("observed_board_frame")
+    color_topic = LaunchConfiguration("color_topic")
+    depth_topic = LaunchConfiguration("depth_topic")
+    camera_info_topic = LaunchConfiguration("camera_info_topic")
+    overlay_topic = LaunchConfiguration("overlay_topic")
+    use_aruco_overlay = LaunchConfiguration("use_aruco_overlay")
+    calibration_parent_frame = LaunchConfiguration("calibration_parent_frame")
+    calibration_child_frame = LaunchConfiguration("calibration_child_frame")
+    calibration_dir = LaunchConfiguration("calibration_dir")
+    calibration_file = LaunchConfiguration("calibration_file")
+    platform_calibration_dir = LaunchConfiguration("platform_calibration_dir")
+    platform_calibration_file = LaunchConfiguration("platform_calibration_file")
+    marker_prefix = LaunchConfiguration("marker_prefix")
+    lookup_timeout = LaunchConfiguration("lookup_timeout")
+    max_observed_age_sec = LaunchConfiguration("max_observed_age_sec")
+
+    aruco_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                get_package_share_directory("aruco_perception"),
+                "launch",
+                "aruco_perception.launch.py",
+            )
+        ),
+        launch_arguments={
+            "use_calibration": "true",
+            "parent_frame": calibration_parent_frame,
+            "child_frame": calibration_child_frame,
+            "calibration_dir": calibration_dir,
+            "calibration_file": calibration_file,
+            "show_overlay_window": "false",
+            "publish_overlay": "true",
+            "overlay_rate_hz": "10.0",
+            "color_topic": color_topic,
+            "depth_topic": depth_topic,
+            "camera_info_topic": camera_info_topic,
+        }.items(),
+    )
+
+    calibration_tf = Node(
+        package="camera_calibration",
+        executable="calibration_perception",
+        name="platform_board_perception",
+        output="screen",
+        parameters=[{
+            "marker_prefix": marker_prefix,
+            "marker_ids": [1, 2, 3, 4],
+            "parent_frame": calibration_child_frame,
+            "output_frame": observed_board_frame,
+            "publish_rate": 20.0,
+            "lookup_timeout": lookup_timeout,
+        }],
+    )
+
+    platform_teach = Node(
+        package="camera_calibration",
+        executable="platform_teach",
+        name="platform_teach",
+        output="screen",
+        parameters=[{
+            "platform_name": platform_name,
+            "base_frame": base_frame,
+            "camera_frame": camera_frame,
+            "observed_board_frame": observed_board_frame,
+            "marker_prefix": marker_prefix,
+            "marker_ids": [1, 2, 3, 4],
+            "color_topic": color_topic,
+            "overlay_topic": overlay_topic,
+            "use_aruco_overlay": use_aruco_overlay,
+            "platform_calibration_dir": platform_calibration_dir,
+            "platform_calibration_file": platform_calibration_file,
+            "lookup_timeout": lookup_timeout,
+            "max_observed_age_sec": max_observed_age_sec,
+            "delete_existing_on_save": True,
+        }],
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument("platform_name", default_value="robot_platform_1"),
+        DeclareLaunchArgument("base_frame", default_value="base_link"),
+        DeclareLaunchArgument("camera_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("observed_board_frame", default_value="platform_board_observed"),
+        DeclareLaunchArgument("color_topic", default_value="/camera/color/image_raw"),
+        DeclareLaunchArgument("depth_topic", default_value="/camera/depth/image_raw"),
+        DeclareLaunchArgument("camera_info_topic", default_value="/camera/color/camera_info"),
+        DeclareLaunchArgument("overlay_topic", default_value="/aruco_overlay"),
+        DeclareLaunchArgument("use_aruco_overlay", default_value="true"),
+        DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
+        DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("calibration_dir", default_value="~/DOBOT_pickn_place/calibration"),
+        DeclareLaunchArgument("calibration_file", default_value=""),
+        DeclareLaunchArgument("platform_calibration_dir", default_value="~/DOBOT_pickn_place/config/platform"),
+        DeclareLaunchArgument("platform_calibration_file", default_value=""),
+        DeclareLaunchArgument("marker_prefix", default_value="aruco_marker"),
+        DeclareLaunchArgument("lookup_timeout", default_value="0.15"),
+        DeclareLaunchArgument("max_observed_age_sec", default_value="0.75"),
+        aruco_launch,
+        calibration_tf,
+        platform_teach,
+    ])

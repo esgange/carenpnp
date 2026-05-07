@@ -4,7 +4,6 @@
      For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
 <robot
   name="cr10_robot">
-  <link name="dummy_link"/>
   <link
     name="base_link">
     <inertial>
@@ -45,10 +44,6 @@
       </geometry>
     </collision>
   </link>
-     <joint name="dummy_joint" type="fixed">
-      <parent link="dummy_link" />
-      <child  link="base_link" />
-    </joint>
   <link
     name="Link1">
     <inertial>

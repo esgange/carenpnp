@@ -40,7 +40,7 @@ int main(int argc, char *argv[])
 //    joint_state_msg.name.push_back(std::string("joint") + std::to_string(i + 1));
 //  }
 
-  double rate_value = robot->declare_parameter<double>("JointStatePublishRate", 10.0);
+  double rate_value = robot->declare_parameter<double>("JointStatePublishRate", 100.0);
 
   robot->init();
 

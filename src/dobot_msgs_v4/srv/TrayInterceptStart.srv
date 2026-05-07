@@ -1,0 +1,19 @@
+float64 tray_vector_wait_timeout_sec
+float64 ee_intercept_speed_mm_s
+float64 tray_intercept_x_offset_mm
+float64 tray_intercept_y_offset_mm
+float64 tray_standoff_z_mm
+float64 follow_distance_mm
+float64 post_follow_z_up_mm
+bool troubleshoot_tf_only
+---
+bool started
+string message
+float64 applied_tray_vector_wait_timeout_sec
+float64 applied_ee_intercept_speed_mm_s
+float64 applied_tray_intercept_x_offset_mm
+float64 applied_tray_intercept_y_offset_mm
+float64 applied_tray_standoff_z_mm
+float64 applied_follow_distance_mm
+float64 applied_post_follow_z_up_mm
+bool applied_troubleshoot_tf_only

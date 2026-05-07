@@ -49,11 +49,12 @@ private:
   std::string gripper_frame_;
   std::string camera_frame_;
   std::string target_frame_;
+  std::string calibration_mode_{"eye_on_hand"};
   bool has_solution_{false};
   Eigen::Matrix3d last_rotation_{Eigen::Matrix3d::Identity()};
   Eigen::Vector3d last_translation_{Eigen::Vector3d::Zero()};
   std::string last_camera_frame_;
-  std::string last_gripper_frame_;
+  std::string last_parent_frame_;
   size_t last_used_samples_{0};
 
   void handleAddSample(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -66,13 +67,17 @@ private:
                    std::shared_ptr<std_srvs::srv::Trigger::Response> res);
 
   bool writeResultYAML(const Eigen::Matrix3d &rotation, const Eigen::Vector3d &translation,
-                       const std::string &camera_frame, const std::string &gripper_frame,
+                       const std::string &camera_frame, const std::string &transform_parent_frame,
                        size_t sample_count) const;
+  void publishCalibratedTransform(const Eigen::Matrix3d &rotation, const Eigen::Vector3d &translation);
   bool runCalibration(Eigen::Matrix3d &rotation, Eigen::Vector3d &translation,
-                      std::string &camera_frame, std::string &gripper_frame, size_t &used_samples);
+                      std::string &camera_frame, std::string &transform_parent_frame,
+                      size_t &used_samples);
   static Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose &pose);
   static void eigenToCv(const Eigen::Matrix3d &R, const Eigen::Vector3d &t, cv::Mat &R_out,
                         cv::Mat &t_out);
   bool fetchTransforms(PoseSample &sample, std::string &reason);
+  bool isEyeToHandMode() const;
+  static std::string normalizeCalibrationMode(const std::string &mode);
 };
 }  // namespace camera_calibration

@@ -1,14 +1,85 @@
 # dobot_msgs_v4
 
-ROS 2 interface definitions mirroring the DOBOT CR dashboard/control API.
+`dobot_msgs_v4` defines the custom ROS 2 messages and services used by the
+DOBOT workspace. It mirrors the DOBOT controller command surface and adds a few
+workspace-specific interfaces for tray and bin workflows.
 
-## What it provides
-- Message, service, and action definitions used by `dobot_bringup_v4` and related nodes.
-- Types for robot state, dashboard commands, and motion control.
+## Build
 
-## Usage
-- Build the workspace to generate headers/interfaces: `colcon build --packages-select dobot_msgs_v4`.
-- Depend on this package in your own CMake/ROS 2 packages to call DOBOT services or subscribe to status topics.
+```bash
+cd /home/erds/DOBOT_pickn_place
+source /opt/ros/humble/setup.bash
+colcon build --packages-select dobot_msgs_v4
+source install/setup.bash
+```
+
+## Messages
+
+| Message | Purpose |
+| --- | --- |
+| `RobotStatus.msg` | Robot status, mode, safety, and controller state fields. |
+| `ToolVectorActual.msg` | Actual TCP/tool pose feedback from the robot controller. |
+| `TrayVector.msg` | Tray pose, timing, velocity, and motion direction used by tray intercept. |
+
+`TrayVector.msg` includes:
+
+- tray pose in millimeters and degrees;
+- first/last observation timestamps;
+- observation window timing;
+- velocity vector, speed, and direction unit vector.
+
+## Services
+
+The package contains the DOBOT command service definitions used by
+`cr_robot_ros2`, including:
+
+| Family | Examples |
+| --- | --- |
+| Robot state and safety | `EnableRobot`, `DisableRobot`, `ClearError`, `RobotMode`, `EmergencyStop` |
+| Motion | `MovJ`, `MovL`, `MovJIO`, `MovLIO`, `Arc`, `Circle`, `MoveJog`, `ServoJ`, `ServoP` |
+| Relative motion | `RelMovJTool`, `RelMovLTool`, `RelMovJUser`, `RelMovLUser`, `RelJointMovJ` |
+| Speed and acceleration | `SpeedFactor`, `VelJ`, `VelL`, `AccJ`, `AccL`, `CP` |
+| IO and Modbus | `DI`, `DO`, `AI`, `AO`, `GetCoils`, `SetCoils`, `GetHoldRegs`, `SetHoldRegs` |
+| Kinematics and frames | `PositiveKin`, `InverseKin`, `CalcUser`, `CalcTool`, `SetUser`, `SetTool` |
+| Workspace workflows | `GetTrayDimensions`, `TrayInterceptStart` |
+
+## Using These Interfaces
+
+For a C++ package:
+
+```xml
+<!-- package.xml -->
+<depend>dobot_msgs_v4</depend>
+```
+
+```cmake
+# CMakeLists.txt
+find_package(dobot_msgs_v4 REQUIRED)
+ament_target_dependencies(your_target dobot_msgs_v4)
+```
+
+For a Python package:
+
+```xml
+<!-- package.xml -->
+<exec_depend>dobot_msgs_v4</exec_depend>
+```
+
+```python
+from dobot_msgs_v4.srv import MovL
+from dobot_msgs_v4.msg import ToolVectorActual
+```
+
+## Related Packages
+
+- `cr_robot_ros2` implements service servers for the controller API.
+- `motion_debug` uses core motion, state, and IO services.
+- `tray_perception` publishes `TrayVector`.
+- `tray_intercept` consumes `TrayVector` and exposes `TrayInterceptStart`.
+- `item_pick` reuses `TrayInterceptStart` for its operator service.
 
 ## Notes
-- Used by `dobot_bringup_v4` for dashboard/control and by downstream tooling that speaks DOBOT’s protocol.
+
+- Build this package before packages that depend on its generated interfaces.
+- Keep service definitions stable when possible; many operator GUIs and
+  perception nodes import these types directly.

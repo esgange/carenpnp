@@ -13,6 +13,11 @@ calibration_transform:
     y: 0.0
     z: 0.0
 metadata:
+  calibration_mode: eye_on_hand
+  transform_parent_frame: link6
+  transform_child_frame: calibrated_camera_link
+  transform_type: gripper_to_camera
+  sample_count: 0
   base_frame: base_link
   gripper_frame: link6
   camera_frame: camera_link

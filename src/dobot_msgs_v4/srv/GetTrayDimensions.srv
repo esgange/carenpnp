@@ -1,0 +1,7 @@
+---
+bool success
+float64 x_size_mm
+float64 y_size_mm
+bool live_detection
+string tray_name
+string message

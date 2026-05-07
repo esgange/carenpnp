@@ -19,6 +19,7 @@ endif ()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
@@ -26,6 +27,7 @@ find_package(builtin_interfaces REQUIRED)
 set(msg_files
         "msg/RobotStatus.msg"
         "msg/ToolVectorActual.msg"
+        "msg/TrayVector.msg"
         )
 
 set(srv_files
@@ -119,6 +121,8 @@ set(srv_files
        "srv/RelMovLTool.srv"
        "srv/RelMovJUser.srv"
        "srv/RelMovLUser.srv"
+       "srv/GetTrayDimensions.srv"
+       "srv/TrayInterceptStart.srv"
        "srv/GetCurrentCommandId.srv"
        "srv/ServoJ.srv"
        "srv/ServoP.srv"
@@ -129,6 +133,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
         ${msg_files} ${srv_files}
         DEPENDENCIES
         builtin_interfaces
+        geometry_msgs
         std_msgs
         )
 

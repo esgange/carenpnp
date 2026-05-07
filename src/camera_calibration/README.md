@@ -1,34 +1,185 @@
 # camera_calibration
 
-Eye-on-hand AX=XB calibration node for robot-mounted cameras. Inspired by MoveIt's hand-eye calibration plugin but packaged as a standalone ROS 2 node.
+`camera_calibration` provides the hand-eye calibration tools used to align the
+camera frame with the DOBOT robot. It supports both eye-on-hand and eye-to-hand
+`AX=XB` workflows and writes calibration YAML files consumed by the perception
+packages.
 
-## Features
-- Collect paired poses from TF frames (base->gripper, camera->target).
-- Solve AX=XB using OpenCV's Tsai hand-eye method.
-- Write YAML transform for downstream perception stacks.
-- Simple UI via ROS services (`/add_sample`, `/compute_calibration`, `/reset_samples`).
+## Executables
 
-## Running
+| Executable | Purpose |
+| --- | --- |
+| `eye_on_hand_calibrator` | C++ calibration solver and service node. |
+| `calibration_perception` | Averages multiple ArUco marker TFs into one stable target frame. |
+| `platform_teach` | GUI for saving the calibration board pose as the robot platform reference. |
+| `camera_calibration_gui` | GUI for generating poses, running capture, solving, and saving YAML. |
+
+## Build
+
+```bash
+cd /home/erds/DOBOT_pickn_place
+source /opt/ros/humble/setup.bash
+colcon build --packages-select camera_calibration
+source install/setup.bash
+```
+
+## Launch
+
+Recommended full workflow:
+
 ```bash
 ros2 launch camera_calibration camera_calibration.launch.py
 ```
-This opens the MoveIt-style GUI and also starts a calibration-only helper node (`calibration_perception`) that averages TFs from `aruco_marker_1..4` in `camera_link` to publish a single `tag_frame` for the calibrator. Fill in the TF frame names (defaults: base_link, link6, camera_link, tag_frame), the output YAML path (defaults to `~/DOBOT_pickn_place/calibration/axab_calibration_ddmmyyyy.yaml`), and minimum samples. Use:
-- Start/Stop Calibrator to launch/terminate the node with your inputs.
-- Add Sample, Compute, Save YAML, Reset Samples to drive the calibration services and see responses. Compute solves and caches AX=XB; Save YAML writes the last computed result (so you can compute multiple times before saving).
 
-While the node is running:
+GUI-only launch:
+
 ```bash
-# Record a sample (gripper pose + target pose should be updated)
-ros2 service call /add_sample std_srvs/srv/Trigger {}
-
-# Compute AX=XB once you have enough poses
-ros2 service call /compute_calibration std_srvs/srv/Trigger {}
-
-# Write the most recent computed solution to disk
-ros2 service call /save_calibration std_srvs/srv/Trigger {}
-
-# Clear samples if needed
-ros2 service call /reset_samples std_srvs/srv/Trigger {}
+ros2 launch camera_calibration camera_calibration_gui.launch.py
 ```
 
-The output YAML (default `axab_calibration_ddmmyyyy.yaml` in `~/DOBOT_pickn_place/calibration/`) contains quaternion, Euler angles (degrees), translation, metadata, and timestamp suitable for downstream perception packages. ArUco perception auto-discovers this folder and prompts if nothing valid is found.
+Mode override:
+
+```bash
+ros2 launch camera_calibration camera_calibration.launch.py calibration_mode:=eye_to_hand
+```
+
+Camera topic overrides:
+
+```bash
+ros2 launch orbbec_camera gemini_330_series.launch.py \
+  device_preset:='High Accuracy' \
+  enable_color:=true \
+  enable_depth:=true \
+  depth_registration:=true \
+  align_target_stream:=COLOR \
+  align_mode:=SW \
+  enable_frame_sync:=true \
+  enable_temporal_filter:=true \
+  color_width:=848 color_height:=480 color_fps:=30 \
+  depth_width:=848 depth_height:=480 depth_fps:=30 \
+  enable_point_cloud:=false
+```
+
+Teach the robot platform reference after camera calibration:
+
+```bash
+ros2 launch camera_calibration platform_teach.launch.py
+```
+
+## Calibration Modes
+
+| Mode | Use Case |
+| --- | --- |
+| `eye_on_hand` | Camera is mounted on the robot; calibration target is fixed in the workspace. |
+| `eye_to_hand` | Camera is fixed; calibration target is mounted on the end effector. |
+
+`eye_on_hand` is the default.
+
+## Full Launch Composition
+
+`camera_calibration.launch.py` starts:
+
+- `camera_calibration_gui`;
+- `calibration_perception`, averaging `aruco_marker_1` through
+  `aruco_marker_4` into `tag_frame`;
+- `aruco_perception.launch.py` with `use_calibration=false`, so samples are
+  collected in the raw camera frame.
+
+Default frames for the normal flow:
+
+| Setting | Default |
+| --- | --- |
+| Base frame | `base_link` |
+| Gripper frame | `Link6` |
+| Camera frame | `camera_link` |
+| Target frame | `tag_frame` |
+
+## Operator Flow
+
+1. Start the RGB-D camera and DOBOT bringup.
+2. Launch `camera_calibration.launch.py`.
+3. In the GUI, confirm frame names and the output path.
+4. Click `Generate Pose` to create candidate robot poses.
+5. Optionally click `Align` to move the camera to the closest reachable,
+   centered view of the tag.
+6. Click `Start` to move, settle, and collect samples.
+7. Click `Compute` and review the result.
+8. Save the YAML.
+
+The generated motion goals aim the configured camera frame at the tag and are
+constrained by tag distance, tag tilt, look-up bias, minimum base-frame Z
+height, and IK availability.
+
+## Services
+
+The solver exposes:
+
+| Service | Type |
+| --- | --- |
+| `/add_sample` | `std_srvs/srv/Trigger` |
+| `/compute_calibration` | `std_srvs/srv/Trigger` |
+| `/save_calibration` | `std_srvs/srv/Trigger` |
+| `/reset_samples` | `std_srvs/srv/Trigger` |
+
+Example:
+
+```bash
+ros2 service call /compute_calibration std_srvs/srv/Trigger {}
+```
+
+## Output Files
+
+Default output path:
+
+```text
+~/DOBOT_pickn_place/calibration/axab_calibration.yaml
+```
+
+Saved YAML includes:
+
+- transform rotation and translation;
+- Euler angles for review;
+- calibration mode and frame names;
+- parent/child frame metadata;
+- sample count and timestamp.
+
+The output is compatible with `aruco_perception`, `tray_perception`,
+`bin_perception`, and `obstacle_perception`.
+
+Only one active camera calibration YAML is kept in the calibration directory.
+Saving a new calibration deletes older `axab_calibration_*.yaml` files before
+writing `axab_calibration.yaml`.
+
+## Platform Reference
+
+`platform_teach.launch.py` reuses the same four-marker calibration board, but
+loads the current camera calibration first. It averages markers `1, 2, 3, 4`
+into `platform_board_observed`, then saves the board pose as:
+
+```text
+~/DOBOT_pickn_place/config/platform/platform_calibration_<platform_name>.yaml
+```
+
+Only one platform calibration is kept in that directory. Saving again deletes
+older `platform_calibration_*.yaml` files and writes the new one. The YAML stores
+`base_link -> <platform_name>` as `calibration_transform`, with metadata such as
+`platform_name`, `transform_parent_frame`, `transform_child_frame`,
+`observed_board_frame`, marker IDs, and timestamp.
+
+`bin_teach` auto-loads this platform file by default and saves bin transforms in
+the platform frame, while ROI dots remain normal RGB image pixel points.
+
+## Quick Checks
+
+```bash
+ros2 topic echo /aruco_overlay --once
+ros2 run tf2_ros tf2_echo camera_link tag_frame
+ros2 run tf2_ros tf2_echo Link6 calibrated_camera_link
+```
+
+## Notes
+
+- Use a stable, visible ArUco target before starting automatic capture.
+- Keep robot motion clear of obstacles during generated-pose capture.
+- Re-run calibration when the camera mount, lens, resolution, or robot TCP setup
+  changes.

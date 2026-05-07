@@ -25,11 +25,12 @@ ObstaclePerceptionNode::ObstaclePerceptionNode(const rclcpp::NodeOptions & optio
   filter_floating_ = declare_parameter<bool>("filter_floating", true);
   neighbor_radius_voxels_ = declare_parameter<int>("neighbor_radius_voxels", 1);
   min_neighbor_voxels_ = declare_parameter<int>("min_neighbor_voxels", 10);
-  const auto color_topic =
-    declare_parameter<std::string>("color_topic", "/camera/camera_link/color/image_raw");
-  const auto depth_topic = declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
-  const auto camera_info_topic =
-    declare_parameter<std::string>("camera_info_topic", "/camera/depth/camera_info");
+  color_topic_ =
+    declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
+  depth_topic_ =
+    declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
+  camera_info_topic_ =
+    declare_parameter<std::string>("camera_info_topic", "/camera/color/camera_info");
 
   if (voxel_size_ <= 0.0) {
     RCLCPP_WARN(get_logger(), "voxel_size must be positive, defaulting to 0.05 m");
@@ -41,20 +42,23 @@ ObstaclePerceptionNode::ObstaclePerceptionNode(const rclcpp::NodeOptions & optio
   cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("obstacles/points", 10);
   marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("obstacles/markers", 10);
 
-  color_sub_.subscribe(this, color_topic, rmw_qos_profile_sensor_data);
-  depth_sub_.subscribe(this, depth_topic, rmw_qos_profile_sensor_data);
-  info_sub_.subscribe(this, camera_info_topic, rmw_qos_profile_sensor_data);
+  color_sub_.subscribe(this, color_topic_, rmw_qos_profile_sensor_data);
+  depth_sub_.subscribe(this, depth_topic_, rmw_qos_profile_sensor_data);
+  info_sub_.subscribe(this, camera_info_topic_, rmw_qos_profile_sensor_data);
 
   sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
     SyncPolicy(10), color_sub_, depth_sub_, info_sub_);
   sync_->registerCallback(std::bind(
     &ObstaclePerceptionNode::depthCallback, this,
     std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+  camera_status_timer_ = create_wall_timer(
+    std::chrono::milliseconds(500),
+    std::bind(&ObstaclePerceptionNode::cameraStatusCallback, this));
 
   RCLCPP_INFO(
     get_logger(),
     "Obstacle perception listening to %s, %s, %s; publishing in frame [%s]",
-    color_topic.c_str(), depth_topic.c_str(), camera_info_topic.c_str(), output_frame_.c_str());
+    color_topic_.c_str(), depth_topic_.c_str(), camera_info_topic_.c_str(), output_frame_.c_str());
 }
 
 void ObstaclePerceptionNode::depthCallback(
@@ -62,6 +66,8 @@ void ObstaclePerceptionNode::depthCallback(
   const sensor_msgs::msg::Image::ConstSharedPtr & depth_msg,
   const sensor_msgs::msg::CameraInfo::ConstSharedPtr & info_msg)
 {
+  last_camera_frame_time_ = std::chrono::steady_clock::now();
+
   if (depth_msg->height == 0 || depth_msg->width == 0) {
     return;
   }
@@ -249,6 +255,51 @@ bool ObstaclePerceptionNode::depthToMeters(
   }
 
   return true;
+}
+
+void ObstaclePerceptionNode::cameraStatusCallback()
+{
+  const auto now_steady = std::chrono::steady_clock::now();
+  if (last_camera_frame_time_.time_since_epoch().count() != 0 &&
+    now_steady - last_camera_frame_time_ < std::chrono::seconds(2))
+  {
+    return;
+  }
+
+  RCLCPP_WARN_THROTTLE(
+    get_logger(), *get_clock(), 5000,
+    "no camera topics... color=%s publishers=%zu depth=%s publishers=%zu info=%s publishers=%zu",
+    color_topic_.c_str(), count_publishers(color_topic_),
+    depth_topic_.c_str(), count_publishers(depth_topic_),
+    camera_info_topic_.c_str(), count_publishers(camera_info_topic_));
+
+  publishPointCloud(now(), output_frame_, {}, {}, true);
+
+  if (!publish_markers_ || !marker_pub_) {
+    return;
+  }
+
+  visualization_msgs::msg::MarkerArray array;
+  visualization_msgs::msg::Marker status;
+  status.header.frame_id = output_frame_;
+  status.header.stamp = now();
+  status.ns = "camera_status";
+  status.id = 0;
+  status.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+  status.action = visualization_msgs::msg::Marker::ADD;
+  status.pose.position.x = 0.0;
+  status.pose.position.y = 0.0;
+  status.pose.position.z = 0.35;
+  status.pose.orientation.w = 1.0;
+  status.scale.z = 0.08;
+  status.color.r = 1.0f;
+  status.color.g = 0.82f;
+  status.color.b = 0.0f;
+  status.color.a = 1.0f;
+  status.text = "no camera topics...";
+  status.lifetime = rclcpp::Duration::from_seconds(1.5);
+  array.markers.push_back(status);
+  marker_pub_->publish(array);
 }
 
 void ObstaclePerceptionNode::publishPointCloud(

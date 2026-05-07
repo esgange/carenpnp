@@ -1,7 +1,122 @@
 #include <dobot_bringup/command.h>
+#include <cctype>
 #include <iostream>
 #include <chrono>
 #include <thread>
+
+namespace
+{
+std::string trimDashboardReply(std::string reply)
+{
+    while (!reply.empty())
+    {
+        const char ch = reply.back();
+        if (ch == '\0' || ch == '\r' || ch == '\n' || ch == '\t')
+        {
+            reply.pop_back();
+            continue;
+        }
+        break;
+    }
+    return reply;
+}
+
+std::string readDashboardReply(std::shared_ptr<TcpClient> &tcp)
+{
+    std::string reply;
+    bool has_any_data = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        uint32_t has_read = 0;
+        char chunk[1024];
+        memset(chunk, 0, sizeof(chunk));
+
+        const bool terminated = tcp->tcpRecv(chunk, sizeof(chunk) - 1, has_read, has_any_data ? 200 : 1000);
+        if (has_read > 0)
+        {
+            reply.append(chunk, has_read);
+            has_any_data = true;
+
+            const char last = reply.back();
+            if (last == ';' || last == '\r' || last == '\n' || last == '\t')
+            {
+                break;
+            }
+        }
+
+        if (terminated || has_any_data)
+        {
+            break;
+        }
+    }
+
+    if (!has_any_data)
+    {
+        throw TcpClientException("dashboard reply timeout");
+    }
+
+    return trimDashboardReply(reply);
+}
+
+int32_t parseDashboardErrorId(const std::string &reply)
+{
+    size_t pos = 0;
+    while (pos < reply.size() && std::isspace(static_cast<unsigned char>(reply[pos])))
+    {
+        ++pos;
+    }
+
+    const size_t start = pos;
+    if (pos < reply.size() && (reply[pos] == '+' || reply[pos] == '-'))
+    {
+        ++pos;
+    }
+    while (pos < reply.size() && std::isdigit(static_cast<unsigned char>(reply[pos])))
+    {
+        ++pos;
+    }
+
+    if (pos == start || (pos == start + 1 && (reply[start] == '+' || reply[start] == '-')))
+    {
+        return -1;
+    }
+
+    return std::atoi(reply.substr(start, pos - start).c_str());
+}
+
+std::string parseDashboardPayload(const std::string &reply)
+{
+    const auto open = reply.find('{');
+    const auto close = reply.rfind('}');
+    if (open != std::string::npos && close != std::string::npos && close >= open)
+    {
+        return reply.substr(open, close - open + 1);
+    }
+    return reply;
+}
+
+std::mutex g_dashboard_log_mutex;
+
+void logDashboardRequest(const char *cmd)
+{
+    std::lock_guard<std::mutex> lock(g_dashboard_log_mutex);
+    std::cout << "[dashboard] request: " << cmd << std::endl;
+}
+
+void logDashboardResult(const char *cmd, int32_t err_id, const std::string &reply)
+{
+    std::lock_guard<std::mutex> lock(g_dashboard_log_mutex);
+    std::cout << "[dashboard] result: cmd=" << cmd << ", err_id=" << err_id << ", reply=" << reply << std::endl;
+}
+
+void logDashboardResultWithPayload(const char *cmd, int32_t err_id, const std::string &reply, const std::string &payload)
+{
+    std::lock_guard<std::mutex> lock(g_dashboard_log_mutex);
+    std::cout << "[dashboard] result: cmd=" << cmd << ", err_id=" << err_id << ", reply=" << reply << ", payload=" << payload << std::endl;
+}
+}  // namespace
 CRCommanderRos2::CRCommanderRos2(const std::string &ip)
     : current_joint_{}, tool_vector_{}, is_running_(false)
 {
@@ -115,47 +230,16 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
     std::ignore = result;
     try
     {
-        uint32_t has_read;
-        char buf[1024];
-        memset(buf, 0, sizeof(buf));
-        auto currentTime = std::chrono::system_clock::now();
-        auto currentTime_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime);
-        auto valueMS = currentTime_ms.time_since_epoch().count();
-        std::cout <<"time: "<<valueMS <<"  tcp send cmd :" << cmd << std::endl;
-
+        err_id = -1;
+        logDashboardRequest(cmd);
         tcp->tcpSend(cmd, strlen(cmd));
-        char *recv_ptr = buf;
-        while (true)
-        {
-            bool err = tcp->tcpRecv(recv_ptr, 1024, has_read, 0);
-            if (!err)
-            {
-                sleep(0.01);
-                continue;
-            }
-            if (*(recv_ptr + strlen(recv_ptr) - 1) == ';')
-                break;
-
-            recv_ptr = recv_ptr + strlen(recv_ptr);
-        }
-        for (int i = 0; i < 2000;i++)  //赋值
-        {
-            if (recv_ptr[i] == '{')
-            {
-                std::string str(recv_ptr); // 将char*类型转为string类型
-                std::string result = str.substr(0, i-1); // 使用substr函数截取指定长度的子字符串
-                int num = stringToInt(result);
-                err_id = num;
-                std::cout << "ErrorID: " << result<< std::endl;
-            }
-            
-        }
-
-        std::cout << "tcp recv feedback : " << recv_ptr << std::endl; // FIXME parse the buf may be better
+        const std::string reply = readDashboardReply(tcp);
+        err_id = parseDashboardErrorId(reply);
+        logDashboardResult(cmd, err_id, reply);
     }
     catch (const std::logic_error &err)
     {
-        std::cout << "tcpDoCmd failed " << std::endl;
+        std::cout << "[dashboard] exception: cmd=" << cmd << ", error=" << err.what() << std::endl;
     }
 }
 
@@ -166,54 +250,18 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
     std::ignore = result;
     try
     {
-        uint32_t has_read;
-        char buf[1024];
-        memset(buf, 0, sizeof(buf));
-        auto currentTime = std::chrono::system_clock::now();
-        auto currentTime_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime);
-        auto valueMS = currentTime_ms.time_since_epoch().count();
-        std::cout <<"time: "<<valueMS <<"  tcp send cmd :" << cmd << std::endl;
+        err_id = -1;
+        mode_id.clear();
+        logDashboardRequest(cmd);
         tcp->tcpSend(cmd, strlen(cmd));
-        char *recv_ptr = buf;
-        while (true)
-        {
-            bool err = tcp->tcpRecv(recv_ptr, 1024, has_read, 0);
-            if (!err)
-            {
-                sleep(0.01);
-                continue;
-            }
-            if (*(recv_ptr + strlen(recv_ptr) - 1) == ';')
-                break;
-
-            recv_ptr = recv_ptr + strlen(recv_ptr);
-        }
-        int pose1 = 0;
-        for (int i = 0; i < 2000;i++)  //赋值
-        {
-            if (recv_ptr[i] == '{')
-            {
-                std::string str(recv_ptr); // 将char*类型转为string类型
-                std::string result = str.substr(0, i-1); // 使用substr函数截取指定长度的子字符串
-                int num = stringToInt(result);
-                err_id = num;
-                std::cout << "ErrorID: " << num<< std::endl;
-                pose1 = i;
-            }
-            if (recv_ptr[i] == '}')
-            {
-                std::string str(recv_ptr); // 将char*类型转为string类型
-                std::string result = str.substr(pose1, i-pose1+1); // 使用substr函数截取指定长度的子字符串
-                mode_id = result;
-                break;
-            }
-            
-        }
-        std::cout << "tcp recv feedback : " << recv_ptr << std::endl; // FIXME parse the buf may be better
+        const std::string reply = readDashboardReply(tcp);
+        err_id = parseDashboardErrorId(reply);
+        mode_id = parseDashboardPayload(reply);
+        logDashboardResultWithPayload(cmd, err_id, reply, mode_id);
     }
     catch (const std::logic_error &err)
     {
-        std::cout << "tcpDoCmd failed " << std::endl;
+        std::cout << "[dashboard] exception: cmd=" << cmd << ", error=" << err.what() << std::endl;
     }
 }
 

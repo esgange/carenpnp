@@ -8,6 +8,8 @@
 #include <sstream>
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 
 #include <Eigen/Geometry>
 #include <opencv2/calib3d.hpp>
@@ -23,27 +25,42 @@
 using std::placeholders::_1;
 using std::placeholders::_2;
 
+namespace
+{
+std::filesystem::path defaultCameraCalibrationDir()
+{
+  const char *home = std::getenv("HOME");
+  if (home == nullptr)
+  {
+    return std::filesystem::path("calibration");
+  }
+  return std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration";
+}
+
+std::filesystem::path defaultCameraCalibrationPath()
+{
+  return defaultCameraCalibrationDir() / "axab_calibration.yaml";
+}
+
+bool isCameraCalibrationYaml(const std::filesystem::path &path)
+{
+  const std::string filename = path.filename().string();
+  return path.extension() == ".yaml" &&
+         (filename == "axab_calibration.yaml" || filename.rfind("axab_calibration_", 0) == 0);
+}
+}  // namespace
+
 namespace camera_calibration
 {
 EyeOnHandCalibrator::EyeOnHandCalibrator()
 : rclcpp::Node("eye_on_hand_calibrator")
 {
-  const auto now = std::chrono::system_clock::now();
-  const std::time_t time_now = std::chrono::system_clock::to_time_t(now);
-  std::tm tm = *std::localtime(&time_now);
-  std::ostringstream fname;
-  fname << "axab_calibration_" << std::put_time(&tm, "%d%m%Y") << ".yaml";
-
-  std::string default_output = fname.str();
+  std::string default_output = "axab_calibration.yaml";
   try
   {
-    const char * home = std::getenv("HOME");
-    if (home != nullptr)
-    {
-      auto calib_dir = std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration";
-      std::filesystem::create_directories(calib_dir);
-      default_output = (calib_dir / fname.str()).string();
-    }
+    const auto calib_dir = defaultCameraCalibrationDir();
+    std::filesystem::create_directories(calib_dir);
+    default_output = defaultCameraCalibrationPath().string();
   }
   catch (const std::exception &ex)
   {
@@ -58,10 +75,23 @@ EyeOnHandCalibrator::EyeOnHandCalibrator()
   camera_frame_ = this->declare_parameter<std::string>("camera_frame", "camera_link");
   target_frame_ = this->declare_parameter<std::string>("target_frame", "tag_frame");
   min_samples_ = this->declare_parameter<int>("min_samples", 8);
+  const std::string requested_mode =
+    this->declare_parameter<std::string>("calibration_mode", "eye_on_hand");
+  calibration_mode_ = normalizeCalibrationMode(requested_mode);
+  std::string requested_mode_lower = requested_mode;
+  std::transform(requested_mode_lower.begin(), requested_mode_lower.end(), requested_mode_lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (requested_mode_lower != calibration_mode_)
+  {
+    RCLCPP_WARN(get_logger(),
+                "Unsupported calibration_mode '%s'; falling back to '%s'.",
+                requested_mode.c_str(), calibration_mode_.c_str());
+  }
 
   RCLCPP_INFO(get_logger(), "Writing calibration output to: %s", output_path_.c_str());
   RCLCPP_INFO(get_logger(),
-              "Using frames base=%s, gripper=%s, camera=%s, target=%s (min_samples=%d)",
+              "Using mode=%s frames base=%s, gripper=%s, camera=%s, target=%s (min_samples=%d)",
+              calibration_mode_.c_str(),
               base_frame_.c_str(), gripper_frame_.c_str(),
               camera_frame_.c_str(), target_frame_.c_str(), min_samples_);
 
@@ -92,8 +122,26 @@ EyeOnHandCalibrator::EyeOnHandCalibrator()
     service_group_);
 
   RCLCPP_INFO(get_logger(),
-              "Eye-on-hand calibration node ready. Call /add_sample, /compute_calibration, "
-              "or /reset_samples.");
+              "Calibration node ready (%s). Call /add_sample, /compute_calibration, "
+              "or /reset_samples.",
+              calibration_mode_.c_str());
+}
+
+std::string EyeOnHandCalibrator::normalizeCalibrationMode(const std::string &mode)
+{
+  std::string normalized = mode;
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (normalized == "eye_to_hand")
+  {
+    return "eye_to_hand";
+  }
+  return "eye_on_hand";
+}
+
+bool EyeOnHandCalibrator::isEyeToHandMode() const
+{
+  return calibration_mode_ == "eye_to_hand";
 }
 
 void EyeOnHandCalibrator::handleAddSample(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
@@ -198,7 +246,8 @@ void EyeOnHandCalibrator::eigenToCv(const Eigen::Matrix3d &R, const Eigen::Vecto
 }
 
 bool EyeOnHandCalibrator::runCalibration(Eigen::Matrix3d &rotation, Eigen::Vector3d &translation,
-                                         std::string &camera_frame, std::string &gripper_frame,
+                                         std::string &camera_frame,
+                                         std::string &transform_parent_frame,
                                          size_t &used_samples)
 {
   std::vector<PoseSample> snapshot;
@@ -224,12 +273,13 @@ bool EyeOnHandCalibrator::runCalibration(Eigen::Matrix3d &rotation, Eigen::Vecto
 
   for (const auto &sample : snapshot)
   {
-    auto T_be = poseToIsometry(sample.end_effector.pose);
-    auto T_tc = poseToIsometry(sample.target.pose);
+    const auto T_gripper_to_base = poseToIsometry(sample.end_effector.pose);
+    const auto T_target_to_camera = poseToIsometry(sample.target.pose);
+    const auto T_robot = isEyeToHandMode() ? T_gripper_to_base.inverse() : T_gripper_to_base;
 
     cv::Mat Rb, tb, Rt, tt;
-    eigenToCv(T_be.rotation(), T_be.translation(), Rb, tb);
-    eigenToCv(T_tc.rotation(), T_tc.translation(), Rt, tt);
+    eigenToCv(T_robot.rotation(), T_robot.translation(), Rb, tb);
+    eigenToCv(T_target_to_camera.rotation(), T_target_to_camera.translation(), Rt, tt);
 
     R_gripper2base.push_back(Rb);
     t_gripper2base.push_back(tb);
@@ -260,8 +310,8 @@ bool EyeOnHandCalibrator::runCalibration(Eigen::Matrix3d &rotation, Eigen::Vecto
     translation(r) = t_cam2gripper.at<double>(r, 0);
   }
 
-  camera_frame = snapshot.back().target.header.frame_id;
-  gripper_frame = snapshot.back().end_effector.header.frame_id;
+  camera_frame = camera_frame_;
+  transform_parent_frame = isEyeToHandMode() ? base_frame_ : gripper_frame_;
   used_samples = snapshot.size();
   return true;
 }
@@ -269,7 +319,7 @@ bool EyeOnHandCalibrator::runCalibration(Eigen::Matrix3d &rotation, Eigen::Vecto
 bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
                                           const Eigen::Vector3d &translation,
                                           const std::string &camera_frame,
-                                          const std::string &gripper_frame,
+                                          const std::string &transform_parent_frame,
                                           size_t sample_count) const
 {
   const std::filesystem::path output_path(output_path_);
@@ -279,6 +329,26 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
     if (!parent.empty())
     {
       std::filesystem::create_directories(parent);
+      for (const auto &entry : std::filesystem::directory_iterator(parent))
+      {
+        if (!entry.is_regular_file())
+        {
+          continue;
+        }
+        const auto candidate = entry.path();
+        if (candidate == output_path || !isCameraCalibrationYaml(candidate))
+        {
+          continue;
+        }
+        std::error_code ec;
+        std::filesystem::remove(candidate, ec);
+        if (ec)
+        {
+          RCLCPP_WARN(get_logger(),
+                      "Failed to delete old camera calibration file %s: %s",
+                      candidate.string().c_str(), ec.message().c_str());
+        }
+      }
     }
   }
   catch (const std::exception &ex)
@@ -335,8 +405,13 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
   out << "    y: " << translation.y() << "\n";
   out << "    z: " << translation.z() << "\n";
   out << "metadata:\n";
+  out << "  calibration_mode: " << calibration_mode_ << "\n";
+  out << "  transform_parent_frame: " << transform_parent_frame << "\n";
+  out << "  transform_child_frame: calibrated_camera_link\n";
+  out << "  transform_type: " << (isEyeToHandMode() ? "base_to_camera" : "gripper_to_camera") << "\n";
+  out << "  sample_count: " << sample_count << "\n";
   out << "  base_frame: " << base_frame_ << "\n";
-  out << "  gripper_frame: " << gripper_frame << "\n";
+  out << "  gripper_frame: " << gripper_frame_ << "\n";
   out << "  camera_frame: " << camera_frame << "\n";
   out << "  target_frame: " << target_frame_ << "\n";
   out << "  units:\n";
@@ -346,13 +421,30 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
   return true;
 }
 
+void EyeOnHandCalibrator::publishCalibratedTransform(
+  const Eigen::Matrix3d &rotation, const Eigen::Vector3d &translation)
+{
+  geometry_msgs::msg::TransformStamped tf_msg;
+  tf_msg.header.stamp = this->now();
+  tf_msg.header.frame_id = isEyeToHandMode() ? base_frame_ : gripper_frame_;
+  tf_msg.child_frame_id = "calibrated_camera_link";
+  tf_msg.transform.translation.x = translation.x();
+  tf_msg.transform.translation.y = translation.y();
+  tf_msg.transform.translation.z = translation.z();
+  Eigen::Quaterniond q(rotation);
+  q.normalize();
+  tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
+  tf_msg.transform.rotation = tf2::toMsg(tf_q);
+  static_broadcaster_->sendTransform(tf_msg);
+}
+
 void EyeOnHandCalibrator::handleCompute(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                                         std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
   Eigen::Matrix3d R;
   Eigen::Vector3d t;
   std::string camera_frame;
-  std::string gripper_frame;
+  std::string parent_frame;
   size_t used_samples = 0;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -363,7 +455,7 @@ void EyeOnHandCalibrator::handleCompute(const std::shared_ptr<std_srvs::srv::Tri
       return;
     }
   }
-  if (!runCalibration(R, t, camera_frame, gripper_frame, used_samples))
+  if (!runCalibration(R, t, camera_frame, parent_frame, used_samples))
   {
     res->success = false;
     res->message = "Calibration failed or insufficient data.";
@@ -375,15 +467,19 @@ void EyeOnHandCalibrator::handleCompute(const std::shared_ptr<std_srvs::srv::Tri
     last_rotation_ = R;
     last_translation_ = t;
     last_camera_frame_ = camera_frame;
-    last_gripper_frame_ = gripper_frame;
+    last_parent_frame_ = parent_frame;
     last_used_samples_ = used_samples;
     has_solution_ = true;
   }
+  publishCalibratedTransform(R, t);
 
   res->success = true;
   std::ostringstream oss;
   oss << "Calibration computed (not saved). Translation: [" << t.transpose()
-      << "] Rotation matrix first row: [" << R.row(0) << "]. Use save_calibration to write YAML.";
+      << "] Rotation matrix first row: [" << R.row(0)
+      << "]. Broadcasted static TF " << parent_frame << " -> calibrated_camera_link "
+      << "(mode=" << calibration_mode_ << "). "
+      << "Use save_calibration to write YAML.";
   res->message = oss.str();
 }
 
@@ -393,7 +489,7 @@ void EyeOnHandCalibrator::handleSave(const std::shared_ptr<std_srvs::srv::Trigge
   Eigen::Matrix3d R;
   Eigen::Vector3d t;
   std::string camera_frame;
-  std::string gripper_frame;
+  std::string parent_frame;
   size_t used_samples = 0;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -406,36 +502,24 @@ void EyeOnHandCalibrator::handleSave(const std::shared_ptr<std_srvs::srv::Trigge
     R = last_rotation_;
     t = last_translation_;
     camera_frame = last_camera_frame_;
-    gripper_frame = last_gripper_frame_;
+    parent_frame = last_parent_frame_;
     used_samples = last_used_samples_;
   }
 
-  if (!writeResultYAML(R, t, camera_frame, gripper_frame, used_samples))
+  if (!writeResultYAML(R, t, camera_frame, parent_frame, used_samples))
   {
     res->success = false;
     res->message = "Cached solution present, but writing YAML failed.";
     return;
   }
 
-  geometry_msgs::msg::TransformStamped tf_msg;
-  tf_msg.header.stamp = this->now();
-  tf_msg.header.frame_id = gripper_frame_;  // enforce configured gripper frame (e.g., Link6)
-  // Publish a static frame to visualize the calibrated camera pose
-  const std::string calibrated_frame = "calibrated_camera_link";
-  tf_msg.child_frame_id = calibrated_frame;
-  tf_msg.transform.translation.x = t.x();
-  tf_msg.transform.translation.y = t.y();
-  tf_msg.transform.translation.z = t.z();
-  Eigen::Quaterniond q(R);
-  q.normalize();
-  tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
-  tf_msg.transform.rotation = tf2::toMsg(tf_q);
-  static_broadcaster_->sendTransform(tf_msg);
+  publishCalibratedTransform(R, t);
 
   res->success = true;
   std::ostringstream oss;
   oss << "Saved cached calibration to " << output_path_ << " using " << used_samples
-      << " samples. Broadcasted static TF " << gripper_frame << " -> " << calibrated_frame << ".";
+      << " samples. Broadcasted static TF " << parent_frame << " -> calibrated_camera_link "
+      << "(mode=" << calibration_mode_ << ").";
   res->message = oss.str();
 }
 }  // namespace camera_calibration

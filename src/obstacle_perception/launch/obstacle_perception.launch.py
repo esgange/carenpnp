@@ -1,8 +1,12 @@
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch.conditions import IfCondition
+from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
@@ -17,6 +21,8 @@ def generate_launch_description():
     memory_color_g = LaunchConfiguration("memory_color_g")
     memory_color_b = LaunchConfiguration("memory_color_b")
     memory_min_hits = LaunchConfiguration("memory_min_hits")
+    target_frame = LaunchConfiguration("target_frame")
+    frame_id_override = LaunchConfiguration("frame_id_override")
     voxel_size = LaunchConfiguration("voxel_size")
     pixel_stride = LaunchConfiguration("pixel_stride")
     min_range = LaunchConfiguration("min_range")
@@ -25,17 +31,28 @@ def generate_launch_description():
     min_points_per_voxel = LaunchConfiguration("min_points_per_voxel")
     publish_pointcloud = LaunchConfiguration("publish_pointcloud")
     publish_markers = LaunchConfiguration("publish_markers")
+    memory_publish_rate = LaunchConfiguration("memory_publish_rate")
+    frustum_enable = LaunchConfiguration("frustum_enable")
+    frustum_frame = LaunchConfiguration("frustum_frame")
+    frustum_near = LaunchConfiguration("frustum_near")
+    frustum_far = LaunchConfiguration("frustum_far")
+    frustum_hfov_deg = LaunchConfiguration("frustum_hfov_deg")
+    frustum_vfov_deg = LaunchConfiguration("frustum_vfov_deg")
+    calibration_parent_frame = LaunchConfiguration("calibration_parent_frame")
+    calibration_child_frame = LaunchConfiguration("calibration_child_frame")
+    calibration_dir = LaunchConfiguration("calibration_dir")
+    calibration_file = LaunchConfiguration("calibration_file")
 
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "color_topic", default_value="/camera/camera_link/color/image_raw"
+                "color_topic", default_value="/camera/color/image_raw"
             ),
             DeclareLaunchArgument(
-                "depth_topic", default_value="/camera/camera_link/aligned_depth_to_color/image_raw"
+                "depth_topic", default_value="/camera/depth/image_raw"
             ),
             DeclareLaunchArgument(
-                "camera_info_topic", default_value="/camera/camera_link/color/camera_info"
+                "camera_info_topic", default_value="/camera/color/camera_info"
             ),
             DeclareLaunchArgument("enable_memory", default_value="true"),
             DeclareLaunchArgument("memory_voxel_size", default_value="0.03"),
@@ -45,9 +62,18 @@ def generate_launch_description():
             DeclareLaunchArgument("memory_color_g", default_value="100"),
             DeclareLaunchArgument("memory_color_b", default_value="255"),
             DeclareLaunchArgument("memory_min_hits", default_value="30"),
+            DeclareLaunchArgument("target_frame", default_value="base_link"),
+            DeclareLaunchArgument("frame_id_override", default_value=""),
+            DeclareLaunchArgument("memory_publish_rate", default_value="5.0"),
             DeclareLaunchArgument("memory_skip_live", default_value="true"),
             DeclareLaunchArgument("memory_blue_tint", default_value="0.3"),
             DeclareLaunchArgument("memory_skip_live_volume", default_value="true"),
+            DeclareLaunchArgument("frustum_enable", default_value="true"),
+            DeclareLaunchArgument("frustum_frame", default_value="calibrated_camera_link"),
+            DeclareLaunchArgument("frustum_near", default_value="0.1"),
+            DeclareLaunchArgument("frustum_far", default_value="3.0"),
+            DeclareLaunchArgument("frustum_hfov_deg", default_value="65.0"),
+            DeclareLaunchArgument("frustum_vfov_deg", default_value="50.0"),
             DeclareLaunchArgument("voxel_size", default_value="0.03"),
             DeclareLaunchArgument("pixel_stride", default_value="4"),
             DeclareLaunchArgument("min_range", default_value="0.15"),
@@ -56,6 +82,36 @@ def generate_launch_description():
             DeclareLaunchArgument("min_points_per_voxel", default_value="3"),
             DeclareLaunchArgument("publish_pointcloud", default_value="true"),
             DeclareLaunchArgument("publish_markers", default_value="true"),
+            DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
+            DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
+            DeclareLaunchArgument(
+                "calibration_dir", default_value="~/DOBOT_pickn_place/calibration"
+            ),
+            DeclareLaunchArgument(
+                "calibration_file",
+                default_value="",
+                description="Optional explicit calibration YAML; empty means auto-discover newest in calibration_dir.",
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(
+                        get_package_share_directory("aruco_perception"),
+                        "launch",
+                        "aruco_perception.launch.py",
+                    )
+                ),
+                launch_arguments={
+                    "use_calibration": "true",
+                    "parent_frame": calibration_parent_frame,
+                    "child_frame": calibration_child_frame,
+                    "calibration_dir": calibration_dir,
+                    "calibration_file": calibration_file,
+                    "show_overlay_window": "false",
+                    "color_topic": color_topic,
+                    "depth_topic": depth_topic,
+                    "camera_info_topic": camera_info_topic,
+                }.items(),
+            ),
             Node(
                 package="obstacle_perception",
                 executable="obstacle_perception_node",
@@ -90,13 +146,22 @@ def generate_launch_description():
                         "voxel_size": memory_voxel_size,
                         "decay_seconds": memory_decay,
                         "max_voxels": memory_max_voxels,
+                        "publish_rate": memory_publish_rate,
                         "color_r": memory_color_r,
                         "color_g": memory_color_g,
                         "color_b": memory_color_b,
                         "min_hits": memory_min_hits,
+                        "target_frame": target_frame,
+                        "frame_id_override": frame_id_override,
                         "skip_if_live": LaunchConfiguration("memory_skip_live"),
                         "blue_tint": LaunchConfiguration("memory_blue_tint"),
                         "skip_live_volume": LaunchConfiguration("memory_skip_live_volume"),
+                        "frustum_enable": frustum_enable,
+                        "frustum_frame": frustum_frame,
+                        "frustum_near": frustum_near,
+                        "frustum_far": frustum_far,
+                        "frustum_hfov_deg": frustum_hfov_deg,
+                        "frustum_vfov_deg": frustum_vfov_deg,
                     }
                 ],
             ),
