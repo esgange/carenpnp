@@ -12,9 +12,6 @@ Startup gate:
 - Cache that startup result and reuse those clients for the whole GUI session
 - Re-check all configured trigger services at the start of every cycle; stop the
   cycle if any required service is unavailable
-- The Reset button calls `/item_pick/reset`, `/tray_intercept/reset`,
-  `/item_detect/seek_complete`, and `/tray_detect/seek_complete`, clears the
-  mini GUI run state, and re-checks services before enabling Start again
 
 1. `/item_detect/go_to_teach`
 2. `/item_pick/track`

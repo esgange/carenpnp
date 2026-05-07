@@ -60,7 +60,6 @@ TRAY_PREDICTION_MAX_LEAD_SEC_DEFAULT = 3.0
 START_SEQUENCE_SERVICE_DEFAULT = 'tray_intercept/start_sequence'
 TRACK_SERVICE_DEFAULT = 'tray_intercept/track'
 TRACK_STATUS_SERVICE_DEFAULT = 'tray_intercept/track_status'
-RESET_SERVICE_DEFAULT = 'tray_intercept/reset'
 TRAY_DIMENSIONS_SERVICE_DEFAULT = 'tray_detect/get_tray_dimensions'
 TRAY_SEEK_COMPLETE_SERVICE_DEFAULT = 'tray_detect/seek_complete'
 TRAY_DIMENSIONS_SERVICE_WAIT_SEC = 2.0
@@ -228,12 +227,6 @@ class RelMovLMiniNode(Node):
                 TRACK_STATUS_SERVICE_DEFAULT,
             ).value
         ).strip() or TRACK_STATUS_SERVICE_DEFAULT
-        self._reset_service_name = str(
-            self.declare_parameter(
-                'reset_service',
-                RESET_SERVICE_DEFAULT,
-            ).value
-        ).strip() or RESET_SERVICE_DEFAULT
         self._tray_dimensions_service_name = str(
             self.declare_parameter(
                 'tray_dimensions_service',
@@ -283,16 +276,10 @@ class RelMovLMiniNode(Node):
             self._track_status_service_name,
             self._track_status_service_callback,
         )
-        self._reset_service = self.create_service(
-            Trigger,
-            self._reset_service_name,
-            self._reset_service_callback,
-        )
         self.get_logger().info('Tray mode configured: queued MovL motion, MovLIO when release IO is enabled.')
         self.get_logger().info(f'Start tray sequence service: {self._start_sequence_service_name}')
         self.get_logger().info(f'Track virtual-click service: {self._track_service_name}')
         self.get_logger().info(f'Track armed status service: {self._track_status_service_name}')
-        self.get_logger().info(f'Tray intercept reset service: {self._reset_service_name}')
         self.get_logger().info(
             'Startup defaults: '
             f'wait={self._tray_vector_watch_timeout_sec:.0f}s, '
@@ -1503,41 +1490,6 @@ class RelMovLMiniNode(Node):
         else:
             response.message = f'Track not armed. {action_text}'
         return response
-
-    def _reset_service_callback(
-        self,
-        request: Trigger.Request,
-        response: Trigger.Response,
-    ) -> Trigger.Response:
-        del request
-        response.success, response.message = self.reset_arm_state()
-        return response
-
-    def reset_arm_state(self) -> tuple[bool, str]:
-        with self._lock:
-            if self._manual_stop_inflight:
-                message = 'Reset refused: manual Stop is already in progress.'
-                self._snapshot.action_text = message
-                return False, message
-
-            was_armed = bool(self._tray_watch_armed)
-            was_busy = bool(self._snapshot.busy)
-            if was_busy and not was_armed:
-                self._cancel_requested = True
-                message = 'Reset refused: tray intercept motion is active. Use Stop to halt robot motion.'
-                self._snapshot.action_text = message
-                return False, message
-
-            self._tray_watch_generation += 1
-            self._tray_watch_armed = False
-            self._tray_watch_stop_dispatched = False
-            self._tray_watch_seq_floor = self._tray_vector_seq
-            self._tray_watch_deadline_monotonic = 0.0
-            self._cancel_requested = was_armed
-            self._snapshot.busy = False
-            message = 'Reset: tray intercept arm cancelled.' if was_armed else 'Reset: tray intercept already idle.'
-            self._snapshot.action_text = message
-            return True, message
 
     def run_track_from_current_settings(self) -> bool:
         with self._lock:

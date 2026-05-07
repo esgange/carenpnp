@@ -49,7 +49,6 @@ Service exposed by this package:
 | --- | --- | --- |
 | `tray_intercept/track` | `std_srvs/srv/Trigger` | Arms the same intercept sequence as the GUI track button. |
 | `tray_intercept/track_status` | `std_srvs/srv/Trigger` | Returns success while track is armed and waiting for a fresh tray vector. |
-| `tray_intercept/reset` | `std_srvs/srv/Trigger` | Cancels an armed wait and returns the tray-intercept node to idle; active robot motion still requires Stop. |
 | `tray_intercept/start_sequence` | `dobot_msgs_v4/srv/TrayInterceptStart` | Arms and starts the intercept sequence. |
 
 Robot services called under `/dobot_bringup_ros2/srv`:

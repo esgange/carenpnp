@@ -57,7 +57,6 @@ so existing teach files do not break during migration.
 | --- | --- | --- |
 | `item_pick/track` | `std_srvs/srv/Trigger` | Arms the same pick sequence as the GUI track button. |
 | `item_pick/track_status` | `std_srvs/srv/Trigger` | Returns success while track is armed and waiting for a fresh item pose. |
-| `item_pick/reset` | `std_srvs/srv/Trigger` | Cancels an armed wait and returns the item-pick node to idle; active robot motion still requires Stop. |
 | `item_pick/start_sequence` | `dobot_msgs_v4/srv/TrayInterceptStart` | Arms and starts the pick sequence with explicit settings. |
 
 The `start_sequence` service type is shared with `tray_intercept`, so field

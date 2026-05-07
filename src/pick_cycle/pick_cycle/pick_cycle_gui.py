@@ -15,17 +15,13 @@ from std_srvs.srv import Trigger
 ITEM_GO_TO_TEACH_SERVICE_DEFAULT = 'item_detect/go_to_teach'
 ITEM_ARM_SERVICE_DEFAULT = 'item_pick/track'
 ITEM_ARM_STATUS_SERVICE_DEFAULT = 'item_pick/track_status'
-ITEM_ARM_RESET_SERVICE_DEFAULT = 'item_pick/reset'
 ITEM_SEEK_SERVICE_DEFAULT = 'item_detect/seek'
 ITEM_SEEK_STATUS_SERVICE_DEFAULT = 'item_detect/seek_status'
-ITEM_SEEK_RESET_SERVICE_DEFAULT = 'item_detect/seek_complete'
 TRAY_GO_TO_TEACH_SERVICE_DEFAULT = 'tray_detect/go_to_teach'
 TRAY_ARM_SERVICE_DEFAULT = 'tray_intercept/track'
 TRAY_ARM_STATUS_SERVICE_DEFAULT = 'tray_intercept/track_status'
-TRAY_ARM_RESET_SERVICE_DEFAULT = 'tray_intercept/reset'
 TRAY_SEEK_SERVICE_DEFAULT = 'tray_detect/seek'
 TRAY_SEEK_STATUS_SERVICE_DEFAULT = 'tray_detect/seek_status'
-TRAY_SEEK_RESET_SERVICE_DEFAULT = 'tray_detect/seek_complete'
 ROBOT_TCP_TOPIC_DEFAULT = '/dobot_msgs_v4/msg/ToolVectorActual'
 
 ROBOT_LINEAR_MOVE_EPS_MM = 1.0
@@ -40,7 +36,6 @@ SEEK_STATUS_POLL_SEC = 0.1
 SEEK_STATUS_RESPONSE_TIMEOUT_SEC = 0.2
 ARM_CLICK_RESPONSE_TIMEOUT_SEC = 5.5
 ARM_STATUS_RESPONSE_TIMEOUT_SEC = 1.0
-RESET_RESPONSE_TIMEOUT_SEC = 2.0
 SERVICE_READY_TIMEOUT_SEC = 5.5
 SERVICE_READY_POLL_SEC = 0.1
 LOOP_PAUSE_SEC_DEFAULT = 1.0
@@ -81,10 +76,6 @@ class PickCycleNode(Node):
             'item_arm_status_service',
             ITEM_ARM_STATUS_SERVICE_DEFAULT,
         )
-        self.item_arm_reset_service = self._declare_name_parameter(
-            'item_arm_reset_service',
-            ITEM_ARM_RESET_SERVICE_DEFAULT,
-        )
         self.item_seek_service = self._declare_name_parameter(
             'item_seek_service',
             ITEM_SEEK_SERVICE_DEFAULT,
@@ -92,10 +83,6 @@ class PickCycleNode(Node):
         self.item_seek_status_service = self._declare_name_parameter(
             'item_seek_status_service',
             ITEM_SEEK_STATUS_SERVICE_DEFAULT,
-        )
-        self.item_seek_reset_service = self._declare_name_parameter(
-            'item_seek_reset_service',
-            ITEM_SEEK_RESET_SERVICE_DEFAULT,
         )
         self.tray_go_to_teach_service = self._declare_name_parameter(
             'tray_go_to_teach_service',
@@ -109,10 +96,6 @@ class PickCycleNode(Node):
             'tray_arm_status_service',
             TRAY_ARM_STATUS_SERVICE_DEFAULT,
         )
-        self.tray_arm_reset_service = self._declare_name_parameter(
-            'tray_arm_reset_service',
-            TRAY_ARM_RESET_SERVICE_DEFAULT,
-        )
         self.tray_seek_service = self._declare_name_parameter(
             'tray_seek_service',
             TRAY_SEEK_SERVICE_DEFAULT,
@@ -120,10 +103,6 @@ class PickCycleNode(Node):
         self.tray_seek_status_service = self._declare_name_parameter(
             'tray_seek_status_service',
             TRAY_SEEK_STATUS_SERVICE_DEFAULT,
-        )
-        self.tray_seek_reset_service = self._declare_name_parameter(
-            'tray_seek_reset_service',
-            TRAY_SEEK_RESET_SERVICE_DEFAULT,
         )
         self.robot_tcp_topic = self._declare_name_parameter(
             'robot_tcp_topic',
@@ -143,10 +122,6 @@ class PickCycleNode(Node):
                 self.item_arm_status_service,
                 self.create_client(Trigger, self.item_arm_status_service),
             ),
-            'item_arm_reset': (
-                self.item_arm_reset_service,
-                self.create_client(Trigger, self.item_arm_reset_service),
-            ),
             'item_seek': (
                 self.item_seek_service,
                 self.create_client(Trigger, self.item_seek_service),
@@ -154,10 +129,6 @@ class PickCycleNode(Node):
             'item_seek_status': (
                 self.item_seek_status_service,
                 self.create_client(Trigger, self.item_seek_status_service),
-            ),
-            'item_seek_reset': (
-                self.item_seek_reset_service,
-                self.create_client(Trigger, self.item_seek_reset_service),
             ),
             'tray_go_to_teach': (
                 self.tray_go_to_teach_service,
@@ -171,10 +142,6 @@ class PickCycleNode(Node):
                 self.tray_arm_status_service,
                 self.create_client(Trigger, self.tray_arm_status_service),
             ),
-            'tray_arm_reset': (
-                self.tray_arm_reset_service,
-                self.create_client(Trigger, self.tray_arm_reset_service),
-            ),
             'tray_seek': (
                 self.tray_seek_service,
                 self.create_client(Trigger, self.tray_seek_service),
@@ -182,10 +149,6 @@ class PickCycleNode(Node):
             'tray_seek_status': (
                 self.tray_seek_status_service,
                 self.create_client(Trigger, self.tray_seek_status_service),
-            ),
-            'tray_seek_reset': (
-                self.tray_seek_reset_service,
-                self.create_client(Trigger, self.tray_seek_reset_service),
             ),
         }
         self._startup_service_result: TriggerResult | None = None
@@ -206,17 +169,13 @@ class PickCycleNode(Node):
             ('Item Go Teach', self.item_go_to_teach_service),
             ('Item Pick Arm', self.item_arm_service),
             ('Item Pick Arm Status', self.item_arm_status_service),
-            ('Item Pick Reset', self.item_arm_reset_service),
             ('Item Seek', self.item_seek_service),
             ('Item Seek Status', self.item_seek_status_service),
-            ('Item Seek Reset', self.item_seek_reset_service),
             ('Tray Go Teach', self.tray_go_to_teach_service),
             ('Tray Intercept Arm', self.tray_arm_service),
             ('Tray Intercept Arm Status', self.tray_arm_status_service),
-            ('Tray Intercept Reset', self.tray_arm_reset_service),
             ('Tray Seek', self.tray_seek_service),
             ('Tray Seek Status', self.tray_seek_status_service),
-            ('Tray Seek Reset', self.tray_seek_reset_service),
         ]
 
     def topic_names(self) -> list[tuple[str, str]]:
@@ -283,10 +242,6 @@ class PickCycleNode(Node):
         if missing_names:
             return TriggerResult(False, 'Required services unavailable: ' + ', '.join(missing_names))
         return TriggerResult(True, f'All {len(self._trigger_clients)} trigger services ready')
-
-    def reset_startup_service_result(self) -> None:
-        with self._startup_service_lock:
-            self._startup_service_result = None
 
     def _cache_startup_service_result(self, result: TriggerResult) -> None:
         with self._startup_service_lock:
@@ -363,17 +318,11 @@ class PickCycleNode(Node):
                 self._tcp_condition.wait(timeout=0.1)
         return TriggerResult(False, f'ROS shutdown while monitoring {self.robot_tcp_topic}')
 
-    def click_trigger(
-        self,
-        client_key: str,
-        wait_response_sec: float | None = None,
-        require_startup: bool = True,
-    ) -> TriggerResult:
+    def click_trigger(self, client_key: str, wait_response_sec: float | None = None) -> TriggerResult:
         service_name, client = self._trigger_clients[client_key]
-        if require_startup:
-            startup_result = self._require_startup_services()
-            if not startup_result.success:
-                return startup_result
+        startup_result = self._require_startup_services()
+        if not startup_result.success:
+            return startup_result
         if not client.service_is_ready():
             return TriggerResult(False, f'Service unavailable: {service_name}')
 
@@ -398,26 +347,6 @@ class PickCycleNode(Node):
         if response is None:
             return TriggerResult(False, f'{service_name} returned no response')
         return TriggerResult(bool(response.success), f'{service_name}: {response.message}')
-
-    def reset_cycle_services(self) -> list[tuple[str, TriggerResult]]:
-        reset_steps = [
-            ('Item Pick Arm Reset', 'item_arm_reset'),
-            ('Tray Intercept Arm Reset', 'tray_arm_reset'),
-            ('Item Seek Reset', 'item_seek_reset'),
-            ('Tray Seek Reset', 'tray_seek_reset'),
-        ]
-        return [
-            (label, self.click_trigger(client_key, RESET_RESPONSE_TIMEOUT_SEC, require_startup=False))
-            for label, client_key in reset_steps
-        ]
-
-    def restart_cycle_state(self) -> None:
-        with self._tcp_condition:
-            self._tcp_seq = 0
-            self._latest_tcp = None
-            self._last_tcp_receive_time = 0.0
-            self._tcp_condition.notify_all()
-        self.reset_startup_service_result()
 
     def read_seek_status(
         self,
@@ -520,13 +449,12 @@ class PickCycleGui:
         self.node = node
         self.root = tk.Tk()
         self.root.title('Pick Cycle Mini GUI')
-        self.root.geometry('760x620')
-        self.root.minsize(720, 560)
+        self.root.geometry('760x520')
+        self.root.minsize(720, 480)
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._running = False
-        self._reset_in_progress = False
         self._cycle_count = 0
         self._startup_services_ok = bool(startup_result.success)
 
@@ -545,7 +473,7 @@ class PickCycleGui:
         controls = tk.LabelFrame(outer, text='Cycle Controls', padx=10, pady=10)
         controls.grid(row=0, column=0, sticky='ew')
         controls.columnconfigure(1, weight=1)
-        controls.columnconfigure(4, weight=1)
+        controls.columnconfigure(3, weight=1)
 
         self.start_button = tk.Button(
             controls,
@@ -557,16 +485,8 @@ class PickCycleGui:
         self.start_button.grid(row=0, column=0, sticky='ew', padx=(0, 8))
         self.stop_button = tk.Button(controls, text='Stop', command=self._stop_clicked, width=12, state=tk.DISABLED)
         self.stop_button.grid(row=0, column=1, sticky='w')
-        self.reset_button = tk.Button(
-            controls,
-            text='Reset',
-            command=self._reset_clicked,
-            width=12,
-            state=tk.NORMAL,
-        )
-        self.reset_button.grid(row=0, column=2, sticky='w', padx=(8, 0))
         self.loop_check = tk.Checkbutton(controls, text='Loop after successful cycle', variable=self.loop_var)
-        self.loop_check.grid(row=0, column=3, columnspan=2, sticky='w', padx=(14, 0))
+        self.loop_check.grid(row=0, column=2, columnspan=2, sticky='w', padx=(14, 0))
 
         tk.Label(controls, text='Stability time (s)').grid(row=1, column=0, sticky='w', pady=(10, 0))
         self.stability_sec_scale = tk.Scale(
@@ -581,7 +501,7 @@ class PickCycleGui:
         self.stability_sec_scale.grid(row=1, column=1, sticky='ew', pady=(4, 0))
 
         tk.Label(controls, text='Loop pause (s)').grid(row=2, column=0, sticky='w', pady=(8, 0))
-        self.loop_pause_spinbox = tk.Spinbox(
+        tk.Spinbox(
             controls,
             from_=0.0,
             to=60.0,
@@ -589,8 +509,7 @@ class PickCycleGui:
             textvariable=self.loop_pause_var,
             width=8,
             format='%.1f',
-        )
-        self.loop_pause_spinbox.grid(row=2, column=1, sticky='w', pady=(8, 0))
+        ).grid(row=2, column=1, sticky='w', pady=(8, 0))
 
         status_frame = tk.LabelFrame(outer, text='Status', padx=10, pady=8)
         status_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
@@ -638,29 +557,6 @@ class PickCycleGui:
     def _stop_clicked(self) -> None:
         self._stop_event.set()
         self._set_status('Stopping after current monitor step...')
-
-    def _reset_clicked(self) -> None:
-        if self._reset_in_progress:
-            return
-        self._reset_in_progress = True
-        self._stop_event.set()
-        self._set_running_controls(self._running)
-        self._set_status('Resetting: clearing arm/seek toggles and restarting cycle state...')
-        self._log('Reset requested: stopping cycle worker and clearing arm/seek toggles.')
-        worker = threading.Thread(target=self._reset_worker, daemon=True)
-        worker.start()
-
-    def _reset_worker(self) -> None:
-        cycle_worker = self._worker_thread
-        if cycle_worker is not None and cycle_worker.is_alive() and cycle_worker is not threading.current_thread():
-            cycle_worker.join(timeout=ARM_CLICK_RESPONSE_TIMEOUT_SEC + 1.0)
-
-        for label, result in self.node.reset_cycle_services():
-            self._log(f'Reset {label}: {"OK" if result.success else "FAIL"} - {result.message}')
-
-        self.node.restart_cycle_state()
-        startup_result = self.node.verify_trigger_services(timeout_sec=SERVICE_READY_TIMEOUT_SEC)
-        self._queue.put(('reset_done', startup_result))
 
     def _read_config(self) -> CycleConfig:
         return CycleConfig(
@@ -897,14 +793,11 @@ class PickCycleGui:
         return True
 
     def _set_running_controls(self, running: bool) -> None:
-        controls_locked = running or self._reset_in_progress
-        start_state = tk.DISABLED if controls_locked or not self._startup_services_ok else tk.NORMAL
+        start_state = tk.DISABLED if running or not self._startup_services_ok else tk.NORMAL
         self.start_button.configure(state=start_state)
-        self.stop_button.configure(state=tk.NORMAL if running and not self._reset_in_progress else tk.DISABLED)
-        self.reset_button.configure(state=tk.DISABLED if self._reset_in_progress else tk.NORMAL)
-        self.loop_check.configure(state=tk.DISABLED if controls_locked else tk.NORMAL)
-        self.stability_sec_scale.configure(state=tk.DISABLED if controls_locked else tk.NORMAL)
-        self.loop_pause_spinbox.configure(state=tk.DISABLED if controls_locked else tk.NORMAL)
+        self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+        self.loop_check.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.stability_sec_scale.configure(state=tk.DISABLED if running else tk.NORMAL)
 
     def _queue_call(self, action: str, payload: object) -> None:
         self._queue.put((action, payload))
@@ -927,25 +820,8 @@ class PickCycleGui:
                     self._append_log(str(payload))
                 elif action == 'finished':
                     self._running = False
-                    self._worker_thread = None
                     self._set_running_controls(False)
-                    if not self._reset_in_progress:
-                        self.status_var.set('Idle' if not self._stop_event.is_set() else 'Stopped')
-                elif action == 'reset_done':
-                    result = payload if isinstance(payload, TriggerResult) else TriggerResult(False, str(payload))
-                    self._running = False
-                    self._worker_thread = None
-                    self._cycle_count = 0
-                    self._stop_event.clear()
-                    self._startup_services_ok = bool(result.success)
-                    self._reset_in_progress = False
-                    self._set_running_controls(False)
-                    if result.success:
-                        self.status_var.set('Reset complete. Cycle node restarted and ready.')
-                        self._append_log(f'{time.strftime("%H:%M:%S")}  Reset complete: {result.message}')
-                    else:
-                        self.status_var.set('Reset complete, but service check failed.')
-                        self._append_log(f'{time.strftime("%H:%M:%S")}  Reset service check failed: {result.message}')
+                    self.status_var.set('Idle' if not self._stop_event.is_set() else 'Stopped')
         except queue.Empty:
             pass
         self.root.after(100, self._drain_queue)

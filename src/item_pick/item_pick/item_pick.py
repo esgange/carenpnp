@@ -77,7 +77,6 @@ CAMERA_BIN_SAFE_MARGIN_MM_DEFAULT = 0.0
 START_SEQUENCE_SERVICE_DEFAULT = 'item_pick/start_sequence'
 TRACK_SERVICE_DEFAULT = 'item_pick/track'
 TRACK_STATUS_SERVICE_DEFAULT = 'item_pick/track_status'
-RESET_SERVICE_DEFAULT = 'item_pick/reset'
 ITEM_SEEK_COMPLETE_SERVICE_DEFAULT = 'item_detect/seek_complete'
 TOOL_OFFSET_PREVIEW_PARENT_FRAME_DEFAULT = 'Link6'
 TOOL_OFFSET_PREVIEW_FRAME_DEFAULT = 'item_pick_tool_offset_preview'
@@ -458,12 +457,6 @@ class ItemPickNode(Node):
                 TRACK_STATUS_SERVICE_DEFAULT,
             ).value
         ).strip() or TRACK_STATUS_SERVICE_DEFAULT
-        self._reset_service_name = str(
-            self.declare_parameter(
-                'reset_service',
-                RESET_SERVICE_DEFAULT,
-            ).value
-        ).strip() or RESET_SERVICE_DEFAULT
         self._item_seek_complete_service_name = str(
             self.declare_parameter(
                 'item_seek_complete_service',
@@ -512,18 +505,12 @@ class ItemPickNode(Node):
             self._track_status_service_name,
             self._track_status_service_callback,
         )
-        self._reset_service = self.create_service(
-            Trigger,
-            self._reset_service_name,
-            self._reset_service_callback,
-        )
         self.get_logger().info(
             'Item pick mode configured: MovL approach/descent/retract/final with explicit DO and two settling waits.'
         )
         self.get_logger().info(f'Start item pick sequence service: {self._start_sequence_service_name}')
         self.get_logger().info(f'Track virtual-click service: {self._track_service_name}')
         self.get_logger().info(f'Track armed status service: {self._track_status_service_name}')
-        self.get_logger().info(f'Item pick reset service: {self._reset_service_name}')
         self.get_logger().info(f'Item detect seek-complete service: {self._item_seek_complete_service_name}')
         self.get_logger().info(f'Gripper DO service: {self._gripper_do_service_name}')
         self.get_logger().info(
@@ -2236,41 +2223,6 @@ class ItemPickNode(Node):
         else:
             response.message = f'Track not armed. {action_text}'
         return response
-
-    def _reset_service_callback(
-        self,
-        request: Trigger.Request,
-        response: Trigger.Response,
-    ) -> Trigger.Response:
-        del request
-        response.success, response.message = self.reset_arm_state()
-        return response
-
-    def reset_arm_state(self) -> tuple[bool, str]:
-        with self._lock:
-            if self._manual_stop_inflight:
-                message = 'Reset refused: manual Stop is already in progress.'
-                self._snapshot.action_text = message
-                return False, message
-
-            was_armed = bool(self._item_pose_watch_armed)
-            was_busy = bool(self._snapshot.busy)
-            if was_busy and not was_armed:
-                self._cancel_requested = True
-                message = 'Reset refused: item pick motion is active. Use Stop to halt robot motion.'
-                self._snapshot.action_text = message
-                return False, message
-
-            self._item_pose_watch_generation += 1
-            self._item_pose_watch_armed = False
-            self._item_pose_watch_stop_dispatched = False
-            self._item_pose_watch_seq_floor = self._item_pose_seq
-            self._item_pose_watch_deadline_monotonic = 0.0
-            self._cancel_requested = was_armed
-            self._snapshot.busy = False
-            message = 'Reset: item pick arm cancelled.' if was_armed else 'Reset: item pick already idle.'
-            self._snapshot.action_text = message
-            return True, message
 
     def run_track_from_current_settings(self) -> bool:
         with self._lock:
