@@ -81,15 +81,10 @@ When armed, the node:
 Troubleshoot mode publishes goal TFs only and does not send robot motion.
 The tray intercept move uses a fixed `650 mm/s` EE speed; the
 `ee_intercept_speed_mm_s` service field is kept for compatibility. The GUI
-angle control sets a `-90..90 deg` offset on top of whichever detected tray
-axis is visually vertical in the live tray overlay: if tray `+Y` is vertical it
-follows `+Y`, and if tray `+X` is vertical it follows `+X`. If live overlay axes
-are unavailable, it falls back to the tray axes projected into robot base XY.
-The selected axis first gets a fixed `90 deg` clockwise EE alignment, then the
-operator offset is applied. Negative rotates CCW, positive rotates CW, and zero
-uses only the fixed clockwise alignment. The tray-direction follow move still
-uses detected tray speed, and post-follow Z-up uses the configured arm max
-speed.
+angle control sets a manual `-90..90 deg` final EE pose angle: negative rotates
+CCW, positive rotates CW, and zero preserves the current TCP orientation instead
+of aligning the EE to the tray axes. The tray-direction follow move still uses
+detected tray speed, and post-follow Z-up uses the configured arm max speed.
 The tray standoff Z offset is applied in robot/base +Z, so positive Z remains
 an upward standoff even if the detected tray frame has a downward natural Z.
 Tray X/Y offsets are projected into the robot base XY plane before motion.
