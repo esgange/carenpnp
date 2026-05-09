@@ -14,7 +14,7 @@ from rclpy.time import Time
 
 from dobot_msgs_v4.msg import ToolVectorActual, TrayVector
 from dobot_msgs_v4.srv import CP, GetTrayDimensions, MovL, MovLIO, SpeedFactor, Stop, TrayInterceptStart
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PolygonStamped, TransformStamped
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
@@ -29,6 +29,7 @@ TRANSLATION_AXES = ('x', 'y', 'z')
 CALIBRATION_FILE_PATH = Path.home() / '.ros' / 'relmovl_speed_calibration.json'
 CALIBRATION_DIR_PATH = Path.home() / 'DOBOT_pickn_place' / 'calibration'
 TRAY_VECTOR_TOPIC = 'tray_vector'
+TRAY_AXIS_OVERLAY_TOPIC = 'tray_axis_overlay'
 ROBOT_GOAL_FRAME_DEFAULT = 'base_link'
 POST_STOP_MOVL_GOAL_DEBUG_FRAME_DEFAULT = 'tray_movel_goal_tcp'
 FOLLOW_MOVL_GOAL_DEBUG_FRAME_DEFAULT = 'tray_follow_goal_tcp'
@@ -98,6 +99,9 @@ class MiniSnapshot:
     action_text: str = 'Ready'
     tray_seq: int = 0
     has_last_tray: bool = False
+    tray_preview_axes_valid: bool = False
+    tray_preview_x_axis: tuple[float, float] = (1.0, 0.0)
+    tray_preview_y_axis: tuple[float, float] = (0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -233,6 +237,12 @@ class RelMovLMiniNode(Node):
                 TRAY_DIMENSIONS_SERVICE_DEFAULT,
             ).value
         ).strip() or TRAY_DIMENSIONS_SERVICE_DEFAULT
+        self._tray_axis_overlay_topic = str(
+            self.declare_parameter(
+                'tray_axis_overlay_topic',
+                TRAY_AXIS_OVERLAY_TOPIC,
+            ).value
+        ).strip() or TRAY_AXIS_OVERLAY_TOPIC
         self._tray_seek_complete_service_name = str(
             self.declare_parameter(
                 'tray_seek_complete_service',
@@ -259,8 +269,12 @@ class RelMovLMiniNode(Node):
         self._goal_static_tf_by_child: dict[str, TransformStamped] = {}
         self._track_trigger_handler = None
         self._last_tray_target: TrayVectorTarget | None = None
+        self._last_tray_preview_axes_valid = False
+        self._last_tray_preview_x_axis = (1.0, 0.0)
+        self._last_tray_preview_y_axis = (0.0, 1.0)
         self.create_subscription(ToolVectorActual, 'dobot_msgs_v4/msg/ToolVectorActual', self._tcp_callback, 10)
         self.create_subscription(TrayVector, TRAY_VECTOR_TOPIC, self._tray_vector_callback, 10)
+        self.create_subscription(PolygonStamped, self._tray_axis_overlay_topic, self._tray_axis_overlay_callback, 10)
         self._start_sequence_service = self.create_service(
             TrayInterceptStart,
             self._start_sequence_service_name,
@@ -331,6 +345,9 @@ class RelMovLMiniNode(Node):
                 action_text=self._snapshot.action_text,
                 tray_seq=self._tray_vector_seq,
                 has_last_tray=self._last_tray_target is not None,
+                tray_preview_axes_valid=self._last_tray_preview_axes_valid,
+                tray_preview_x_axis=self._last_tray_preview_x_axis,
+                tray_preview_y_axis=self._last_tray_preview_y_axis,
             )
 
     def _tcp_callback(self, msg: ToolVectorActual) -> None:
@@ -342,6 +359,25 @@ class RelMovLMiniNode(Node):
             self._snapshot.tcp_values['ry'] = float(msg.ry)
             self._snapshot.tcp_values['rz'] = float(msg.rz)
             self._snapshot.tcp_stamp = time.time()
+
+    def _tray_axis_overlay_callback(self, msg: PolygonStamped) -> None:
+        points = getattr(getattr(msg, 'polygon', None), 'points', [])
+        if len(points) < 3:
+            return
+
+        x_axis = self._image_axis_to_preview_axis(points[1].x, points[1].y)
+        y_axis = self._image_axis_to_preview_axis(points[2].x, points[2].y)
+        if x_axis is None or y_axis is None:
+            return
+
+        det = (x_axis[0] * y_axis[1]) - (x_axis[1] * y_axis[0])
+        if abs(det) <= 1e-6:
+            return
+
+        with self._lock:
+            self._last_tray_preview_axes_valid = True
+            self._last_tray_preview_x_axis = x_axis
+            self._last_tray_preview_y_axis = y_axis
 
     @staticmethod
     def _rpy_deg_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> tuple[float, float, float, float]:
@@ -438,6 +474,24 @@ class RelMovLMiniNode(Node):
         if norm <= 1e-12:
             return (0.0, 0.0, 0.0)
         return (vector_xyz[0] / norm, vector_xyz[1] / norm, vector_xyz[2] / norm)
+
+    @staticmethod
+    def _project_unit_to_base_xy(vector_xyz: tuple[float, float, float]) -> tuple[float, float, float] | None:
+        x = float(vector_xyz[0])
+        y = float(vector_xyz[1])
+        norm = math.sqrt((x * x) + (y * y))
+        if norm <= 1e-9:
+            return None
+        return (x / norm, y / norm, 0.0)
+
+    @staticmethod
+    def _image_axis_to_preview_axis(x_image: float, y_image: float) -> tuple[float, float] | None:
+        x = float(x_image)
+        y = -float(y_image)
+        norm = math.sqrt((x * x) + (y * y))
+        if norm <= 1e-9:
+            return None
+        return (x / norm, y / norm)
 
     @staticmethod
     def _solve_intercept_time_sec(
@@ -730,9 +784,18 @@ class RelMovLMiniNode(Node):
             return None
 
         tray_base_x, tray_base_y, tray_base_z, _, _, _, q_base_tray, q_base_camera = tray_base_pose
-        tray_local_x_in_base = self._rotate_vector_by_quaternion((1.0, 0.0, 0.0), q_base_tray)
-        tray_local_y_in_base = self._rotate_vector_by_quaternion((0.0, 1.0, 0.0), q_base_tray)
-        tray_local_z_in_base = self._rotate_vector_by_quaternion((0.0, 0.0, 1.0), q_base_tray)
+        raw_tray_local_x_in_base = self._rotate_vector_by_quaternion((1.0, 0.0, 0.0), q_base_tray)
+        raw_tray_local_y_in_base = self._rotate_vector_by_quaternion((0.0, 1.0, 0.0), q_base_tray)
+        raw_tray_local_z_in_base = self._rotate_vector_by_quaternion((0.0, 0.0, 1.0), q_base_tray)
+        tray_local_x_in_base = self._project_unit_to_base_xy(raw_tray_local_x_in_base)
+        tray_local_y_in_base = self._project_unit_to_base_xy(raw_tray_local_y_in_base)
+        if tray_local_x_in_base is None or tray_local_y_in_base is None:
+            self._set_action_text('Tray pose rejected: tray X/Y axes cannot be projected safely into base XY.')
+            return None
+        if raw_tray_local_z_in_base[2] < -0.1:
+            self.get_logger().warn(
+                'Detected tray Z points down; using base-XY tray axes and base-up standoff for robot safety.'
+            )
 
         speed_mmps = max(0.0, float(tray_target.speed_mmps))
         direction_cam = self._normalize_vector3(tray_target.direction_unit)
@@ -741,7 +804,12 @@ class RelMovLMiniNode(Node):
             direction_cam[1] * speed_mmps,
             direction_cam[2] * speed_mmps,
         )
-        velocity_base_mmps = self._rotate_vector_by_quaternion(velocity_cam_mmps, q_base_camera)
+        raw_velocity_base_mmps = self._rotate_vector_by_quaternion(velocity_cam_mmps, q_base_camera)
+        velocity_base_mmps = (
+            raw_velocity_base_mmps[0],
+            raw_velocity_base_mmps[1],
+            0.0,
+        )
         tray_speed_base_mmps = self._vector_norm3(velocity_base_mmps)
         if tray_speed_base_mmps > 1e-6:
             follow_direction_base_unit = self._normalize_vector3(velocity_base_mmps)
@@ -766,14 +834,13 @@ class RelMovLMiniNode(Node):
             tray_now_z = tray_base_z
 
         snapshot = self.snapshot()
+        safe_z_offset_mm = max(POST_STOP_Z_OFFSET_MIN, float(z_offset_mm))
         stand_off_vec_base_mm = (
             (tray_local_x_in_base[0] * x_offset_mm)
             + (tray_local_y_in_base[0] * y_offset_mm),
             (tray_local_x_in_base[1] * x_offset_mm)
             + (tray_local_y_in_base[1] * y_offset_mm),
-            (tray_local_x_in_base[2] * x_offset_mm)
-            + (tray_local_y_in_base[2] * y_offset_mm)
-            + z_offset_mm,
+            safe_z_offset_mm,
         )
         desired_now_goal_mm = (
             tray_now_x + stand_off_vec_base_mm[0],
@@ -2120,7 +2187,7 @@ class RelMovLMiniGui:
         self.root.resizable(False, False)
         self._closed = False
         self._last_preview_signature: tuple | None = None
-        self._preview_canvas_transform: dict[str, float | tuple[float, float, float, float]] | None = None
+        self._preview_canvas_transform: dict[str, object] | None = None
         self._runtime_settings_path = RUNTIME_SETTINGS_PATH
         self._runtime_settings_save_after_id: str | None = None
         self._suspend_runtime_settings_events = False
@@ -2238,7 +2305,7 @@ class RelMovLMiniGui:
         )
         self.post_stop_y_offset_scale.grid(row=3, column=0, sticky='ew')
 
-        tk.Label(ee_settings_frame, text='Tray stand-off (+tray Z, mm)').grid(row=4, column=0, sticky='w', pady=(10, 0))
+        tk.Label(ee_settings_frame, text='Tray stand-off (+base Z, mm)').grid(row=4, column=0, sticky='w', pady=(10, 0))
         self.post_stop_z_offset_var = tk.DoubleVar(value=100.0)
         self.post_stop_z_offset_scale = tk.Scale(
             ee_settings_frame,
@@ -2846,12 +2913,29 @@ class RelMovLMiniGui:
         if scale <= 1e-9:
             return
 
-        plane_min_x_mm = float(transform['plane_min_x_mm'])
-        plane_max_y_mm = float(transform['plane_max_y_mm'])
+        plane_min_x_mm = float(transform['plane_min_display_x_mm'])
+        plane_max_y_mm = float(transform['plane_max_display_y_mm'])
         x_offset_px = float(transform['x_offset_px'])
         y_offset_px = float(transform['y_offset_px'])
-        clicked_x_mm = plane_min_x_mm + (float(event.x) - x_offset_px) / scale
-        clicked_y_mm = plane_max_y_mm - (float(event.y) - y_offset_px) / scale
+        clicked_display_x_mm = plane_min_x_mm + (float(event.x) - x_offset_px) / scale
+        clicked_display_y_mm = plane_max_y_mm - (float(event.y) - y_offset_px) / scale
+        x_axis = transform.get('x_axis_xy', (1.0, 0.0))
+        y_axis = transform.get('y_axis_xy', (0.0, 1.0))
+        det = (
+            float(x_axis[0]) * float(y_axis[1])
+            - float(x_axis[1]) * float(y_axis[0])
+        )
+        if abs(det) <= 1e-9:
+            return
+        clicked_x_mm = (
+            (clicked_display_x_mm * float(y_axis[1]))
+            - (clicked_display_y_mm * float(y_axis[0]))
+        ) / det
+        clicked_y_mm = (
+            (float(x_axis[0]) * clicked_display_y_mm)
+            - (float(x_axis[1]) * clicked_display_x_mm)
+        )
+        clicked_y_mm /= det
         self._set_intercept_offsets_from_preview(clicked_x_mm, clicked_y_mm)
 
     def _draw_intercept_preview(self) -> None:
@@ -2886,10 +2970,35 @@ class RelMovLMiniGui:
         self.dot_info_var.set(f'Red dot Ø {dot_diameter_mm:.0f} mm (default 10 mm)')
         self.border_info_var.set(f'Tray border thickness: {border_mm:.0f} mm.')
 
-        plane_min_x_mm = min(-border_mm, x_offset_mm - dot_radius_mm - 20.0)
-        plane_max_x_mm = max(tray_length_mm + border_mm, x_offset_mm + dot_radius_mm + 20.0)
-        plane_min_y_mm = min(-border_mm, y_offset_mm - dot_radius_mm - 20.0)
-        plane_max_y_mm = max(tray_width_mm + border_mm, y_offset_mm + dot_radius_mm + 20.0)
+        snapshot = self.node.snapshot()
+        x_axis_xy = snapshot.tray_preview_x_axis if snapshot.tray_preview_axes_valid else (1.0, 0.0)
+        y_axis_xy = snapshot.tray_preview_y_axis if snapshot.tray_preview_axes_valid else (0.0, 1.0)
+
+        def local_to_display_xy(x_mm: float, y_mm: float) -> tuple[float, float]:
+            return (
+                (float(x_mm) * x_axis_xy[0]) + (float(y_mm) * y_axis_xy[0]),
+                (float(x_mm) * x_axis_xy[1]) + (float(y_mm) * y_axis_xy[1]),
+            )
+
+        outer_corners_local = (
+            (-border_mm, -border_mm),
+            (tray_length_mm + border_mm, -border_mm),
+            (tray_length_mm + border_mm, tray_width_mm + border_mm),
+            (-border_mm, tray_width_mm + border_mm),
+        )
+        display_points = [local_to_display_xy(x_mm, y_mm) for x_mm, y_mm in outer_corners_local]
+        dot_display_x_mm, dot_display_y_mm = local_to_display_xy(x_offset_mm, y_offset_mm)
+        display_points.extend((
+            (dot_display_x_mm - dot_radius_mm - 20.0, dot_display_y_mm),
+            (dot_display_x_mm + dot_radius_mm + 20.0, dot_display_y_mm),
+            (dot_display_x_mm, dot_display_y_mm - dot_radius_mm - 20.0),
+            (dot_display_x_mm, dot_display_y_mm + dot_radius_mm + 20.0),
+        ))
+
+        plane_min_x_mm = min(point[0] for point in display_points)
+        plane_max_x_mm = max(point[0] for point in display_points)
+        plane_min_y_mm = min(point[1] for point in display_points)
+        plane_max_y_mm = max(point[1] for point in display_points)
         span_x_mm = max(1.0, plane_max_x_mm - plane_min_x_mm)
         span_y_mm = max(1.0, plane_max_y_mm - plane_min_y_mm)
         pad_px = 16.0
@@ -2904,10 +3013,13 @@ class RelMovLMiniGui:
         x_offset_px = pad_px + 0.5 * (usable_w_px - used_w_px)
         y_offset_px = pad_px + 0.5 * (usable_h_px - used_h_px)
 
-        def to_canvas(x_mm: float, y_mm: float) -> tuple[float, float]:
+        def display_to_canvas(x_mm: float, y_mm: float) -> tuple[float, float]:
             x_px = x_offset_px + (x_mm - plane_min_x_mm) * scale
             y_px = y_offset_px + (plane_max_y_mm - y_mm) * scale
             return (x_px, y_px)
+
+        def to_canvas(x_mm: float, y_mm: float) -> tuple[float, float]:
+            return display_to_canvas(*local_to_display_xy(x_mm, y_mm))
 
         def polygon_coords_mm(
             x0_mm: float,
@@ -2941,12 +3053,14 @@ class RelMovLMiniGui:
         )
         self._preview_canvas_transform = {
             'scale': scale,
-            'plane_min_x_mm': plane_min_x_mm,
-            'plane_max_y_mm': plane_max_y_mm,
+            'plane_min_display_x_mm': plane_min_x_mm,
+            'plane_max_display_y_mm': plane_max_y_mm,
             'x_offset_px': x_offset_px,
             'y_offset_px': y_offset_px,
             'outer_rect_px': outer_rect,
             'tray_length_mm': tray_length_mm,
+            'x_axis_xy': x_axis_xy,
+            'y_axis_xy': y_axis_xy,
         }
         canvas.create_polygon(*outer_polygon, fill='#2b8e53', outline='#7fe8ad', width=2)
         canvas.create_polygon(*inner_polygon, fill='#141414', outline='#67d593', width=2)
@@ -2958,6 +3072,8 @@ class RelMovLMiniGui:
         y_axis_x, y_axis_y = to_canvas(0.0, axis_len_mm)
         canvas.create_line(origin_x, origin_y, x_axis_x, x_axis_y, fill='#ff6666', width=2)
         canvas.create_line(origin_x, origin_y, y_axis_x, y_axis_y, fill='#00ff00', width=2)
+        canvas.create_text(x_axis_x, x_axis_y, text='X', anchor='center', fill='#ffb3b3', font=('TkDefaultFont', 9, 'bold'))
+        canvas.create_text(y_axis_x, y_axis_y, text='Y', anchor='center', fill='#b9ffb9', font=('TkDefaultFont', 9, 'bold'))
         canvas.create_oval(origin_x - 3, origin_y - 3, origin_x + 3, origin_y + 3, fill='#ffe27a', outline='')
         canvas.create_text(
             origin_x + 8,

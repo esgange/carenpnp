@@ -36,6 +36,7 @@ ros2 run tray_intercept tray_intercept
 | Input | Type | Source |
 | --- | --- | --- |
 | `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | `tray_detect` motion estimate. |
+| `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | Live 2D tray origin and X/Y axes for the GUI preview. |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | DOBOT bringup TCP feedback. |
 
 The GUI automatically calls `tray_detect/get_tray_dimensions` to keep the tray
@@ -85,12 +86,14 @@ CCW, positive rotates CW, and zero preserves the current TCP orientation instead
 of aligning the EE to the tray axes. The tray-direction follow move still uses
 detected tray speed, and post-follow Z-up uses the configured arm max speed.
 The tray standoff Z offset is applied in robot/base +Z, so positive Z remains
-an upward standoff even if a detected tray frame is noisy.
+an upward standoff even if the detected tray frame has a downward natural Z.
+Tray X/Y offsets are projected into the robot base XY plane before motion.
 
 The preview origin is fixed at the lower-left tray corner. X/Y preview clicks
 are converted from that displayed bottom origin and sent directly in the
-canonical tray frame from `tray_detect`. The preview is a flat top-down 2D tray
-view based only on tray length and width.
+canonical tray frame from `tray_detect`. The flat top-down preview uses live
+2D axes from `tray_axis_overlay`, so it follows runtime tray orientation without
+waiting for a seek `tray_vector`.
 
 ## Debug TF Frames
 

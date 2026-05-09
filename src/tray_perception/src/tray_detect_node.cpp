@@ -36,10 +36,7 @@
 #include <dobot_msgs_v4/srv/get_tray_dimensions.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include <tf2/exceptions.h>
-#include <tf2_ros/buffer.h>
 #include <tf2_ros/static_transform_broadcaster.h>
-#include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <yaml-cpp/yaml.h>
 
@@ -2181,26 +2178,11 @@ int lowerLeftCornerIndex(const std::vector<cv::Point2f> &corners)
   return lower_idx;
 }
 
-std::optional<cv::Point2f> projectedVector2D(const cv::Vec3d &vector)
-{
-  cv::Point2f axis(
-    static_cast<float>(vector[0]),
-    static_cast<float>(vector[1]));
-  const float norm = std::sqrt(axis.dot(axis));
-  if (norm < 1e-6F)
-  {
-    return std::nullopt;
-  }
-  axis *= (1.0F / norm);
-  return axis;
-}
-
 std::optional<TrayPose3D> estimateTrayPose3D(
   const TrayEstimate &estimate,
   const cv::Mat &depth_m,
   const CameraInfoMsg &camera_info,
-  int depth_edge_offset_px,
-  const cv::Vec3d &base_up_in_frame)
+  int depth_edge_offset_px)
 {
   auto camera_points = estimateTrayCornerCameraPointsFromDepthLines(
     estimate.corners,
@@ -2225,53 +2207,25 @@ std::optional<TrayPose3D> estimateTrayPose3D(
     return std::nullopt;
   }
 
-  cv::Vec3d z_axis = base_up_in_frame;
+  const cv::Vec3d origin = (*camera_points)[overlay_axes->origin_idx];
+  const cv::Vec3d x_edge = (*camera_points)[overlay_axes->x_idx] - origin;
+  const cv::Vec3d y_edge = (*camera_points)[overlay_axes->y_idx] - origin;
+  cv::Vec3d x_axis = x_edge;
+  if (!normalizeVectorInPlace(x_axis))
+  {
+    return std::nullopt;
+  }
+
+  cv::Vec3d z_axis = x_axis.cross(y_edge);
   if (!normalizeVectorInPlace(z_axis))
   {
     return std::nullopt;
   }
 
-  const cv::Vec3d origin = (*camera_points)[overlay_axes->origin_idx];
-  const cv::Vec3d x_edge = (*camera_points)[overlay_axes->x_idx] - origin;
-  const cv::Vec3d y_edge = (*camera_points)[overlay_axes->y_idx] - origin;
-  cv::Vec3d y_axis = y_edge - z_axis * y_edge.dot(z_axis);
-  bool used_y_edge = normalizeVectorInPlace(y_axis);
-
-  cv::Vec3d x_axis;
-  if (used_y_edge)
+  cv::Vec3d y_axis = z_axis.cross(x_axis);
+  if (!normalizeVectorInPlace(y_axis))
   {
-    x_axis = y_axis.cross(z_axis);
-    if (!normalizeVectorInPlace(x_axis))
-    {
-      return std::nullopt;
-    }
-  }
-  else
-  {
-    x_axis = x_edge - z_axis * x_edge.dot(z_axis);
-    if (!normalizeVectorInPlace(x_axis))
-    {
-      return std::nullopt;
-    }
-    y_axis = z_axis.cross(x_axis);
-    if (!normalizeVectorInPlace(y_axis))
-    {
-      return std::nullopt;
-    }
-  }
-
-  const auto x_projected = projectedVector2D(x_axis);
-  const auto y_projected = projectedVector2D(y_axis);
-  if (x_projected.has_value() && y_projected.has_value())
-  {
-    const float positive_score =
-      x_projected->dot(overlay_axes->x_dir) + y_projected->dot(overlay_axes->y_dir);
-    const float negative_score = -positive_score;
-    if (negative_score > positive_score)
-    {
-      x_axis *= -1.0;
-      y_axis *= -1.0;
-    }
+    return std::nullopt;
   }
 
   TrayPose3D pose;
@@ -3928,8 +3882,6 @@ public:
     movj_service_name_ = declare_parameter<std::string>("movj_service", "/dobot_bringup_ros2/srv/MovJ");
     use_calibration_ = declare_parameter<bool>("use_calibration", true);
     publish_static_calibration_tf_ = declare_parameter<bool>("publish_static_calibration_tf", true);
-    (void)declare_parameter<bool>("sterilize_tray_z_axis_to_base_normal", true);
-    sterilize_tray_z_axis_to_base_normal_ = true;
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link");
     calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "Link6");
     calibration_child_frame_ = declare_parameter<std::string>(
@@ -4122,9 +4074,6 @@ public:
     loadRuntimeUiSettings();
     createRosInterfaces();
     movj_client_ = create_client<MovJSrv>(movj_service_name_);
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
     cv::namedWindow(kDetectWindowName, cv::WINDOW_NORMAL);
     cv::resizeWindow(kDetectWindowName, kPreviewCanvasWidth, kTopBarBaseHeight + kPreviewCanvasHeight);
     cv::setMouseCallback(kDetectWindowName, &TrayDetectNode::onMouseThunk, this);
@@ -4133,7 +4082,7 @@ public:
       get_logger(),
       "Tray detect ready. Overlay topic=%s tray_pose topic=%s tray_vector topic=%s tray_cube_marker topic=%s "
       "(enabled=%s thickness=%.1fmm) detect_mode=%s depth_threshold=+/- %dmm depth_plane=%s "
-      "z_axis_sterilize=%s base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
+      "z_axis=natural_edge base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
       "selected_profile=%s profiles=%zu",
       overlay_topic_.c_str(),
       tray_pose_topic_.c_str(),
@@ -4144,7 +4093,6 @@ public:
       detectionModeToString(detection_use_depth_).c_str(),
       depth_threshold_mm_,
       depth_plane_model_.valid ? "fixed" : "missing",
-      sterilize_tray_z_axis_to_base_normal_ ? "on" : "off",
       robot_base_frame_.c_str(),
       pose_filter_window_sec_,
       pose_filter_min_samples_,
@@ -4668,73 +4616,6 @@ private:
       filtered_pose->origin[1] = raw_pose->origin[1];
     }
     return filtered_pose;
-  }
-
-  cv::Matx33d quaternionToRotationMatrix(const geometry_msgs::msg::Quaternion &quaternion) const
-  {
-    double qw = quaternion.w;
-    double qx = quaternion.x;
-    double qy = quaternion.y;
-    double qz = quaternion.z;
-    const double norm = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
-    if (norm > 1e-12)
-    {
-      const double inv = 1.0 / norm;
-      qw *= inv;
-      qx *= inv;
-      qy *= inv;
-      qz *= inv;
-    }
-
-    const double xx = qx * qx;
-    const double yy = qy * qy;
-    const double zz = qz * qz;
-    const double xy = qx * qy;
-    const double xz = qx * qz;
-    const double yz = qy * qz;
-    const double wx = qw * qx;
-    const double wy = qw * qy;
-    const double wz = qw * qz;
-
-    return cv::Matx33d(
-      1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy),
-      2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),
-      2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy));
-  }
-
-  std::optional<cv::Vec3d> baseNormalInFrame(const std::string &frame_id)
-  {
-    if (frame_id.empty() || robot_base_frame_.empty() || !tf_buffer_)
-    {
-      return std::nullopt;
-    }
-
-    try
-    {
-      const auto tf = tf_buffer_->lookupTransform(frame_id, robot_base_frame_, tf2::TimePointZero);
-      const cv::Matx33d rotation_frame_base = quaternionToRotationMatrix(tf.transform.rotation);
-      cv::Vec3d base_z_in_frame(
-        rotation_frame_base(0, 2),
-        rotation_frame_base(1, 2),
-        rotation_frame_base(2, 2));
-      if (!normalizeVectorInPlace(base_z_in_frame))
-      {
-        return std::nullopt;
-      }
-      return base_z_in_frame;
-    }
-    catch (const tf2::TransformException &ex)
-    {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(),
-        *get_clock(),
-        3000,
-        "Tray Z-axis sterilization skipped: missing TF %s -> %s (%s)",
-        robot_base_frame_.c_str(),
-        frame_id.c_str(),
-        ex.what());
-      return std::nullopt;
-    }
   }
 
   void refreshTrayProfiles()
@@ -6353,31 +6234,20 @@ private:
 
     if (accepted_estimate.has_value())
     {
-      const auto base_up = baseNormalInFrame(resolved_frame_id);
-      if (base_up.has_value())
+      const auto tray_pose_3d = estimateTrayPose3D(
+        *accepted_estimate,
+        depth_m,
+        *info,
+        depth_edge_offset_px_);
+      if (tray_pose_3d.has_value())
       {
-        const auto tray_pose_3d = estimateTrayPose3D(
-          *accepted_estimate,
-          depth_m,
-          *info,
-          depth_edge_offset_px_,
-          *base_up);
-        if (tray_pose_3d.has_value())
-        {
-          detected_tray_pose_3d = tray_pose_3d;
-        }
-        else
-        {
-          RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000,
-            "Tray detected in image but canonical 3D tray pose estimation failed.");
-        }
+        detected_tray_pose_3d = tray_pose_3d;
       }
       else
       {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "Tray detected but base-up TF is unavailable; skipping tray pose/vector publish for safety.");
+          "Tray detected in image but natural 3D tray pose estimation failed.");
       }
     }
     latest_live_tray_size_m_ = measuredTrayPlanarSizeMeters(accepted_estimate);
@@ -7275,7 +7145,6 @@ private:
   bool auto_discover_calibration_ {true};
   bool publish_overlay_ {true};
   bool publish_tray_cube_marker_ {true};
-  bool sterilize_tray_z_axis_to_base_normal_ {true};
   bool detection_use_depth_ {false};
   cv::Size rendered_window_size_ {};
   int red_threshold_ {120};
@@ -7373,8 +7242,6 @@ private:
   rclcpp::TimerBase::SharedPtr camera_status_timer_;
   rclcpp::Client<MovJSrv>::SharedPtr movj_client_;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
-  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
   rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;

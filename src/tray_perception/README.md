@@ -71,7 +71,9 @@ saved plane instead of recomputing it every frame.
 - resets seek evidence after `seek_decay_sec` without a valid frame;
 - publishes first/last seek artifacts for successful confidence runs;
 - uses the lower-left tray corner as the pose and overlay origin;
-- sets `+X` along the tray long side and `+Y` along the short side.
+- sets `+X` along the tray long side and `+Y` along the short side;
+- derives `+Z` naturally from `X cross Y`, so Z may point up or down
+  depending on the tray orientation in the image.
 - keeps that lower-left origin fixed; seek direction no longer flips the axes.
 
 ## Calibration
@@ -104,7 +106,7 @@ dialog and exits.
 | Output | Type | Notes |
 | --- | --- | --- |
 | `tray_overlay` | `sensor_msgs/msg/Image` | Runtime debug/preview image. |
-| `tray_pose` | `geometry_msgs/msg/PoseStamped` | Filtered canonical tray pose: overlay origin/X, robot/base-up Z. |
+| `tray_pose` | `geometry_msgs/msg/PoseStamped` | Filtered canonical tray pose: lower-left origin, tray edge X/Y, natural right-handed Z. |
 | `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | The same 2D origin and X/Y unit directions drawn on the camera overlay. |
 | `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | Pose, timing, velocity, speed, and direction. |
 | `tray_cube_marker` | `visualization_msgs/msg/Marker` | RViz cube marker. |

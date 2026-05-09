@@ -33,6 +33,10 @@ operational notes.
 - The item depth plane is now a reference surface only. The depth window scans
   finite depth inside the RGB mask and ROI across the selected 1-100 mm window
   instead of clamping at the plane.
+- `item_pick` now separates pre-pick settling from pickup-depth settling and
+  uses `MovLIO` to trigger suction at the start of the 6% pickup descent.
+- `tray_detect` publishes natural tray edge axes, and `tray_intercept` projects
+  tray X/Y motion into robot base XY while applying standoff in base +Z.
 - The old `Clear Depth` teach button was removed because the ROI/depth workflow
   no longer needs that manual reset step.
 

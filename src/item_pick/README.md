@@ -86,8 +86,8 @@ Main robot services used:
 ## Tool Teach Sidecars
 
 Each item-detect profile requires a saved tool teach sidecar before arming. The
-sidecar stores the Link6/tool offset and operator pick heights for the active
-item teach.
+sidecar stores the Link6/tool offset, operator pick heights, pre-pick settling,
+and pickup-depth settling for the active item teach.
 
 Sidecar pattern:
 
@@ -104,16 +104,20 @@ The GUI can:
 
 ## Motion Sequence
 
-On trigger, the node:
+On trigger, the node arms for a fresh `bin_seek_pose`. When the pose arrives, it:
 
-1. Sends `Stop`.
-2. Builds the two valid long-axis item poses: preferred and 180-degree flipped.
-3. Prefers the pose that keeps `calibrated_camera_link` inside the active bin
+1. Builds the two valid long-axis item poses: preferred and 180-degree flipped.
+2. Prefers the pose that keeps `calibrated_camera_link` inside the active bin
    teach footprint. If both are outside, it logs a warning and continues with
    the preferred pose anyway.
-4. Moves with `MovL` to the approach pose above the pick goal.
-5. Moves to pick depth with open gripper and suction enabled.
-6. Closes the gripper, retracts to approach, then moves to final Z-up.
+3. Moves with `MovL` to the approach pose above the pick goal.
+4. Opens the gripper with suction off, then waits the configured pre-pick
+   settling time.
+5. Uses `MovLIO` at 6% speed factor to move to pick depth while triggering
+   suction at the start of the descent, waits for TCP reach, then waits the
+   configured pick settling time at pickup depth.
+6. Closes the gripper, retracts to approach, waits for TCP reach, then moves to
+   final Z-up at 100% speed factor.
 
 Camera-bin pose preference can be disabled with `prefer_camera_inside_bin:=false`.
 The checked frames default to `Link6` and `calibrated_camera_link`.
