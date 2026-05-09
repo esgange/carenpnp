@@ -899,8 +899,13 @@ class RelMovLMiniNode(Node):
             signed_ee_angle_deg = ee_angle_deg
             ee_angle_direction_label = 'cw_offset'
 
-        x_vertical_score = abs(tray_local_x_in_base[1])
-        y_vertical_score = abs(tray_local_y_in_base[1])
+        if snapshot.tray_preview_axes_valid:
+            x_vertical_score = abs(float(snapshot.tray_preview_x_axis[1]))
+            y_vertical_score = abs(float(snapshot.tray_preview_y_axis[1]))
+        else:
+            x_vertical_score = abs(tray_local_x_in_base[1])
+            y_vertical_score = abs(tray_local_y_in_base[1])
+
         if x_vertical_score > y_vertical_score:
             vertical_axis_name = 'tray_x'
             vertical_axis_in_base = tray_local_x_in_base
