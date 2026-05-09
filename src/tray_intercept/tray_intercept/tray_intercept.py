@@ -128,6 +128,7 @@ class PredictedGoal:
     tray_age_sec: float
     tray_speed_base_mmps: float
     follow_direction_base_unit: tuple[float, float, float]
+    tray_axis_name: str = 'tray_y'
     tray_axis_rz_deg: float = 0.0
     ee_angle_signed_deg: float = 0.0
     ee_angle_direction_label: str = 'tray_axis'
@@ -898,11 +899,20 @@ class RelMovLMiniNode(Node):
             signed_ee_angle_deg = ee_angle_deg
             ee_angle_direction_label = 'cw_offset'
 
+        x_vertical_score = abs(tray_local_x_in_base[1])
+        y_vertical_score = abs(tray_local_y_in_base[1])
+        if x_vertical_score > y_vertical_score:
+            vertical_axis_name = 'tray_x'
+            vertical_axis_in_base = tray_local_x_in_base
+        else:
+            vertical_axis_name = 'tray_y'
+            vertical_axis_in_base = tray_local_y_in_base
         tray_axis_rz_deg = self._normalize_angle_deg(
-            math.degrees(math.atan2(tray_local_y_in_base[1], tray_local_y_in_base[0]))
+            math.degrees(math.atan2(vertical_axis_in_base[1], vertical_axis_in_base[0]))
         )
         # GUI convention is negative=CCW and positive=CW. Mathematical yaw is
-        # positive CCW, so subtract the operator offset from the tray Y-axis yaw.
+        # positive CCW, so subtract the operator offset from the selected
+        # vertical tray-axis yaw.
         goal_rx_deg = current_rx_deg
         goal_ry_deg = current_ry_deg
         goal_rz_deg = self._normalize_angle_deg(tray_axis_rz_deg - signed_ee_angle_deg)
@@ -919,6 +929,7 @@ class RelMovLMiniNode(Node):
             tray_age_sec=tray_age_sec,
             tray_speed_base_mmps=tray_speed_base_mmps,
             follow_direction_base_unit=follow_direction_base_unit,
+            tray_axis_name=vertical_axis_name,
             tray_axis_rz_deg=tray_axis_rz_deg,
             ee_angle_signed_deg=signed_ee_angle_deg,
             ee_angle_direction_label=ee_angle_direction_label,
@@ -1231,7 +1242,8 @@ class RelMovLMiniNode(Node):
                 f'Previewed 3-stage goal from {base_goal.source_frame_id}: '
                 f'age={base_goal.tray_age_sec:.3f}s lead={base_goal.lead_time_sec:.3f}s '
                 f'tray_speed={base_goal.tray_speed_base_mmps:.1f} mm/s '
-                f'tray_y_rz={base_goal.tray_axis_rz_deg:.1f}deg '
+                f'tray_axis={base_goal.tray_axis_name} '
+                f'axis_rz={base_goal.tray_axis_rz_deg:.1f}deg '
                 f'ee_offset={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
                 f'goal_rz={base_goal.rz_deg:.1f}deg '
                 f'z-up follow={zup_follow_distance_mm:.1f} mm. TF-only.'
@@ -1467,7 +1479,8 @@ class RelMovLMiniNode(Node):
                 f'intercept {intercept_speed_mm_s:.0f} mm/s, follow {follow_distance_mm:.0f} mm '
                 f'at tray speed {follow_speed_mm_s:.0f} mm/s, '
                 f'post Z-up {post_follow_z_up_mm:.0f} mm with tray-follow {zup_follow_distance_mm:.1f} mm. '
-                f'tray_y_rz={base_goal.tray_axis_rz_deg:.1f}deg '
+                f'tray_axis={base_goal.tray_axis_name} '
+                f'axis_rz={base_goal.tray_axis_rz_deg:.1f}deg '
                 f'ee_offset={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
                 f'goal_rz={base_goal.rz_deg:.1f}deg '
                 f'release_grip={"on" if release_grip_enabled else "off"} '
@@ -2351,7 +2364,7 @@ class RelMovLMiniGui:
             text=f'EE intercept speed fixed: {FIXED_EE_INTERCEPT_SPEED_MM_S:.0f} mm/s',
         ).grid(row=0, column=0, sticky='w')
 
-        tk.Label(settings_frame, text='EE tray-Y angle offset (deg, -CCW / +CW)').grid(row=1, column=0, sticky='w', pady=(10, 0))
+        tk.Label(settings_frame, text='EE vertical-axis angle offset (deg, -CCW / +CW)').grid(row=1, column=0, sticky='w', pady=(10, 0))
         self.ee_final_pose_angle_var = tk.DoubleVar(value=EE_FINAL_POSE_ANGLE_DEFAULT_DEG)
         self.ee_final_pose_angle_scale = tk.Scale(
             settings_frame,
