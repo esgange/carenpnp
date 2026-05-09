@@ -7,6 +7,7 @@ from tkinter import scrolledtext
 
 import rclpy
 from dobot_msgs_v4.msg import ToolVectorActual
+from dobot_msgs_v4.srv import TrayInterceptStart
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from std_srvs.srv import Trigger
@@ -18,7 +19,7 @@ ITEM_ARM_STATUS_SERVICE_DEFAULT = 'item_pick/track_status'
 ITEM_SEEK_SERVICE_DEFAULT = 'item_detect/seek'
 ITEM_SEEK_STATUS_SERVICE_DEFAULT = 'item_detect/seek_status'
 TRAY_GO_TO_TEACH_SERVICE_DEFAULT = 'tray_detect/go_to_teach'
-TRAY_ARM_SERVICE_DEFAULT = 'tray_intercept/track'
+TRAY_ARM_SERVICE_DEFAULT = 'tray_intercept/start_sequence'
 TRAY_ARM_STATUS_SERVICE_DEFAULT = 'tray_intercept/track_status'
 TRAY_SEEK_SERVICE_DEFAULT = 'tray_detect/seek'
 TRAY_SEEK_STATUS_SERVICE_DEFAULT = 'tray_detect/seek_status'
@@ -39,6 +40,17 @@ ARM_STATUS_RESPONSE_TIMEOUT_SEC = 1.0
 SERVICE_READY_TIMEOUT_SEC = 5.5
 SERVICE_READY_POLL_SEC = 0.1
 LOOP_PAUSE_SEC_DEFAULT = 1.0
+TRAY_START_WAIT_TIMEOUT_SEC_DEFAULT = 60.0
+TRAY_INTERCEPT_SPEED_MM_S_DEFAULT = 650.0
+TRAY_STANDOFF_Z_MM_DEFAULT = 100.0
+TRAY_FOLLOW_DISTANCE_MM_DEFAULT = 200.0
+TRAY_POST_FOLLOW_Z_UP_MM_DEFAULT = 300.0
+TRAY_INTERCEPT_X_OFFSET_MIN = -50.0
+TRAY_INTERCEPT_X_OFFSET_MAX = 400.0
+TRAY_INTERCEPT_Y_OFFSET_MIN = -50.0
+TRAY_INTERCEPT_Y_OFFSET_MAX = 300.0
+TRAY_EE_ANGLE_MIN_DEG = -90.0
+TRAY_EE_ANGLE_MAX_DEG = 90.0
 
 ROBOT_STATUS_STOP = 'stop'
 ROBOT_STATUS_PICKING = 'picking'
@@ -70,6 +82,9 @@ class CycleConfig:
     loop_pause_sec: float
     loop_enabled: bool
     stability_sec: float
+    tray_intercept_x_offset_mm: float
+    tray_intercept_y_offset_mm: float
+    tray_ee_angle_deg: float
 
 
 class PickCycleNode(Node):
@@ -119,6 +134,7 @@ class PickCycleNode(Node):
             'robot_tcp_topic',
             ROBOT_TCP_TOPIC_DEFAULT,
         )
+        self._tray_arm_client = self.create_client(TrayInterceptStart, self.tray_arm_service)
 
         self._trigger_clients: dict[str, tuple[str, object]] = {
             'item_go_to_teach': (
@@ -144,10 +160,6 @@ class PickCycleNode(Node):
             'tray_go_to_teach': (
                 self.tray_go_to_teach_service,
                 self.create_client(Trigger, self.tray_go_to_teach_service),
-            ),
-            'tray_arm': (
-                self.tray_arm_service,
-                self.create_client(Trigger, self.tray_arm_service),
             ),
             'tray_arm_status': (
                 self.tray_arm_status_service,
@@ -175,6 +187,9 @@ class PickCycleNode(Node):
         value = str(self.declare_parameter(parameter_name, default_value).value).strip()
         return value or default_value
 
+    def _required_service_clients(self) -> list[tuple[str, object]]:
+        return [*self._trigger_clients.values(), (self.tray_arm_service, self._tray_arm_client)]
+
     def service_names(self) -> list[tuple[str, str]]:
         return [
             ('Item Go Teach', self.item_go_to_teach_service),
@@ -183,7 +198,7 @@ class PickCycleNode(Node):
             ('Item Seek', self.item_seek_service),
             ('Item Seek Status', self.item_seek_status_service),
             ('Tray Go Teach', self.tray_go_to_teach_service),
-            ('Tray Intercept Arm', self.tray_arm_service),
+            ('Tray Intercept Arm Start', self.tray_arm_service),
             ('Tray Intercept Arm Status', self.tray_arm_status_service),
             ('Tray Seek', self.tray_seek_service),
             ('Tray Seek Status', self.tray_seek_status_service),
@@ -213,11 +228,11 @@ class PickCycleNode(Node):
 
             missing_names = [
                 service_name
-                for service_name, client in self._trigger_clients.values()
+                for service_name, client in self._required_service_clients()
                 if not client.service_is_ready()
             ]
             if not missing_names:
-                result = TriggerResult(True, f'All {len(self._trigger_clients)} trigger services ready')
+                result = TriggerResult(True, f'All {len(self._required_service_clients())} services ready')
                 self._cache_startup_service_result(result)
                 return result
 
@@ -229,7 +244,7 @@ class PickCycleNode(Node):
         if not missing_names:
             missing_names = [
                 service_name
-                for service_name, client in self._trigger_clients.values()
+                for service_name, client in self._required_service_clients()
                 if not client.service_is_ready()
             ]
         missing = ', '.join(missing_names)
@@ -247,12 +262,12 @@ class PickCycleNode(Node):
     def check_trigger_services_now(self) -> TriggerResult:
         missing_names = [
             service_name
-            for service_name, client in self._trigger_clients.values()
+            for service_name, client in self._required_service_clients()
             if not client.service_is_ready()
         ]
         if missing_names:
             return TriggerResult(False, 'Required services unavailable: ' + ', '.join(missing_names))
-        return TriggerResult(True, f'All {len(self._trigger_clients)} trigger services ready')
+        return TriggerResult(True, f'All {len(self._required_service_clients())} services ready')
 
     def _cache_startup_service_result(self, result: TriggerResult) -> None:
         with self._startup_service_lock:
@@ -359,6 +374,58 @@ class PickCycleNode(Node):
             return TriggerResult(False, f'{service_name} returned no response')
         return TriggerResult(bool(response.success), f'{service_name}: {response.message}')
 
+    def start_tray_intercept(
+        self,
+        config: CycleConfig,
+        wait_response_sec: float = ARM_CLICK_RESPONSE_TIMEOUT_SEC,
+    ) -> TriggerResult:
+        service_name = self.tray_arm_service
+        client = self._tray_arm_client
+        startup_result = self._require_startup_services()
+        if not startup_result.success:
+            return startup_result
+        if not client.service_is_ready():
+            return TriggerResult(False, f'Service unavailable: {service_name}')
+
+        request = TrayInterceptStart.Request()
+        request.tray_vector_wait_timeout_sec = TRAY_START_WAIT_TIMEOUT_SEC_DEFAULT
+        request.ee_intercept_speed_mm_s = TRAY_INTERCEPT_SPEED_MM_S_DEFAULT
+        request.tray_intercept_x_offset_mm = float(config.tray_intercept_x_offset_mm)
+        request.tray_intercept_y_offset_mm = float(config.tray_intercept_y_offset_mm)
+        request.ee_final_pose_angle_deg = float(config.tray_ee_angle_deg)
+        request.tray_standoff_z_mm = TRAY_STANDOFF_Z_MM_DEFAULT
+        request.follow_distance_mm = TRAY_FOLLOW_DISTANCE_MM_DEFAULT
+        request.post_follow_z_up_mm = TRAY_POST_FOLLOW_Z_UP_MM_DEFAULT
+        request.troubleshoot_tf_only = False
+
+        try:
+            future = client.call_async(request)
+        except Exception as exc:
+            return TriggerResult(False, f'Failed to start tray intercept via {service_name}: {exc}')
+
+        deadline = time.monotonic() + max(0.0, float(wait_response_sec))
+        while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            return TriggerResult(False, f'Timed out waiting for {service_name} response')
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            return TriggerResult(False, f'{service_name} response failed: {exc}')
+
+        if response is None:
+            return TriggerResult(False, f'{service_name} returned no response')
+        applied = (
+            f'x={float(response.applied_tray_intercept_x_offset_mm):.0f}mm, '
+            f'y={float(response.applied_tray_intercept_y_offset_mm):.0f}mm, '
+            f'rz={float(response.applied_ee_final_pose_angle_deg):.0f}deg'
+        )
+        return TriggerResult(
+            bool(response.started),
+            f'{service_name}: {response.message} ({applied})',
+        )
+
     def read_seek_status(
         self,
         client_key: str,
@@ -460,8 +527,8 @@ class PickCycleGui:
         self.node = node
         self.root = tk.Tk()
         self.root.title('Pick Cycle Mini GUI')
-        self.root.geometry('760x520')
-        self.root.minsize(720, 480)
+        self.root.geometry('760x590')
+        self.root.minsize(720, 540)
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -477,6 +544,9 @@ class PickCycleGui:
         self.loop_var = tk.BooleanVar(value=False)
         self.loop_pause_var = tk.DoubleVar(value=LOOP_PAUSE_SEC_DEFAULT)
         self.stability_sec_var = tk.DoubleVar(value=ROBOT_STABILITY_SEC_DEFAULT)
+        self.tray_intercept_x_var = tk.DoubleVar(value=0.0)
+        self.tray_intercept_y_var = tk.DoubleVar(value=0.0)
+        self.tray_ee_angle_var = tk.DoubleVar(value=0.0)
 
         outer = tk.Frame(self.root, padx=12, pady=12)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -514,7 +584,7 @@ class PickCycleGui:
         self.stability_sec_scale.grid(row=1, column=1, sticky='ew', pady=(4, 0))
 
         tk.Label(controls, text='Loop pause (s)').grid(row=2, column=0, sticky='w', pady=(8, 0))
-        tk.Spinbox(
+        self.loop_pause_spinbox = tk.Spinbox(
             controls,
             from_=0.0,
             to=60.0,
@@ -522,7 +592,49 @@ class PickCycleGui:
             textvariable=self.loop_pause_var,
             width=8,
             format='%.1f',
-        ).grid(row=2, column=1, sticky='w', pady=(8, 0))
+        )
+        self.loop_pause_spinbox.grid(row=2, column=1, sticky='w', pady=(8, 0))
+
+        tray_settings = tk.LabelFrame(controls, text='Tray Arm Settings', padx=8, pady=6)
+        tray_settings.grid(row=3, column=0, columnspan=4, sticky='ew', pady=(10, 0))
+        for column in range(3):
+            tray_settings.columnconfigure(column, weight=1)
+
+        tk.Label(tray_settings, text='X offset (mm)').grid(row=0, column=0, sticky='w')
+        self.tray_intercept_x_spinbox = tk.Spinbox(
+            tray_settings,
+            from_=TRAY_INTERCEPT_X_OFFSET_MIN,
+            to=TRAY_INTERCEPT_X_OFFSET_MAX,
+            increment=5.0,
+            textvariable=self.tray_intercept_x_var,
+            width=8,
+            format='%.1f',
+        )
+        self.tray_intercept_x_spinbox.grid(row=1, column=0, sticky='w', padx=(0, 10))
+
+        tk.Label(tray_settings, text='Y offset (mm)').grid(row=0, column=1, sticky='w')
+        self.tray_intercept_y_spinbox = tk.Spinbox(
+            tray_settings,
+            from_=TRAY_INTERCEPT_Y_OFFSET_MIN,
+            to=TRAY_INTERCEPT_Y_OFFSET_MAX,
+            increment=5.0,
+            textvariable=self.tray_intercept_y_var,
+            width=8,
+            format='%.1f',
+        )
+        self.tray_intercept_y_spinbox.grid(row=1, column=1, sticky='w', padx=(0, 10))
+
+        tk.Label(tray_settings, text='RZ angle (deg)').grid(row=0, column=2, sticky='w')
+        self.tray_ee_angle_spinbox = tk.Spinbox(
+            tray_settings,
+            from_=TRAY_EE_ANGLE_MIN_DEG,
+            to=TRAY_EE_ANGLE_MAX_DEG,
+            increment=1.0,
+            textvariable=self.tray_ee_angle_var,
+            width=8,
+            format='%.1f',
+        )
+        self.tray_ee_angle_spinbox.grid(row=1, column=2, sticky='w')
 
         status_frame = tk.LabelFrame(outer, text='Status', padx=10, pady=8)
         status_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
@@ -586,11 +698,32 @@ class PickCycleGui:
         self._set_robot_status(ROBOT_STATUS_STOP)
         self._set_status('Stopping after current monitor step...')
 
+    @staticmethod
+    def _read_clamped_var(var: tk.DoubleVar, minimum: float, maximum: float) -> float:
+        value = max(float(minimum), min(float(maximum), float(var.get())))
+        var.set(value)
+        return value
+
     def _read_config(self) -> CycleConfig:
         return CycleConfig(
             loop_pause_sec=max(0.0, float(self.loop_pause_var.get())),
             loop_enabled=bool(self.loop_var.get()),
             stability_sec=self._read_timing_slider(self.stability_sec_var),
+            tray_intercept_x_offset_mm=self._read_clamped_var(
+                self.tray_intercept_x_var,
+                TRAY_INTERCEPT_X_OFFSET_MIN,
+                TRAY_INTERCEPT_X_OFFSET_MAX,
+            ),
+            tray_intercept_y_offset_mm=self._read_clamped_var(
+                self.tray_intercept_y_var,
+                TRAY_INTERCEPT_Y_OFFSET_MIN,
+                TRAY_INTERCEPT_Y_OFFSET_MAX,
+            ),
+            tray_ee_angle_deg=self._read_clamped_var(
+                self.tray_ee_angle_var,
+                TRAY_EE_ANGLE_MIN_DEG,
+                TRAY_EE_ANGLE_MAX_DEG,
+            ),
         )
 
     def _run_worker(self, config: CycleConfig) -> None:
@@ -703,7 +836,7 @@ class PickCycleGui:
         seek_status_client_key: str,
         config: CycleConfig,
     ) -> bool:
-        if not self._arm_and_verify(cycle_index, arm_label, arm_client_key, arm_status_client_key):
+        if not self._arm_and_verify(cycle_index, arm_label, arm_client_key, arm_status_client_key, config):
             return False
         self._log(f'[{cycle_index}] {arm_label}: armed; confirming robot stability before seek...')
 
@@ -726,14 +859,28 @@ class PickCycleGui:
         arm_label: str,
         arm_client_key: str,
         arm_status_client_key: str,
+        config: CycleConfig,
     ) -> bool:
-        if not self._click_step(
-            cycle_index,
-            arm_label,
-            arm_client_key,
-            wait_response_sec=ARM_CLICK_RESPONSE_TIMEOUT_SEC,
-        ):
-            return False
+        if arm_client_key == 'tray_arm':
+            self._set_status(f'Cycle {cycle_index}: {arm_label}')
+            self._log(
+                f'[{cycle_index}] {arm_label}: '
+                f'x={config.tray_intercept_x_offset_mm:.0f}mm, '
+                f'y={config.tray_intercept_y_offset_mm:.0f}mm, '
+                f'rz={config.tray_ee_angle_deg:.0f}deg...'
+            )
+            result = self.node.start_tray_intercept(config, ARM_CLICK_RESPONSE_TIMEOUT_SEC)
+            self._log(f'[{cycle_index}] {arm_label}: {"OK" if result.success else "FAIL"} - {result.message}')
+            if not result.success or self._stop_event.is_set():
+                return False
+        else:
+            if not self._click_step(
+                cycle_index,
+                arm_label,
+                arm_client_key,
+                wait_response_sec=ARM_CLICK_RESPONSE_TIMEOUT_SEC,
+            ):
+                return False
 
         self._set_status(f'Cycle {cycle_index}: verifying {arm_label} armed status')
         status = self.node.read_trigger_status(
@@ -833,6 +980,11 @@ class PickCycleGui:
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
         self.loop_check.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.stability_sec_scale.configure(state=tk.DISABLED if running else tk.NORMAL)
+        setting_state = tk.DISABLED if running else tk.NORMAL
+        self.loop_pause_spinbox.configure(state=setting_state)
+        self.tray_intercept_x_spinbox.configure(state=setting_state)
+        self.tray_intercept_y_spinbox.configure(state=setting_state)
+        self.tray_ee_angle_spinbox.configure(state=setting_state)
 
     def _queue_call(self, action: str, payload: object) -> None:
         self._queue.put((action, payload))

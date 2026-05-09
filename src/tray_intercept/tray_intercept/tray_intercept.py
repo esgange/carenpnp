@@ -1498,6 +1498,7 @@ class RelMovLMiniNode(Node):
             float(request.follow_distance_mm),
             float(request.post_follow_z_up_mm),
             bool(request.troubleshoot_tf_only),
+            float(request.ee_final_pose_angle_deg),
         )
         with self._lock:
             response.started = bool(started)
@@ -1506,6 +1507,7 @@ class RelMovLMiniNode(Node):
             response.applied_ee_intercept_speed_mm_s = float(self._post_stop_movel_speed_mm_s)
             response.applied_tray_intercept_x_offset_mm = float(self._post_stop_x_offset_mm)
             response.applied_tray_intercept_y_offset_mm = float(self._post_stop_y_offset_mm)
+            response.applied_ee_final_pose_angle_deg = float(self._ee_final_pose_angle_deg)
             response.applied_tray_standoff_z_mm = float(self._post_stop_z_offset_mm)
             response.applied_follow_distance_mm = float(self._follow_distance_mm)
             response.applied_post_follow_z_up_mm = float(self._post_follow_z_up_mm)

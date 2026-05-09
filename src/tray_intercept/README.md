@@ -64,7 +64,7 @@ Example:
 
 ```bash
 ros2 service call /tray_intercept/start_sequence dobot_msgs_v4/srv/TrayInterceptStart \
-"{tray_vector_wait_timeout_sec: 60.0, ee_intercept_speed_mm_s: 650.0, tray_intercept_x_offset_mm: 0.0, tray_intercept_y_offset_mm: 0.0, tray_standoff_z_mm: 100.0, follow_distance_mm: 200.0, post_follow_z_up_mm: 300.0, troubleshoot_tf_only: false}"
+"{tray_vector_wait_timeout_sec: 60.0, ee_intercept_speed_mm_s: 650.0, tray_intercept_x_offset_mm: 0.0, tray_intercept_y_offset_mm: 0.0, ee_final_pose_angle_deg: 0.0, tray_standoff_z_mm: 100.0, follow_distance_mm: 200.0, post_follow_z_up_mm: 300.0, troubleshoot_tf_only: false}"
 ```
 
 ## Runtime Flow

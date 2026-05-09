@@ -2295,6 +2295,7 @@ class ItemPickNode(Node):
             response.applied_ee_intercept_speed_mm_s = float(self._post_stop_movel_speed_mm_s)
             response.applied_tray_intercept_x_offset_mm = float(self._post_stop_x_offset_mm)
             response.applied_tray_intercept_y_offset_mm = float(self._post_stop_y_offset_mm)
+            response.applied_ee_final_pose_angle_deg = 0.0
             response.applied_tray_standoff_z_mm = float(self._post_stop_z_offset_mm)
             response.applied_follow_distance_mm = 0.0
             response.applied_post_follow_z_up_mm = float(self._approach_z_up_mm)
