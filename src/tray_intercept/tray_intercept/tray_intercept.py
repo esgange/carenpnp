@@ -900,11 +900,11 @@ class RelMovLMiniNode(Node):
             ee_angle_direction_label = 'cw_offset'
 
         if snapshot.tray_preview_axes_valid:
-            x_vertical_score = abs(float(snapshot.tray_preview_x_axis[1]))
-            y_vertical_score = abs(float(snapshot.tray_preview_y_axis[1]))
+            x_vertical_score = abs(float(snapshot.tray_preview_x_axis[0]))
+            y_vertical_score = abs(float(snapshot.tray_preview_y_axis[0]))
         else:
-            x_vertical_score = abs(tray_local_x_in_base[1])
-            y_vertical_score = abs(tray_local_y_in_base[1])
+            x_vertical_score = abs(tray_local_x_in_base[0])
+            y_vertical_score = abs(tray_local_y_in_base[0])
 
         if x_vertical_score > y_vertical_score:
             vertical_axis_name = 'tray_x'
@@ -913,7 +913,7 @@ class RelMovLMiniNode(Node):
             vertical_axis_name = 'tray_y'
             vertical_axis_in_base = tray_local_y_in_base
         tray_axis_rz_deg = self._normalize_angle_deg(
-            math.degrees(math.atan2(vertical_axis_in_base[1], vertical_axis_in_base[0]))
+            math.degrees(math.atan2(vertical_axis_in_base[1], vertical_axis_in_base[0])) + 180.0
         )
         # GUI convention is negative=CCW and positive=CW. Mathematical yaw is
         # positive CCW, so subtract the operator offset from the selected
