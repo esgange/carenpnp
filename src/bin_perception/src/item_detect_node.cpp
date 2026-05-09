@@ -73,7 +73,7 @@ constexpr int kRgbDilateMinPx = 1;
 constexpr int kRgbDilateMaxPx = 20;
 constexpr int kDepthFillSensitivityMin = 0;
 constexpr int kDepthFillSensitivityMax = 100;
-constexpr int kDepthWindowMinMm = 0;
+constexpr int kDepthWindowMinMm = 1;
 constexpr int kDepthWindowMaxMm = 100;
 constexpr int kDepthTrimMinPx = 0;
 constexpr int kDepthTrimMaxPx = 30;
@@ -1417,7 +1417,7 @@ cv::Mat buildPositiveFiniteDepthMask(const cv::Mat &depth_m)
   return mask;
 }
 
-cv::Mat buildDepthAbovePlaneMask(const cv::Mat &depth_residual_m)
+cv::Mat buildFiniteDepthResidualMask(const cv::Mat &depth_residual_m)
 {
   cv::Mat mask;
   if (depth_residual_m.empty() || depth_residual_m.type() != CV_32FC1)
@@ -1433,12 +1433,7 @@ cv::Mat buildDepthAbovePlaneMask(const cv::Mat &depth_residual_m)
     for (int x = 0; x < depth_residual_m.cols; ++x)
     {
       const float residual = depth_row[x];
-      if (!std::isfinite(residual))
-      {
-        continue;
-      }
-      const float height_above_plane_m = -residual;
-      if (height_above_plane_m >= 0.0F)
+      if (std::isfinite(residual))
       {
         mask_row[x] = 255;
       }
@@ -1508,7 +1503,7 @@ cv::Mat applyDepthTopWindowMask(
 
   const float depth_window_m = static_cast<float>(
     std::clamp(depth_window_mm, kDepthWindowMinMm, kDepthWindowMaxMm)) / 1000.0F;
-  const float min_keep_height_m = std::max(0.0F, peak_height_m - depth_window_m);
+  const float min_keep_height_m = peak_height_m - depth_window_m;
   if (peak_info != nullptr)
   {
     peak_info->valid = true;
@@ -10167,18 +10162,18 @@ private:
       if (depth_plane_model_.valid)
       {
         const cv::Mat depth_residual_m = computeDepthPlaneResidual(depth_m, depth_plane_model_);
-        cv::Mat depth_above_plane_mask = buildDepthAbovePlaneMask(depth_residual_m);
+        cv::Mat finite_depth_residual_mask = buildFiniteDepthResidualMask(depth_residual_m);
         if (roi_ready)
         {
-          cv::bitwise_and(depth_above_plane_mask, roi_mask, depth_above_plane_mask);
+          cv::bitwise_and(finite_depth_residual_mask, roi_mask, finite_depth_residual_mask);
         }
 
-        // Select the depth-window peak only from pixels that are both above the
-        // normalized plane and inside the current RGB/ROI detection mask. This
-        // prevents random above-plane depth noise outside the binarized RGB blob
-        // from becoming the peak that drives the top-window filter.
+        // Select the depth-window peak only from finite depth pixels inside the
+        // current RGB/ROI detection mask. This prevents random depth noise
+        // outside the binarized RGB blob from becoming the peak that drives the
+        // top-window filter.
         cv::Mat peak_candidate_mask;
-        cv::bitwise_and(depth_above_plane_mask, detection_mask, peak_candidate_mask);
+        cv::bitwise_and(finite_depth_residual_mask, detection_mask, peak_candidate_mask);
 
         cv::Mat depth_window_mask = applyDepthTopWindowMask(
           depth_residual_m,

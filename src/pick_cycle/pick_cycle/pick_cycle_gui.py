@@ -40,6 +40,17 @@ SERVICE_READY_TIMEOUT_SEC = 5.5
 SERVICE_READY_POLL_SEC = 0.1
 LOOP_PAUSE_SEC_DEFAULT = 1.0
 
+ROBOT_STATUS_STOP = 'stop'
+ROBOT_STATUS_PICKING = 'picking'
+ROBOT_STATUS_PLACING = 'placing'
+ROBOT_STATUS_PAUSE = 'pause'
+ROBOT_STATUS_LABELS = {
+    ROBOT_STATUS_STOP: 'Stop',
+    ROBOT_STATUS_PICKING: 'Picking',
+    ROBOT_STATUS_PLACING: 'Placing',
+    ROBOT_STATUS_PAUSE: 'On Pause',
+}
+
 
 @dataclass(frozen=True)
 class TriggerResult:
@@ -456,11 +467,13 @@ class PickCycleGui:
         self._stop_event = threading.Event()
         self._running = False
         self._cycle_count = 0
+        self._robot_status = ROBOT_STATUS_STOP
         self._startup_services_ok = bool(startup_result.success)
 
         self.status_var = tk.StringVar(
             value='Idle' if self._startup_services_ok else 'Startup service check failed'
         )
+        self.robot_status_var = tk.StringVar(value=ROBOT_STATUS_LABELS[self._robot_status])
         self.loop_var = tk.BooleanVar(value=False)
         self.loop_pause_var = tk.DoubleVar(value=LOOP_PAUSE_SEC_DEFAULT)
         self.stability_sec_var = tk.DoubleVar(value=ROBOT_STABILITY_SEC_DEFAULT)
@@ -513,8 +526,22 @@ class PickCycleGui:
 
         status_frame = tk.LabelFrame(outer, text='Status', padx=10, pady=8)
         status_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
-        status_frame.columnconfigure(0, weight=1)
-        tk.Label(status_frame, textvariable=self.status_var, anchor='w').grid(row=0, column=0, sticky='ew')
+        status_frame.columnconfigure(1, weight=1)
+        tk.Label(status_frame, text='Robot Status').grid(row=0, column=0, sticky='w')
+        tk.Label(status_frame, textvariable=self.robot_status_var, anchor='w').grid(
+            row=0,
+            column=1,
+            sticky='ew',
+            padx=(12, 0),
+        )
+        tk.Label(status_frame, text='Cycle Status').grid(row=1, column=0, sticky='w', pady=(4, 0))
+        tk.Label(status_frame, textvariable=self.status_var, anchor='w').grid(
+            row=1,
+            column=1,
+            sticky='ew',
+            padx=(12, 0),
+            pady=(4, 0),
+        )
 
         services_frame = tk.LabelFrame(outer, text='Services', padx=10, pady=8)
         services_frame.grid(row=2, column=0, sticky='ew', pady=(10, 0))
@@ -556,6 +583,7 @@ class PickCycleGui:
 
     def _stop_clicked(self) -> None:
         self._stop_event.set()
+        self._set_robot_status(ROBOT_STATUS_STOP)
         self._set_status('Stopping after current monitor step...')
 
     def _read_config(self) -> CycleConfig:
@@ -596,6 +624,7 @@ class PickCycleGui:
                     self._log(f'=== Cycle {cycle_index} stopped/failed ===')
                     break
                 self._log(f'=== Cycle {cycle_index} done ===')
+                self._set_robot_status(ROBOT_STATUS_STOP)
                 if not config.loop_enabled:
                     break
                 if not self._sleep_with_stop(config.loop_pause_sec, 'Loop pause'):
@@ -606,7 +635,8 @@ class PickCycleGui:
             self._queue.put(('finished', None))
 
     def _run_one_cycle(self, config: CycleConfig, cycle_index: int) -> bool:
-        return (
+        self._set_robot_status(ROBOT_STATUS_PICKING)
+        if not (
             self._go_to_teach_step(cycle_index, 'Go to item detect teach', 'item_go_to_teach')
             and self._seek_step(
                 cycle_index,
@@ -618,7 +648,12 @@ class PickCycleGui:
                 'item_seek_status',
                 config,
             )
-            and self._go_to_teach_step(cycle_index, 'Go to tray detect teach', 'tray_go_to_teach')
+        ):
+            return False
+
+        self._set_robot_status(ROBOT_STATUS_PLACING)
+        return (
+            self._go_to_teach_step(cycle_index, 'Go to tray detect teach', 'tray_go_to_teach')
             and self._seek_step(
                 cycle_index,
                 'Arm tray intercept',
@@ -805,6 +840,10 @@ class PickCycleGui:
     def _set_status(self, text: str) -> None:
         self._queue_call('status', text)
 
+    def _set_robot_status(self, status: str) -> None:
+        self._robot_status = status
+        self._queue_call('robot_status', status)
+
     def _log(self, text: str) -> None:
         timestamp = time.strftime('%H:%M:%S')
         self._queue_call('log', f'{timestamp}  {text}')
@@ -816,11 +855,15 @@ class PickCycleGui:
                 action, payload = self._queue.get_nowait()
                 if action == 'status':
                     self.status_var.set(str(payload))
+                elif action == 'robot_status':
+                    status = str(payload)
+                    self.robot_status_var.set(ROBOT_STATUS_LABELS.get(status, status))
                 elif action == 'log':
                     self._append_log(str(payload))
                 elif action == 'finished':
                     self._running = False
                     self._set_running_controls(False)
+                    self._set_robot_status(ROBOT_STATUS_STOP)
                     self.status_var.set('Idle' if not self._stop_event.is_set() else 'Stopped')
         except queue.Empty:
             pass

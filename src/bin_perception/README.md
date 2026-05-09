@@ -118,11 +118,14 @@ The teach preview mirrors the runtime mask order used by `item_detect`:
 ROI -> RGB mask -> optional RGB cleanup -> depth-plane mask -> depth window/trim -> pose detection
 ```
 
-For depth peak selection, detect uses only pixels inside:
+For depth peak selection, detect uses only finite depth pixels inside:
 
 ```text
-RGB mask AND ROI AND above normalized depth plane
+RGB mask AND ROI
 ```
+
+The normalized depth plane is a reference surface for measuring the depth window;
+it no longer clamps the scan to only pixels above the plane.
 
 ## Profile Files
 

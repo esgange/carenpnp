@@ -69,7 +69,7 @@ constexpr int kRgbDilateMinPx = 1;
 constexpr int kRgbDilateMaxPx = 20;
 constexpr int kDepthFillSensitivityMin = 0;
 constexpr int kDepthFillSensitivityMax = 100;
-constexpr int kDepthWindowMinMm = 0;
+constexpr int kDepthWindowMinMm = 1;
 constexpr int kDepthWindowMaxMm = 100;
 constexpr int kDepthTrimMinPx = 0;
 constexpr int kDepthTrimMaxPx = 30;
@@ -459,7 +459,7 @@ cv::Mat buildPositiveFiniteDepthMask(const cv::Mat &depth_m)
   return mask;
 }
 
-cv::Mat buildDepthAbovePlaneMask(const cv::Mat &depth_residual_m)
+cv::Mat buildFiniteDepthResidualMask(const cv::Mat &depth_residual_m)
 {
   cv::Mat mask;
   if (depth_residual_m.empty() || depth_residual_m.type() != CV_32FC1)
@@ -475,12 +475,7 @@ cv::Mat buildDepthAbovePlaneMask(const cv::Mat &depth_residual_m)
     for (int x = 0; x < depth_residual_m.cols; ++x)
     {
       const float residual = depth_row[x];
-      if (!std::isfinite(residual))
-      {
-        continue;
-      }
-      const float height_above_plane_m = -residual;
-      if (height_above_plane_m >= 0.0F)
+      if (std::isfinite(residual))
       {
         mask_row[x] = 255;
       }
@@ -551,7 +546,7 @@ cv::Mat applyDepthTopWindowMask(
 
   const float depth_window_m = static_cast<float>(
     std::clamp(depth_window_mm, kDepthWindowMinMm, kDepthWindowMaxMm)) / 1000.0F;
-  const float min_keep_height_m = std::max(0.0F, peak_height_m - depth_window_m);
+  const float min_keep_height_m = peak_height_m - depth_window_m;
   if (peak_info != nullptr)
   {
     peak_info->valid = true;
@@ -5677,8 +5672,6 @@ private:
     buttons_.clear();
     buttons_.push_back({"Live", cv::Rect(button_x, top_y, 112, top_h), &live_view_enabled_});
     button_x += 112 + top_gap;
-    buttons_.push_back({"Clear Depth", cv::Rect(button_x, top_y, 132, top_h), nullptr});
-    button_x += 132 + top_gap;
     buttons_.push_back({"View", cv::Rect(button_x, top_y, 142, top_h), nullptr});
     button_x += 142 + top_gap;
     buttons_.push_back({"Overlay", cv::Rect(button_x, top_y, 128, top_h), &overlay_enabled_});
@@ -6913,8 +6906,12 @@ private:
         }
       }
       depth_plane_model_ = entry.depth_plane;
-      depth_plane_roi_bounds_ = plane_bounds;
-      depth_plane_roi_points_ = plane_bounds.has_value() ? roiPointsFromBounds(*plane_bounds) : std::vector<cv::Point2f>{};
+      depth_plane_roi_points_ = loaded_roi_points;
+      depth_plane_roi_bounds_ = roiBoundsFromSelection(depth_plane_roi_points_);
+      if (!depth_plane_roi_bounds_.has_value())
+      {
+        depth_plane_roi_bounds_ = plane_bounds;
+      }
       pending_depth_plane_points_.clear();
       depth_plane_from_bin_teach_ = depth_plane_model_.valid && depth_plane_roi_bounds_.has_value();
     }
@@ -7434,20 +7431,6 @@ private:
     }
   }
 
-  void clearDepthNormalizeSelection()
-  {
-    clearDepthPlaneReference(false);
-    clearAllPoseReferenceSlots();
-    pose_stage_status_.clear();
-    if (teach_stage_ >= TeachStage::kDepthNormalize)
-    {
-      setTeachStage(TeachStage::kDepthNormalize, false);
-    }
-    save_status_message_ = "Depth normalize cleared (0/4)";
-    save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
-    markRuntimeSettingsDirty();
-  }
-
   bool poseBlobReferenceReadyForSave(const PoseBlobReference2D &reference_blob) const
   {
     const auto finite_point = [](const cv::Point2f &point)
@@ -7945,6 +7928,53 @@ private:
     return true;
   }
 
+  bool fitDepthNormalizeFromRoiPoints()
+  {
+    if (!hasValidRoiPoints(roi_points_))
+    {
+      return false;
+    }
+
+    std::vector<cv::Point2f> depth_points = roi_points_;
+    if (depth_points.size() != 4)
+    {
+      const auto roi_bounds = roiBoundsFromSelection(depth_points);
+      if (!roi_bounds.has_value())
+      {
+        return false;
+      }
+      depth_points = roiPointsFromBounds(*roi_bounds);
+    }
+    if (depth_points.size() != 4)
+    {
+      return false;
+    }
+
+    cv::Mat depth_for_fit;
+    if (!getDepthFrameForPlaneFit(depth_for_fit))
+    {
+      return false;
+    }
+
+    DepthPlaneModel fitted_plane;
+    if (!fitDepthPlaneFromCorners(depth_for_fit, depth_points, fitted_plane))
+    {
+      return false;
+    }
+
+    depth_plane_model_ = fitted_plane;
+    depth_plane_roi_points_ = depth_points;
+    depth_plane_from_bin_teach_ = false;
+    pending_depth_plane_points_.clear();
+    depth_plane_roi_bounds_ = roiBoundsFromSelection(depth_plane_roi_points_);
+    if (!depth_plane_roi_bounds_.has_value())
+    {
+      depth_plane_roi_bounds_ = roiBoundsFromSelection(roi_points_);
+    }
+    markRuntimeSettingsDirty();
+    return true;
+  }
+
   void backTeachSequence()
   {
     switch (teach_stage_)
@@ -8030,10 +8060,18 @@ private:
           markRuntimeSettingsDirty();
           return;
         }
+        if (fitDepthNormalizeFromRoiPoints())
+        {
+          setTeachStage(TeachStage::kFlatLocate);
+          view_mode_ = ViewMode::kDepth;
+          save_status_message_ = "Using ROI points for depth normalize. Stage: tune depth window/hole/trim";
+          save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.8);
+          return;
+        }
         clearDepthPlaneReference(false);
         setTeachStage(TeachStage::kDepthNormalize);
         view_mode_ = ViewMode::kDepth;
-        save_status_message_ = "Depth normalize: click 4 points (0/4)";
+        save_status_message_ = "ROI depth fit unavailable; click 4 depth normalize points (0/4)";
         save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
         markRuntimeSettingsDirty();
         return;
@@ -8156,14 +8194,6 @@ private:
           continue;
         }
 
-        if (button.label == "Clear Depth")
-        {
-          if (teach_stage_ >= TeachStage::kDepthNormalize || !pending_depth_plane_points_.empty() || hasDepthPlaneReference())
-          {
-            clearDepthNormalizeSelection();
-          }
-          return;
-        }
         if (button.label == "View")
         {
           advanceViewMode();
@@ -8311,10 +8341,6 @@ private:
     {
       return focus_black_mask_ ? "Focus Black" : "Focus White";
     }
-    if (button.label == "Clear Depth")
-    {
-      return "Clear Depth";
-    }
     return button.label + ": " + ((button.state != nullptr && *button.state) ? "ON" : "OFF");
   }
 
@@ -8382,24 +8408,12 @@ private:
       {
         enabled = true;
       }
-      if (button.label == "Clear Depth")
-      {
-        enabled =
-          !pending_depth_plane_points_.empty() ||
-          hasDepthPlaneReference() ||
-          teach_stage_ >= TeachStage::kDepthNormalize;
-      }
       cv::Scalar fill_on(70, 132, 82);
       cv::Scalar border_on(132, 215, 150);
       if (button.label == "Live")
       {
         fill_on = cv::Scalar(70, 132, 82);
         border_on = cv::Scalar(132, 215, 150);
-      }
-      else if (button.label == "Clear Depth")
-      {
-        fill_on = cv::Scalar(92, 80, 152);
-        border_on = cv::Scalar(166, 152, 245);
       }
       else if (button.label == "View")
       {
@@ -9127,7 +9141,7 @@ private:
     bool normalized_depth_ready = false;
     cv::Mat depth_residual_m;
     cv::Mat depth_residual_display_m;
-    cv::Mat depth_above_plane_mask = cv::Mat::zeros(current_depth.size(), CV_8UC1);
+    cv::Mat finite_depth_residual_mask = cv::Mat::zeros(current_depth.size(), CV_8UC1);
     cv::Mat depth_window_mask = cv::Mat::zeros(current_depth.size(), CV_8UC1);
     cv::Mat depth_retain_mask = cv::Mat::zeros(current_depth.size(), CV_8UC1);
     DepthWindowPeakInfo depth_window_peak_info;
@@ -9143,13 +9157,13 @@ private:
 
     if (normalized_depth_ready)
     {
-      depth_above_plane_mask = buildDepthAbovePlaneMask(depth_residual_m);
+      finite_depth_residual_mask = buildFiniteDepthResidualMask(depth_residual_m);
       if (roi_ready)
       {
-        cv::bitwise_and(depth_above_plane_mask, roi_mask, depth_above_plane_mask);
+        cv::bitwise_and(finite_depth_residual_mask, roi_mask, finite_depth_residual_mask);
       }
       cv::Mat peak_candidate_mask;
-      cv::bitwise_and(depth_above_plane_mask, color_detection_mask, peak_candidate_mask);
+      cv::bitwise_and(finite_depth_residual_mask, color_detection_mask, peak_candidate_mask);
       depth_window_mask = applyDepthTopWindowMask(
         depth_residual_m,
         peak_candidate_mask,
