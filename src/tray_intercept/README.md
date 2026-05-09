@@ -85,9 +85,11 @@ angle control sets a `-90..90 deg` offset on top of whichever detected tray
 axis is visually vertical in the live tray overlay: if tray `+Y` is vertical it
 follows `+Y`, and if tray `+X` is vertical it follows `+X`. If live overlay axes
 are unavailable, it falls back to the tray axes projected into robot base XY.
-Negative rotates CCW, positive rotates CW, and zero follows the selected tray
-axis directly. The tray-direction follow move still uses detected tray speed,
-and post-follow Z-up uses the configured arm max speed.
+The selected axis first gets a fixed `90 deg` clockwise EE alignment, then the
+operator offset is applied. Negative rotates CCW, positive rotates CW, and zero
+uses only the fixed clockwise alignment. The tray-direction follow move still
+uses detected tray speed, and post-follow Z-up uses the configured arm max
+speed.
 The tray standoff Z offset is applied in robot/base +Z, so positive Z remains
 an upward standoff even if the detected tray frame has a downward natural Z.
 Tray X/Y offsets are projected into the robot base XY plane before motion.

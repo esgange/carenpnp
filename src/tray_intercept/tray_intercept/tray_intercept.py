@@ -43,6 +43,7 @@ FIXED_EE_INTERCEPT_SPEED_MM_S = 650.0
 EE_FINAL_POSE_ANGLE_MIN_DEG = -90.0
 EE_FINAL_POSE_ANGLE_MAX_DEG = 90.0
 EE_FINAL_POSE_ANGLE_DEFAULT_DEG = 0.0
+EE_VERTICAL_AXIS_FIXED_CW_OFFSET_DEG = 90.0
 POST_STOP_X_OFFSET_MIN = -50.0
 POST_STOP_X_OFFSET_MAX = 400.0
 POST_STOP_Y_OFFSET_MIN = -50.0
@@ -916,11 +917,13 @@ class RelMovLMiniNode(Node):
             math.degrees(math.atan2(vertical_axis_in_base[1], vertical_axis_in_base[0])) + 180.0
         )
         # GUI convention is negative=CCW and positive=CW. Mathematical yaw is
-        # positive CCW, so subtract the operator offset from the selected
-        # vertical tray-axis yaw.
+        # positive CCW, so subtract the fixed CW tool alignment and then the
+        # operator offset from the selected vertical tray-axis yaw.
         goal_rx_deg = current_rx_deg
         goal_ry_deg = current_ry_deg
-        goal_rz_deg = self._normalize_angle_deg(tray_axis_rz_deg - signed_ee_angle_deg)
+        goal_rz_deg = self._normalize_angle_deg(
+            tray_axis_rz_deg - EE_VERTICAL_AXIS_FIXED_CW_OFFSET_DEG - signed_ee_angle_deg
+        )
 
         return PredictedGoal(
             x_mm=target_x_goal,
