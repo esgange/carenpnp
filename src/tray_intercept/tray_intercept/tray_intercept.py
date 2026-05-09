@@ -128,8 +128,9 @@ class PredictedGoal:
     tray_age_sec: float
     tray_speed_base_mmps: float
     follow_direction_base_unit: tuple[float, float, float]
+    tray_axis_rz_deg: float = 0.0
     ee_angle_signed_deg: float = 0.0
-    ee_angle_direction_label: str = 'none'
+    ee_angle_direction_label: str = 'tray_axis'
 
 
 class RelMovLMiniNode(Node):
@@ -298,7 +299,7 @@ class RelMovLMiniNode(Node):
             'Startup defaults: '
             f'wait={self._tray_vector_watch_timeout_sec:.0f}s, '
             f'fixed_speed={self._post_stop_movel_speed_mm_s:.0f} mm/s, '
-            f'ee_angle={self._ee_final_pose_angle_deg:.0f} deg, '
+            f'ee_angle_offset={self._ee_final_pose_angle_deg:.0f} deg, '
             f'offsets(x={self._post_stop_x_offset_mm:.0f},'
             f'y={self._post_stop_y_offset_mm:.0f},'
             f'z={self._post_stop_z_offset_mm:.0f}) mm, '
@@ -453,6 +454,13 @@ class RelMovLMiniNode(Node):
         cosy_cosp = 1.0 - (2.0 * ((qy * qy) + (qz * qz)))
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return (math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
+
+    @staticmethod
+    def _normalize_angle_deg(angle_deg: float) -> float:
+        normalized = (float(angle_deg) + 180.0) % 360.0 - 180.0
+        if normalized <= -180.0:
+            return normalized + 360.0
+        return normalized
 
     @staticmethod
     def _builtin_time_to_sec(stamp) -> float:
@@ -875,33 +883,29 @@ class RelMovLMiniNode(Node):
         target_y_goal = desired_now_goal_mm[1] + (velocity_base_mmps[1] * lead_time_sec)
         target_z_goal = desired_now_goal_mm[2] + (velocity_base_mmps[2] * lead_time_sec)
 
-        q_base_goal = self._quat_normalize(
-            self._rpy_deg_to_quaternion(
-                float(snapshot.tcp_values.get('rx', 0.0)),
-                float(snapshot.tcp_values.get('ry', 0.0)),
-                float(snapshot.tcp_values.get('rz', 0.0)),
-            )
-        )
+        current_rx_deg = float(snapshot.tcp_values.get('rx', 0.0))
+        current_ry_deg = float(snapshot.tcp_values.get('ry', 0.0))
         ee_angle_deg = max(
             EE_FINAL_POSE_ANGLE_MIN_DEG,
             min(EE_FINAL_POSE_ANGLE_MAX_DEG, float(ee_final_pose_angle_deg)),
         )
         signed_ee_angle_deg = 0.0
-        ee_angle_direction_label = 'none'
+        ee_angle_direction_label = 'tray_axis'
         if ee_angle_deg < -1e-6:
             signed_ee_angle_deg = ee_angle_deg
-            ee_angle_direction_label = 'ccw_manual'
+            ee_angle_direction_label = 'ccw_offset'
         elif ee_angle_deg > 1e-6:
             signed_ee_angle_deg = ee_angle_deg
-            ee_angle_direction_label = 'cw_manual'
-        if abs(signed_ee_angle_deg) > 1e-6:
-            # GUI convention is negative=CCW and positive=CW. Positive local Rz
-            # is CCW in quaternion math, so invert the operator command here.
-            q_angle_local = self._rpy_deg_to_quaternion(0.0, 0.0, -signed_ee_angle_deg)
-            q_base_goal = self._quat_normalize(
-                self._quat_multiply(q_base_goal, q_angle_local)
-            )
-        goal_rx_deg, goal_ry_deg, goal_rz_deg = self._quaternion_to_rpy_deg(q_base_goal)
+            ee_angle_direction_label = 'cw_offset'
+
+        tray_axis_rz_deg = self._normalize_angle_deg(
+            math.degrees(math.atan2(tray_local_y_in_base[1], tray_local_y_in_base[0]))
+        )
+        # GUI convention is negative=CCW and positive=CW. Mathematical yaw is
+        # positive CCW, so subtract the operator offset from the tray Y-axis yaw.
+        goal_rx_deg = current_rx_deg
+        goal_ry_deg = current_ry_deg
+        goal_rz_deg = self._normalize_angle_deg(tray_axis_rz_deg - signed_ee_angle_deg)
 
         return PredictedGoal(
             x_mm=target_x_goal,
@@ -915,6 +919,7 @@ class RelMovLMiniNode(Node):
             tray_age_sec=tray_age_sec,
             tray_speed_base_mmps=tray_speed_base_mmps,
             follow_direction_base_unit=follow_direction_base_unit,
+            tray_axis_rz_deg=tray_axis_rz_deg,
             ee_angle_signed_deg=signed_ee_angle_deg,
             ee_angle_direction_label=ee_angle_direction_label,
         )
@@ -1226,7 +1231,9 @@ class RelMovLMiniNode(Node):
                 f'Previewed 3-stage goal from {base_goal.source_frame_id}: '
                 f'age={base_goal.tray_age_sec:.3f}s lead={base_goal.lead_time_sec:.3f}s '
                 f'tray_speed={base_goal.tray_speed_base_mmps:.1f} mm/s '
-                f'ee_angle={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
+                f'tray_y_rz={base_goal.tray_axis_rz_deg:.1f}deg '
+                f'ee_offset={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
+                f'goal_rz={base_goal.rz_deg:.1f}deg '
                 f'z-up follow={zup_follow_distance_mm:.1f} mm. TF-only.'
             )
         except Exception as exc:
@@ -1460,7 +1467,9 @@ class RelMovLMiniNode(Node):
                 f'intercept {intercept_speed_mm_s:.0f} mm/s, follow {follow_distance_mm:.0f} mm '
                 f'at tray speed {follow_speed_mm_s:.0f} mm/s, '
                 f'post Z-up {post_follow_z_up_mm:.0f} mm with tray-follow {zup_follow_distance_mm:.1f} mm. '
-                f'ee_angle={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
+                f'tray_y_rz={base_goal.tray_axis_rz_deg:.1f}deg '
+                f'ee_offset={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
+                f'goal_rz={base_goal.rz_deg:.1f}deg '
                 f'release_grip={"on" if release_grip_enabled else "off"} '
                 f'age={base_goal.tray_age_sec:.3f}s lead={base_goal.lead_time_sec:.3f}s '
                 f'tray_speed={base_goal.tray_speed_base_mmps:.1f} mm/s '
@@ -1875,7 +1884,7 @@ class RelMovLMiniNode(Node):
                 f'mode={mode_name} '
                 f'wait={watch_timeout_sec:.0f}s '
                 f'fixed_speed={self._post_stop_movel_speed_mm_s:.0f} mm/s '
-                f'ee_angle={self._ee_final_pose_angle_deg:.0f} deg '
+                f'ee_angle_offset={self._ee_final_pose_angle_deg:.0f} deg '
                 f'offsets(x={self._post_stop_x_offset_mm:.0f},'
                 f'y={self._post_stop_y_offset_mm:.0f},'
                 f'z={self._post_stop_z_offset_mm:.0f}) mm '
@@ -2342,7 +2351,7 @@ class RelMovLMiniGui:
             text=f'EE intercept speed fixed: {FIXED_EE_INTERCEPT_SPEED_MM_S:.0f} mm/s',
         ).grid(row=0, column=0, sticky='w')
 
-        tk.Label(settings_frame, text='EE final pose angle (deg, -CCW / +CW)').grid(row=1, column=0, sticky='w', pady=(10, 0))
+        tk.Label(settings_frame, text='EE tray-Y angle offset (deg, -CCW / +CW)').grid(row=1, column=0, sticky='w', pady=(10, 0))
         self.ee_final_pose_angle_var = tk.DoubleVar(value=EE_FINAL_POSE_ANGLE_DEFAULT_DEG)
         self.ee_final_pose_angle_scale = tk.Scale(
             settings_frame,
