@@ -83,7 +83,9 @@ source install/setup.bash
 SAM2 is installed in a workspace-local Python environment:
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 python -c "import torch, torchvision, sam2; print(torch.__version__, torchvision.__version__, sam2.__file__)"
 ```
 
