@@ -8,7 +8,7 @@ layout.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select dobot_rviz
 source install/setup.bash
@@ -16,21 +16,13 @@ source install/setup.bash
 
 ## Launch
 
-Start DOBOT bringup first so live joint states are available:
-
-```bash
-ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
-```
-
-Then launch RViz:
-
 ```bash
 ros2 launch dobot_rviz dobot_rviz.launch.py
 ```
 
 ## What the Launch Does
 
-- Reads `robot_type` from `cr_robot_ros2/config/param.json`.
+- Reads `robot_type` from `WORKSPACE_ROOT/config/dobot_bringup_v4/param.json`.
 - Selects the matching URDF from `urdf/`.
 - Falls back to `cr5_robot.urdf` if the configured model has no URDF.
 - Starts `robot_state_publisher`.
@@ -71,7 +63,7 @@ Useful debug TFs include:
 
 ## Notes
 
-- Keep `robot_type` in `cr_robot_ros2/config/param.json` aligned with the
+- Keep `robot_type` in `WORKSPACE_ROOT/config/dobot_bringup_v4/param.json` aligned with the
   physical robot.
 - Run perception packages alongside RViz to populate obstacle, tray, bin, and
   debug overlays.

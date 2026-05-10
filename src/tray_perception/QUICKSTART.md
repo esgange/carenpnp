@@ -7,7 +7,7 @@ contract.
 ## 1. Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select tray_perception
 source install/setup.bash
@@ -47,13 +47,13 @@ Teach flow:
 Saved profiles are written to:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/trays/tray_<name>_<ddmmyyyy>.yaml
+WORKSPACE_ROOT/teach/trays/tray_<name>_<ddmmyyyy>.yaml
 ```
 
 The compatibility/latest profile is also written as:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/trays/tray_teach_settings.yaml
+WORKSPACE_ROOT/config/trays/tray_teach_settings.yaml
 ```
 
 ## 3. Run Detection
@@ -73,7 +73,7 @@ ros2 launch tray_perception tray_detect.launch.py \
 
 Detect mode:
 
-- loads valid tray profiles from `/home/erds/DOBOT_pickn_place/config/trays`;
+- loads valid tray profiles from `WORKSPACE_ROOT/teach/trays`;
 - supports RGB or depth detection based on the selected profile;
 - publishes `tray_pose` after the seek confidence threshold is met;
 - publishes `tray_vector` with timing and velocity metadata;
@@ -92,7 +92,7 @@ ros2 service call /tray_detect/get_tray_dimensions dobot_msgs_v4/srv/GetTrayDime
 
 - No profile in the dropdown: teach and save a profile, then restart detect.
 - Missing calibration: pass `calibration_file:=/abs/path/to/file.yaml` or add a
-  valid YAML to `~/DOBOT_pickn_place/calibration`.
+  valid YAML to `WORKSPACE_ROOT/calibration`.
 - Overlay appears but no `tray_pose`: loosen area/depth tolerance or retune the
   tray ROI and thresholds.
 - Unstable output: re-teach the profile with a cleaner ROI and stronger edge or

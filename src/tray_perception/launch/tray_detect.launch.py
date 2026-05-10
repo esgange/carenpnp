@@ -7,6 +7,36 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def _workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / "src").exists() and
+            (
+                (path / "README.md").exists()
+                or (path / "docker-compose.yml").exists()
+                or (path / "src" / "dobot_msgs_v4").exists()
+            )
+        )
+
+    for name in ("DOBOT_PICKN_PLACE_ROOT", "DOBOT_WORKSPACE_ROOT"):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser().resolve()
+
+    for start in (Path.cwd(), Path(__file__).resolve()):
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+    return Path.cwd().resolve()
+
+
+def _repo_path(*parts: str) -> str:
+    return str(_workspace_root().joinpath(*parts))
+
+
 def _to_bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
@@ -122,12 +152,36 @@ def _launch_setup(context, *args, **kwargs):
         )
     ]
 
+def _ros_domain_action():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / 'src' / 'dobot_bringup_v4' / 'launch' / 'ros_domain.py',
+            parent / 'install' / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location('_dobot_ros_domain', helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.ros_domain_action()
+
+    raise RuntimeError('Could not find ros_domain.py helper for ROS_DOMAIN_ID')
+
 
 def generate_launch_description():
     return LaunchDescription([
+        _ros_domain_action(),
         DeclareLaunchArgument(
             "params_file",
-            default_value="/home/erds/DOBOT_pickn_place/config/trays/tray_teach_settings.yaml",
+            default_value=_repo_path("config", "trays", "tray_teach_settings.yaml"),
         ),
         DeclareLaunchArgument(
             "color_topic",
@@ -163,7 +217,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "calibration_dir",
-            default_value="~/DOBOT_pickn_place/calibration",
+            default_value=_repo_path("calibration"),
         ),
         DeclareLaunchArgument(
             "calibration_file",

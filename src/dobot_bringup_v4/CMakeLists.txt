@@ -52,8 +52,16 @@ target_link_libraries(${PROJECT_NAME}_node
 install(TARGETS ${PROJECT_NAME}_node
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch config
+install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
+
+ament_environment_hooks(environment/ros_domain_id.sh)
+
+set(WORKSPACE_PARAM_JSON "${CMAKE_CURRENT_SOURCE_DIR}/../../config/dobot_bringup_v4/param.json")
+if(EXISTS "${WORKSPACE_PARAM_JSON}")
+  install(FILES "${WORKSPACE_PARAM_JSON}"
+    DESTINATION share/${PROJECT_NAME}/config)
+endif()
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

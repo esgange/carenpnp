@@ -15,6 +15,7 @@ setup(
             'share/' + package_name + '/launch',
             [
                 'launch/pick_cycle.launch.py',
+                'launch/pick_cycle_servo.launch.py',
             ],
         ),
     ],
@@ -28,6 +29,7 @@ setup(
     entry_points={
         'console_scripts': [
             'pick_cycle_gui = pick_cycle.pick_cycle_gui:main',
+            'pick_cycle_gui_servo = pick_cycle.pick_cycle_gui_servo:main',
         ],
     },
 )

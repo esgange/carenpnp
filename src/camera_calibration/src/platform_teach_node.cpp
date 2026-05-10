@@ -47,6 +47,8 @@
 #include <tf2_ros/transform_listener.h>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
@@ -126,12 +128,7 @@ std::filesystem::path expandUserPath(const std::string &raw)
 
 std::filesystem::path defaultPlatformCalibrationDir()
 {
-  const char *home = std::getenv("HOME");
-  if (home == nullptr)
-  {
-    return std::filesystem::path("config") / "platform";
-  }
-  return std::filesystem::path(home) / "DOBOT_pickn_place" / "config" / "platform";
+  return dobot_common::paths::workspacePath({"teach", "platform"}, __FILE__);
 }
 
 std::string formatMarkerIds(const std::vector<int64_t> &marker_ids)

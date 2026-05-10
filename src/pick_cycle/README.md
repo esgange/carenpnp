@@ -45,8 +45,78 @@ based on live feedback time, not a fixed number of frames. A 30 second internal
 watchdog prevents robot monitoring from hanging forever and logs the last
 observed TCP delta when it cannot classify stability.
 
-Run:
+## Launch
+
+Source the workspace first:
+
+```bash
+cd WORKSPACE_ROOT
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+```
+
+Launch the non-servo pick-cycle GUI:
 
 ```bash
 ros2 launch pick_cycle pick_cycle.launch.py
 ```
+
+Launch the servo pick-cycle GUI:
+
+```bash
+ros2 launch pick_cycle pick_cycle_servo.launch.py
+```
+
+To open both GUIs at the same time, use two terminals:
+
+```bash
+# Terminal 1
+cd WORKSPACE_ROOT
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch pick_cycle pick_cycle.launch.py
+```
+
+```bash
+# Terminal 2
+cd WORKSPACE_ROOT
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch pick_cycle pick_cycle_servo.launch.py
+```
+
+Direct run commands are also available:
+
+```bash
+ros2 run pick_cycle pick_cycle_gui
+ros2 run pick_cycle pick_cycle_gui_servo
+```
+
+`pick_cycle_gui` arms `item_pick` and `tray_intercept`. `pick_cycle_gui_servo`
+uses the shared `item_detect` and `tray_detect` services, but arms
+`item_pick_servo` and `tray_intercept_servo`. Do not run both cycles actively at
+the same time against the same robot.
+
+## Background movement timing
+
+The GUI now includes a passive movement tracker. It observes the configured robot
+TCP feedback topic in the background and logs a timing line after each detected
+physical movement settles, for example:
+
+```text
+Movement tracker: Cycle 1: Go to item detect teach -> Cycle 1: Arm item pick travel took 2.34s (TCP delta 185.6mm, 0.0deg)
+```
+
+This tracker does not send robot commands, add sleeps, or change the cycle
+sequence. It only watches TCP feedback and uses the same stability window chosen
+in the GUI to decide when a detected movement has finished.
+
+Each cycle also writes one debug text file containing all completed movement
+delta events for that cycle under:
+
+```text
+WORKSPACE_ROOT/debug files/pick_cycle_movement_deltas
+```
+
+File names use `YYYYMMDD_HHMMSS_cycle_<n>_movement_deltas.txt` and are updated
+as movement tracker events arrive during that cycle.

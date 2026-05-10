@@ -15,7 +15,7 @@ motion packages.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select tray_perception
 source install/setup.bash
@@ -88,7 +88,7 @@ Defaults:
 | `use_calibration` | `true` |
 | `parent_frame` | `Link6` |
 | `child_frame` | `calibrated_camera_link` |
-| `calibration_dir` | `~/DOBOT_pickn_place/calibration` |
+| `calibration_dir` | `WORKSPACE_ROOT/calibration` |
 
 If calibration is enabled and no usable YAML is available, launch shows an error
 dialog and exits.
@@ -117,7 +117,7 @@ dialog and exits.
 Profiles are stored in:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/trays
+WORKSPACE_ROOT/teach/trays
 ```
 
 Current dated profiles use:
@@ -135,7 +135,7 @@ tray_teach_settings.yaml
 Seek artifacts are written under:
 
 ```text
-/home/erds/DOBOT_pickn_place/debug files/seek_frames
+WORKSPACE_ROOT/debug files/seek_frames
 ```
 
 ## Key Runtime Defaults

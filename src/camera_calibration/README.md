@@ -17,7 +17,7 @@ packages.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select camera_calibration
 source install/setup.bash
@@ -132,7 +132,7 @@ ros2 service call /compute_calibration std_srvs/srv/Trigger {}
 Default output path:
 
 ```text
-~/DOBOT_pickn_place/calibration/axab_calibration.yaml
+WORKSPACE_ROOT/calibration/axab_calibration.yaml
 ```
 
 Saved YAML includes:
@@ -144,7 +144,7 @@ Saved YAML includes:
 - sample count and timestamp.
 
 The output is compatible with `aruco_perception`, `tray_perception`,
-`bin_perception`, and `obstacle_perception`.
+`item_perception`, and `obstacle_perception`.
 
 Only one active camera calibration YAML is kept in the calibration directory.
 Saving a new calibration deletes older `axab_calibration_*.yaml` files before
@@ -157,7 +157,7 @@ loads the current camera calibration first. It averages markers `1, 2, 3, 4`
 into `platform_board_observed`, then saves the board pose as:
 
 ```text
-~/DOBOT_pickn_place/config/platform/platform_calibration_<platform_name>.yaml
+WORKSPACE_ROOT/teach/platform/platform_calibration_<platform_name>.yaml
 ```
 
 Only one platform calibration is kept in that directory. Saving again deletes

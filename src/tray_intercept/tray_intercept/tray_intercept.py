@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import threading
 import time
 import tkinter as tk
@@ -26,8 +27,56 @@ LINEAR_SPEED_MM_S_MAX = 650.0
 DEFAULT_ACC_PERCENT = 100
 TCP_FIELDS = ('x', 'y', 'z', 'rx', 'ry', 'rz')
 TRANSLATION_AXES = ('x', 'y', 'z')
-CALIBRATION_FILE_PATH = Path.home() / '.ros' / 'relmovl_speed_calibration.json'
-CALIBRATION_DIR_PATH = Path.home() / 'DOBOT_pickn_place' / 'calibration'
+
+
+def workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / 'src').exists() and
+            (
+                (path / 'README.md').exists()
+                or (path / 'docker-compose.yml').exists()
+                or (path / 'src' / 'dobot_msgs_v4').exists()
+            )
+        )
+
+    def find_from(start: Path) -> Path | None:
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+        return None
+
+    for name in ('DOBOT_PICKN_PLACE_ROOT', 'DOBOT_WORKSPACE_ROOT'):
+        value = os.environ.get(name)
+        if value:
+            return find_from(Path(value)) or Path(value).expanduser().resolve()
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for name in ('COLCON_PREFIX_PATH', 'AMENT_PREFIX_PATH'):
+        for token in os.environ.get(name, '').split(os.pathsep):
+            if not token:
+                continue
+            prefix = Path(token)
+            candidates.append(prefix)
+            if 'install' in prefix.parts:
+                candidates.append(Path(*prefix.parts[:prefix.parts.index('install')]))
+
+    for candidate in candidates:
+        found = find_from(candidate)
+        if found is not None:
+            return found
+    return Path.cwd().resolve()
+
+
+def workspace_path(*parts: str) -> Path:
+    return workspace_root().joinpath(*parts)
+
+
+CALIBRATION_FILE_PATH = workspace_path('calibration', 'relmovl_speed_calibration.json')
+CALIBRATION_DIR_PATH = workspace_path('calibration')
 TRAY_VECTOR_TOPIC = 'tray_vector'
 TRAY_AXIS_OVERLAY_TOPIC = 'tray_axis_overlay'
 ROBOT_GOAL_FRAME_DEFAULT = 'base_link'
@@ -79,7 +128,7 @@ TRAY_PREVIEW_BORDER_MAX_MM = 150.0
 INTERCEPT_DOT_DIAMETER_DEFAULT_MM = 10.0
 INTERCEPT_DOT_DIAMETER_MIN_MM = 2.0
 INTERCEPT_DOT_DIAMETER_MAX_MM = 60.0
-RUNTIME_SETTINGS_PATH = Path.home() / '.ros' / 'tray_intercept_runtime_settings.json'
+RUNTIME_SETTINGS_PATH = workspace_path('config', 'trays', 'tray_intercept_runtime_settings.json')
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
 MOTION_PROFILE_ENFORCE_WAIT_SEC = 12.0
 MOTION_PROFILE_ENFORCE_CALL_SEC = 8.0

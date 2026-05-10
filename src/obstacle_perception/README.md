@@ -15,7 +15,7 @@ camera moves with the robot.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select obstacle_perception
 source install/setup.bash

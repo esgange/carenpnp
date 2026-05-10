@@ -14,7 +14,7 @@ retract, and final Z-up motions.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select item_pick
 source install/setup.bash
@@ -43,7 +43,7 @@ ros2 run item_pick item_pick
 The active profile export is read from:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/bins/item_detect_selected_profile.txt
+WORKSPACE_ROOT/config/bins/item_detect_selected_profile.txt
 ```
 
 The old `bin_detect_selected_profile.txt` path is still accepted as a fallback
@@ -92,7 +92,7 @@ and pickup-depth settling for the active item teach.
 Sidecar pattern:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/bins/<item_name>_tool.yaml
+WORKSPACE_ROOT/teach/items/<item_name>_tool.yaml
 ```
 
 The GUI can:

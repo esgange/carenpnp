@@ -23,6 +23,8 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
@@ -3065,13 +3067,15 @@ public:
     overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
     profiles_dir_ = declare_parameter<std::string>(
       "profiles_dir",
-      "/home/erds/DOBOT_pickn_place/config/trays");
+      dobot_common::paths::workspacePath({"teach", "trays"}, __FILE__).string());
     settings_path_ = declare_parameter<std::string>(
       "settings_path",
-      "/home/erds/DOBOT_pickn_place/config/trays/tray_teach_settings.yaml");
+      dobot_common::paths::workspacePath(
+        {"config", "trays", "tray_teach_settings.yaml"}, __FILE__).string());
     runtime_settings_path_ = declare_parameter<std::string>(
       "runtime_settings_path",
-      "/home/erds/DOBOT_pickn_place/config/trays/tray_teach_runtime.yaml");
+      dobot_common::paths::workspacePath(
+        {"config", "trays", "tray_teach_runtime.yaml"}, __FILE__).string());
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
     display_scale_ = declare_parameter<double>("display_scale", 1.0);
     const int legacy_ray_step = declare_parameter<int>("ray_step_mm", 3);

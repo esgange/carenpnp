@@ -1,0 +1,1284 @@
+#!/usr/bin/env python3
+import datetime as _dt
+import os
+import re
+import shutil
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import rclpy
+import torch
+import yaml
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image
+
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+
+def workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / "src").exists() and
+            (
+                (path / "README.md").exists()
+                or (path / "docker-compose.yml").exists()
+                or (path / "src" / "dobot_msgs_v4").exists()
+            )
+        )
+
+    def find_from(start: Path) -> Optional[Path]:
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+        return None
+
+    for name in ("DOBOT_PICKN_PLACE_ROOT", "DOBOT_WORKSPACE_ROOT"):
+        value = os.environ.get(name)
+        if value:
+            return find_from(Path(value)) or Path(value).expanduser().resolve()
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for name in ("COLCON_PREFIX_PATH", "AMENT_PREFIX_PATH"):
+        for token in os.environ.get(name, "").split(os.pathsep):
+            if not token:
+                continue
+            prefix = Path(token)
+            candidates.append(prefix)
+            if "install" in prefix.parts:
+                candidates.append(Path(*prefix.parts[:prefix.parts.index("install")]))
+
+    for candidate in candidates:
+        found = find_from(candidate)
+        if found is not None:
+            return found
+    return Path.cwd().resolve()
+
+
+def workspace_path(*parts: str) -> Path:
+    return workspace_root().joinpath(*parts)
+
+
+WINDOW_NAME = "item_teach_yolo_view"
+LEFT_PANEL_WIDTH = 440
+VIDEO_TOP_BAR_HEIGHT = 92
+PREVIEW_CANVAS_WIDTH = 1080
+PREVIEW_CANVAS_HEIGHT = 680
+PANEL_PAD = 20
+BUTTON_HEIGHT = 38
+DROPDOWN_ROW_HEIGHT = 32
+MAX_DROPDOWN_ROWS = 7
+
+
+@dataclass
+class BinEntry:
+    label: str
+    path: Path
+    bin_name: str
+    roi_points: List[Tuple[float, float]]
+    depth_plane: Dict[str, float]
+
+
+@dataclass
+class Button:
+    name: str
+    rect: Tuple[int, int, int, int]
+    enabled: bool = True
+
+
+def resolve_path(path_text: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(path_text))).resolve()
+
+
+def safe_name(text: str, fallback: str = "item") -> str:
+    value = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip().lower()).strip("_")
+    return value or fallback
+
+
+def timestamp_for_path() -> str:
+    return _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def compact_date_for_path() -> str:
+    return _dt.datetime.now().strftime("%d%m%Y")
+
+
+def as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def parse_flat_points(values) -> List[Tuple[float, float]]:
+    if not isinstance(values, list) or len(values) < 8:
+        return []
+    points: List[Tuple[float, float]] = []
+    for i in range(0, min(len(values), 8), 2):
+        points.append((float(values[i]), float(values[i + 1])))
+    return points if len(points) == 4 else []
+
+
+def fit_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def polygon_area(points: np.ndarray) -> float:
+    if points.shape[0] < 3:
+        return 0.0
+    return float(abs(cv2.contourArea(points.reshape(-1, 1, 2).astype(np.float32))))
+
+
+class ItemTeachYoloNode(Node):
+    def __init__(self) -> None:
+        super().__init__("item_teach_yolo")
+        self.bridge = CvBridge()
+
+        self.color_topic = self.declare_parameter("color_topic", "/camera/color/image_raw").value
+        self.joint_states_topic = self.declare_parameter("joint_states_topic", "/joint_states_robot").value
+        self.item_name = self.declare_parameter("item_name", "item").value
+        self.bin_teach_dir = resolve_path(
+            self.declare_parameter(
+                "bin_teach_dir",
+                str(workspace_path("teach", "bin_teach")),
+            ).value)
+        self.runtime_root = resolve_path(
+            self.declare_parameter(
+                "runtime_root",
+                str(workspace_path("teach", "bins_yolo", "runtime")),
+            ).value)
+        self.profile_dir = resolve_path(
+            self.declare_parameter(
+                "profile_dir",
+                str(workspace_path("teach", "bins_yolo", "profiles")),
+            ).value)
+        self.model_root = resolve_path(
+            self.declare_parameter(
+                "model_root",
+                str(workspace_path("teach", "bins_yolo", "models")),
+            ).value)
+        self.depth_topic = self.declare_parameter("depth_topic", "/camera/depth/image_raw").value
+        self.camera_info_topic = self.declare_parameter(
+            "camera_info_topic", "/camera/color/camera_info").value
+        self.overlay_topic = self.declare_parameter("overlay_topic", "bin_overlay").value
+        self.sam2_checkpoint = resolve_path(
+            self.declare_parameter(
+                "sam2_checkpoint",
+                str(workspace_path("third_party", "sam2", "checkpoints", "sam2.1_hiera_tiny.pt"))).value)
+        self.sam2_config = self.declare_parameter(
+            "sam2_config", "configs/sam2.1/sam2.1_hiera_t.yaml").value
+        self.yolo_base_model = self.declare_parameter(
+            "yolo_base_model",
+            str(workspace_path("third_party", "yolo", "checkpoints", "yolo11n-seg.pt"))).value
+        self.train_epochs = int(self.declare_parameter("train_epochs", 80).value)
+        self.train_imgsz = int(self.declare_parameter("train_imgsz", 640).value)
+        self.train_device = self.declare_parameter("train_device", "cpu").value
+        self.display_scale = float(self.declare_parameter("display_scale", 1.0).value)
+        self.overlay_enabled = as_bool(self.declare_parameter("overlay_enabled", True).value)
+        self.live_view_enabled = as_bool(self.declare_parameter("live_view_enabled", True).value)
+
+        self.lock = threading.Lock()
+        self.latest_bgr: Optional[np.ndarray] = None
+        self.latest_header_stamp = ""
+        self.latest_joint_positions_deg = [0.0] * 6
+        self.has_joint_positions = False
+
+        self.bin_entries: List[BinEntry] = []
+        self.active_bin_index = -1
+        self.active_bin: Optional[BinEntry] = None
+        self.bin_dropdown_open = False
+        self.roi_crop_rect: Optional[Tuple[int, int, int, int]] = None
+        self.roi_crop_mask: Optional[np.ndarray] = None
+
+        self.frozen_frame_bgr: Optional[np.ndarray] = None
+        self.frozen_crop_bgr: Optional[np.ndarray] = None
+        self.frozen_crop_rgb: Optional[np.ndarray] = None
+        self.current_mask: Optional[np.ndarray] = None
+        self.sam2_image_key: Optional[Tuple[int, int, int]] = None
+        self.positive_points: List[Tuple[int, int]] = []
+        self.negative_points: List[Tuple[int, int]] = []
+        self.prediction_dirty = False
+        self.predicting = False
+        self.status = "Load a Bin Teach file to begin"
+        self.item_name_edit_active = False
+        self.item_name_edit_buffer = self.item_name
+
+        self.sample_count = 0
+        self.training_thread: Optional[threading.Thread] = None
+        self.training_status = "idle"
+        self.training_epoch_current = 0
+        self.training_epoch_total = max(1, self.train_epochs)
+        self.training_progress = 0.0
+        self.trained_model_path = ""
+        self.trained_onnx_path = ""
+        self.final_model_dir = ""
+        self.latest_profile_path = ""
+
+        self.buttons: Dict[str, Button] = {}
+        self.item_name_input_rect = (0, 0, 0, 0)
+        self.preview_rect = (LEFT_PANEL_WIDTH, VIDEO_TOP_BAR_HEIGHT, PREVIEW_CANVAS_WIDTH, PREVIEW_CANVAS_HEIGHT)
+        self.preview_scale = 1.0
+        self.preview_image_size = (0, 0)
+        self.preview_source_size = (0, 0)
+
+        self.session_dir = self.create_session_dir()
+        self.configure_session_storage()
+        self.write_dataset_yaml()
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.get_logger().info(
+            f"Loading SAM2 checkpoint={self.sam2_checkpoint} device={self.device}")
+        sam2_model = build_sam2(self.sam2_config, str(self.sam2_checkpoint), device=self.device)
+        self.predictor = SAM2ImagePredictor(sam2_model)
+
+        self.refresh_bin_files()
+        self.save_session()
+
+        self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
+        self.joint_state_sub = self.create_subscription(
+            JointState,
+            self.joint_states_topic,
+            self.joint_state_callback,
+            10,
+        )
+
+        window_flags = cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0)
+        cv2.namedWindow(WINDOW_NAME, window_flags)
+        cv2.setMouseCallback(WINDOW_NAME, self.mouse_callback)
+        self.timer = self.create_timer(1.0 / 20.0, self.update_view)
+        self.get_logger().info(f"item_teach_yolo session: {self.session_dir}")
+
+    def create_session_dir(self) -> Path:
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        name = f"{safe_name(self.item_name)}_{timestamp_for_path()}"
+        path = self.runtime_root / name
+        suffix = 1
+        while path.exists():
+            path = self.runtime_root / f"{name}_{suffix}"
+            suffix += 1
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def configure_session_storage(self) -> None:
+        self.dataset_dir = self.session_dir / "dataset"
+        self.images_dir = self.dataset_dir / "images" / "train"
+        self.labels_dir = self.dataset_dir / "labels" / "train"
+        self.masks_dir = self.session_dir / "masks"
+        self.previews_dir = self.session_dir / "previews"
+        self.prompts_dir = self.session_dir / "prompts"
+        self.models_dir = self.session_dir / "models"
+        for path in [
+            self.images_dir,
+            self.labels_dir,
+            self.masks_dir,
+            self.previews_dir,
+            self.prompts_dir,
+            self.models_dir,
+        ]:
+            path.mkdir(parents=True, exist_ok=True)
+
+        self.dataset_yaml_path = self.session_dir / "dataset.yaml"
+        self.session_yaml_path = self.session_dir / "session.yaml"
+
+    def remove_runtime_dir(self, path: Path) -> None:
+        try:
+            resolved_path = path.resolve()
+            resolved_root = self.runtime_root.resolve()
+            if resolved_path == resolved_root:
+                return
+            resolved_path.relative_to(resolved_root)
+            if resolved_path.exists():
+                shutil.rmtree(resolved_path)
+        except Exception as exc:
+            self.get_logger().warn(f"Could not clear old runtime folder {path}: {exc}")
+
+    def reset_runtime_for_item_name(self, new_name: str) -> None:
+        old_session_dir = self.session_dir
+        self.clear_prompts(save=False)
+        self.item_name = new_name
+        self.item_name_edit_buffer = new_name
+        self.sample_count = 0
+        self.training_status = "idle"
+        self.training_epoch_current = 0
+        self.training_epoch_total = max(1, self.train_epochs)
+        self.training_progress = 0.0
+        self.trained_model_path = ""
+        self.trained_onnx_path = ""
+        self.final_model_dir = ""
+        self.latest_profile_path = ""
+        self.session_dir = self.create_session_dir()
+        self.configure_session_storage()
+        self.write_dataset_yaml()
+        self.remove_runtime_dir(old_session_dir)
+        self.status = f"Item name changed to {self.item_name}; runtime reset"
+        self.save_session()
+
+    def write_dataset_yaml(self) -> None:
+        data = {
+            "path": str(self.dataset_dir),
+            "train": "images/train",
+            "val": "images/train",
+            "names": {0: self.item_name},
+        }
+        self.dataset_yaml_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    def save_session(self) -> None:
+        active_bin = self.active_bin
+        data = {
+            "item_teach_yolo_session": {
+                "item_name": self.item_name,
+                "session_dir": str(self.session_dir),
+                "dataset_yaml": str(self.dataset_yaml_path),
+                "sample_count": self.sample_count,
+                "training_status": self.training_status,
+                "training_epoch_current": self.training_epoch_current,
+                "training_epoch_total": self.training_epoch_total,
+                "training_progress": round(float(self.training_progress), 4),
+                "trained_model_path": self.trained_model_path,
+                "trained_onnx_path": self.trained_onnx_path,
+                "final_model_dir": self.final_model_dir,
+                "latest_profile_path": self.latest_profile_path,
+                "active_bin_name": active_bin.bin_name if active_bin else "",
+                "active_bin_file": str(active_bin.path) if active_bin else "",
+                "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
+                "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
+                "positive_prompt_count": len(self.positive_points),
+                "negative_prompt_count": len(self.negative_points),
+            }
+        }
+        tmp_path = self.session_yaml_path.with_suffix(".tmp")
+        tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        tmp_path.replace(self.session_yaml_path)
+
+    def refresh_bin_files(self) -> None:
+        entries: List[BinEntry] = []
+        if self.bin_teach_dir.exists():
+            for path in sorted(self.bin_teach_dir.glob("*.yaml")):
+                entry = self.parse_bin_file(path)
+                if entry is not None:
+                    entries.append(entry)
+        self.bin_entries = entries
+        if not entries:
+            self.status = f"No compatible Bin Teach YAML in {self.bin_teach_dir}"
+
+    def parse_bin_file(self, path: Path) -> Optional[BinEntry]:
+        try:
+            root = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            bin_node = root.get("bin_teach", {})
+            roi_points = parse_flat_points(bin_node.get("roi_points", []))
+            if not roi_points:
+                return None
+            bin_name = str(bin_node.get("bin_name", path.stem))
+            depth_plane = {}
+            for key in [
+                "depth_plane_enabled",
+                "depth_plane_a",
+                "depth_plane_b",
+                "depth_plane_c",
+                "depth_plane_reference_depth_m",
+            ]:
+                if key in bin_node:
+                    depth_plane[key] = bin_node[key]
+            return BinEntry(
+                label=f"{bin_name} ({path.name})",
+                path=path,
+                bin_name=bin_name,
+                roi_points=roi_points,
+                depth_plane=depth_plane,
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Skipping bin teach file {path}: {exc}")
+            return None
+
+    def color_callback(self, msg: Image) -> None:
+        try:
+            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as exc:
+            self.get_logger().warn(f"Color conversion failed: {exc}")
+            return
+        with self.lock:
+            self.latest_bgr = bgr.copy()
+            self.latest_header_stamp = f"{msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}"
+
+    def joint_state_callback(self, msg: JointState) -> None:
+        if not msg.position:
+            return
+        rad_to_deg = 57.29577951308232
+        joints_deg = [0.0] * 6
+        found = [False] * 6
+        joint_index = {
+            "joint1": 0,
+            "joint2": 1,
+            "joint3": 2,
+            "joint4": 3,
+            "joint5": 4,
+            "joint6": 5,
+        }
+        for i, name in enumerate(msg.name[:len(msg.position)]):
+            index = joint_index.get(name)
+            if index is not None:
+                joints_deg[index] = float(msg.position[i]) * rad_to_deg
+                found[index] = True
+        valid = all(found)
+        if not valid and len(msg.position) >= 6:
+            joints_deg = [float(value) * rad_to_deg for value in msg.position[:6]]
+            valid = True
+        if not valid:
+            return
+        self.latest_joint_positions_deg = joints_deg
+        self.has_joint_positions = True
+
+    def select_bin(self, index: int) -> None:
+        if index < 0 or index >= len(self.bin_entries):
+            return
+        self.active_bin_index = index
+        self.active_bin = self.bin_entries[index]
+        self.bin_dropdown_open = False
+        self.clear_prompts(save=False)
+        self.status = f"Loaded bin ROI: {self.active_bin.bin_name}"
+        self.save_session()
+
+    def latest_frame_copy(self) -> Optional[np.ndarray]:
+        with self.lock:
+            frame = None if self.latest_bgr is None else self.latest_bgr.copy()
+        return frame
+
+    def roi_views_from_frame(
+        self,
+        frame: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], np.ndarray, np.ndarray, np.ndarray]]:
+        if frame is None or self.active_bin is None:
+            return None
+        h, w = frame.shape[:2]
+        points = np.asarray(self.active_bin.roi_points, dtype=np.float32)
+        xs = np.clip(points[:, 0], 0, max(0, w - 1))
+        ys = np.clip(points[:, 1], 0, max(0, h - 1))
+        clipped_points = np.column_stack([xs, ys]).astype(np.float32)
+        x0 = int(np.floor(np.min(xs)))
+        y0 = int(np.floor(np.min(ys)))
+        x1 = int(np.ceil(np.max(xs)))
+        y1 = int(np.ceil(np.max(ys)))
+        x1 = min(w - 1, max(x0 + 1, x1))
+        y1 = min(h - 1, max(y0 + 1, y1))
+        crop = frame[y0:y1 + 1, x0:x1 + 1].copy()
+        rel_points = np.round(clipped_points - np.array([x0, y0], dtype=np.float32)).astype(np.int32)
+        roi_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(roi_mask, [rel_points], 255)
+        crop[roi_mask == 0] = 0
+
+        full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        full_points = np.round(clipped_points).astype(np.int32)
+        cv2.fillPoly(full_mask, [full_points], 255)
+        full_roi_frame = np.zeros_like(frame)
+        full_roi_frame[full_mask > 0] = frame[full_mask > 0]
+        return crop, (x0, y0, crop.shape[1], crop.shape[0]), roi_mask, full_roi_frame, full_mask
+
+    def current_roi_crop(self) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], np.ndarray]]:
+        frame = self.latest_frame_copy()
+        if frame is None:
+            return None
+        roi_views = self.roi_views_from_frame(frame)
+        if roi_views is None:
+            return None
+        crop, rect, roi_mask, _, _ = roi_views
+        return crop, rect, roi_mask
+
+    def freeze_current_crop(self) -> bool:
+        frame = self.latest_frame_copy()
+        if frame is None:
+            self.status = "Select a bin and wait for color image"
+            return False
+        roi = self.roi_views_from_frame(frame)
+        if roi is None:
+            self.status = "Select a bin and wait for color image"
+            return False
+        crop, rect, roi_mask, full_roi_frame, _ = roi
+        self.frozen_frame_bgr = full_roi_frame
+        self.frozen_crop_bgr = crop
+        self.frozen_crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        self.roi_crop_rect = rect
+        self.roi_crop_mask = roi_mask
+        self.current_mask = None
+        self.sam2_image_key = None
+        return True
+
+    def clear_prompts(self, save: bool = True) -> None:
+        self.positive_points.clear()
+        self.negative_points.clear()
+        self.current_mask = None
+        self.frozen_frame_bgr = None
+        self.frozen_crop_bgr = None
+        self.frozen_crop_rgb = None
+        self.roi_crop_rect = None
+        self.roi_crop_mask = None
+        self.sam2_image_key = None
+        self.prediction_dirty = False
+        self.status = "Prompts cleared"
+        if save:
+            self.save_session()
+
+    def run_sam2_prediction(self) -> None:
+        if self.frozen_crop_rgb is None or not self.positive_points:
+            return
+        self.predicting = True
+        try:
+            image_key = (
+                self.frozen_crop_rgb.shape[1],
+                self.frozen_crop_rgb.shape[0],
+                int(np.sum(self.frozen_crop_rgb[:5, :5], dtype=np.int64)),
+            )
+            if self.sam2_image_key != image_key:
+                self.predictor.set_image(self.frozen_crop_rgb)
+                self.sam2_image_key = image_key
+            points = self.positive_points + self.negative_points
+            labels = [1] * len(self.positive_points) + [0] * len(self.negative_points)
+            point_coords = np.asarray(points, dtype=np.float32)
+            point_labels = np.asarray(labels, dtype=np.int32)
+            with torch.inference_mode():
+                masks, scores, _ = self.predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    multimask_output=True,
+                )
+            best_idx = int(np.argmax(scores))
+            mask = masks[best_idx].astype(np.uint8) * 255
+            if self.roi_crop_mask is not None:
+                mask = cv2.bitwise_and(mask, self.roi_crop_mask)
+            self.current_mask = mask
+            self.status = (
+                f"SAM2 mask ready | score {float(scores[best_idx]):.3f} | "
+                f"samples {self.sample_count}"
+            )
+        except Exception as exc:
+            self.status = f"SAM2 failed: {exc}"
+            self.get_logger().warn(self.status)
+        finally:
+            self.predicting = False
+            self.prediction_dirty = False
+            self.save_session()
+
+    def mask_to_largest_contour(self, mask: np.ndarray) -> Optional[np.ndarray]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = [c for c in contours if cv2.contourArea(c) >= 16.0]
+        if not contours:
+            return None
+        return max(contours, key=cv2.contourArea)
+
+    def contour_to_yolo_seg(self, contour: np.ndarray, width: int, height: int) -> Optional[str]:
+        epsilon = max(1.0, 0.002 * cv2.arcLength(contour, True))
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if approx.shape[0] < 3:
+            approx = contour
+        points = approx.reshape(-1, 2)
+        if points.shape[0] < 3 or polygon_area(points.astype(np.float32)) < 4.0:
+            return None
+        values = ["0"]
+        for x, y in points:
+            values.append(f"{min(max(float(x) / width, 0.0), 1.0):.6f}")
+            values.append(f"{min(max(float(y) / height, 0.0), 1.0):.6f}")
+        return " ".join(values) + "\n"
+
+    def save_sample(self) -> None:
+        if self.frozen_crop_bgr is None or self.current_mask is None:
+            self.status = "No SAM2 mask to save"
+            return
+        contour = self.mask_to_largest_contour(self.current_mask)
+        if contour is None:
+            self.status = "Mask is empty"
+            return
+        h, w = self.current_mask.shape[:2]
+        label_text = self.contour_to_yolo_seg(contour, w, h)
+        if label_text is None:
+            self.status = "Mask polygon is invalid"
+            return
+
+        self.sample_count += 1
+        stem = f"sample_{self.sample_count:06d}"
+        image_path = self.images_dir / f"{stem}.png"
+        label_path = self.labels_dir / f"{stem}.txt"
+        mask_path = self.masks_dir / f"{stem}.png"
+        preview_path = self.previews_dir / f"{stem}_overlay.png"
+        prompt_path = self.prompts_dir / f"{stem}.yaml"
+
+        cv2.imwrite(str(image_path), self.frozen_crop_bgr)
+        label_path.write_text(label_text, encoding="utf-8")
+        cv2.imwrite(str(mask_path), self.current_mask)
+        preview = self.render_mask_overlay(self.frozen_crop_bgr.copy(), self.current_mask)
+        cv2.imwrite(str(preview_path), preview)
+        prompt_data = {
+            "sample": stem,
+            "item_name": self.item_name,
+            "bin_name": self.active_bin.bin_name if self.active_bin else "",
+            "bin_file": str(self.active_bin.path) if self.active_bin else "",
+            "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
+            "positive_points": [list(p) for p in self.positive_points],
+            "negative_points": [list(p) for p in self.negative_points],
+            "image": str(image_path),
+            "label": str(label_path),
+            "mask": str(mask_path),
+            "preview": str(preview_path),
+        }
+        prompt_path.write_text(yaml.safe_dump(prompt_data, sort_keys=False), encoding="utf-8")
+        self.write_dataset_yaml()
+        self.write_profile()
+        self.status = f"Saved YOLO sample {self.sample_count}"
+        self.save_session()
+
+    def start_training(self) -> None:
+        if self.training_thread is not None and self.training_thread.is_alive():
+            self.status = "Training already running"
+            return
+        if self.sample_count <= 0:
+            self.status = "Save at least one sample first"
+            return
+        self.training_status = "training"
+        self.training_epoch_current = 0
+        self.training_epoch_total = max(1, self.train_epochs)
+        self.training_progress = 0.0
+        self.status = f"Training YOLO11-seg on {self.sample_count} samples"
+        self.save_session()
+        self.training_thread = threading.Thread(target=self.train_worker, daemon=True)
+        self.training_thread.start()
+
+    def update_training_progress(self, current_epoch: int, total_epochs: int, stage: str = "training") -> None:
+        total = max(1, int(total_epochs))
+        current = min(max(0, int(current_epoch)), total)
+        self.training_epoch_total = total
+        self.training_epoch_current = current
+        self.training_progress = float(current) / float(total)
+        percent = int(round(self.training_progress * 100.0))
+        self.training_status = f"{stage} {current}/{total} ({percent}%)"
+
+    def train_worker(self) -> None:
+        try:
+            from ultralytics import YOLO
+
+            base_model_path = resolve_path(self.yolo_base_model)
+            model_ref = str(base_model_path) if base_model_path.exists() else base_model_path.name
+            model = YOLO(model_ref)
+
+            def on_train_start(trainer) -> None:
+                total_epochs = int(getattr(trainer, "epochs", self.train_epochs))
+                self.update_training_progress(0, total_epochs, "training")
+                self.status = f"Training YOLO11-seg: epoch 0/{self.training_epoch_total}"
+                self.save_session()
+
+            def on_train_epoch_start(trainer) -> None:
+                total_epochs = int(getattr(trainer, "epochs", self.train_epochs))
+                epoch_index = int(getattr(trainer, "epoch", 0)) + 1
+                completed = max(0, epoch_index - 1)
+                self.update_training_progress(completed, total_epochs, "training")
+                self.status = f"Training YOLO11-seg: epoch {epoch_index}/{self.training_epoch_total}"
+
+            def on_fit_epoch_end(trainer) -> None:
+                total_epochs = int(getattr(trainer, "epochs", self.train_epochs))
+                completed = int(getattr(trainer, "epoch", 0)) + 1
+                self.update_training_progress(completed, total_epochs, "training")
+                self.status = (
+                    f"Training YOLO11-seg: epoch "
+                    f"{self.training_epoch_current}/{self.training_epoch_total}"
+                )
+                self.save_session()
+
+            model.add_callback("on_train_start", on_train_start)
+            model.add_callback("on_train_epoch_start", on_train_epoch_start)
+            model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
+            result = model.train(
+                data=str(self.dataset_yaml_path),
+                imgsz=self.train_imgsz,
+                epochs=self.train_epochs,
+                project=str(self.models_dir),
+                name="train",
+                device=self.train_device,
+                exist_ok=True,
+            )
+            best_path = Path(result.save_dir) / "weights" / "best.pt"
+            self.promote_trained_model(best_path)
+            self.update_training_progress(self.training_epoch_total, self.training_epoch_total, "done")
+            self.training_status = "done"
+            self.status = f"Training done: {self.trained_onnx_path or self.trained_model_path}"
+            self.write_profile()
+        except Exception as exc:
+            self.training_status = f"failed: {exc}"
+            self.status = self.training_status
+            self.get_logger().error(f"YOLO11 training failed: {exc}")
+        finally:
+            self.save_session()
+
+    def unique_model_dir(self) -> Path:
+        active_bin = self.active_bin
+        bin_suffix = f"_bin_{safe_name(active_bin.bin_name)}" if active_bin else ""
+        stem = f"item_{safe_name(self.item_name)}{bin_suffix}_{compact_date_for_path()}"
+        self.model_root.mkdir(parents=True, exist_ok=True)
+        path = self.model_root / stem
+        suffix = 1
+        while path.exists():
+            path = self.model_root / f"{stem}_{suffix}"
+            suffix += 1
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def promote_trained_model(self, best_path: Path) -> None:
+        if not best_path.exists():
+            raise FileNotFoundError(f"YOLO best.pt missing: {best_path}")
+
+        from ultralytics import YOLO
+
+        model_dir = self.unique_model_dir()
+        final_pt = model_dir / "best.pt"
+        final_onnx = model_dir / "best.onnx"
+        shutil.copy2(best_path, final_pt)
+
+        exported_path = ""
+        try:
+            trained_model = YOLO(str(best_path))
+            exported = trained_model.export(
+                format="onnx",
+                imgsz=self.train_imgsz,
+                device=self.train_device,
+                dynamic=False,
+                simplify=False,
+            )
+            exported_path = str(exported)
+            exported_file = Path(exported_path)
+            if exported_file.exists():
+                shutil.copy2(exported_file, final_onnx)
+        except Exception as exc:
+            self.get_logger().warn(f"YOLO ONNX export failed; detect needs ONNX for CPU speed: {exc}")
+
+        shutil.copy2(self.dataset_yaml_path, model_dir / "dataset.yaml")
+        summary = {
+            "item_name": self.item_name,
+            "class_id": 0,
+            "class_name": self.item_name,
+            "associated_bin_name": self.active_bin.bin_name if self.active_bin else "",
+            "session_dir": str(self.session_dir),
+            "runtime_best_pt": str(best_path),
+            "runtime_exported_onnx": exported_path,
+            "model_pt_path": str(final_pt),
+            "model_onnx_path": str(final_onnx) if final_onnx.exists() else "",
+            "sample_count": self.sample_count,
+            "train_epochs": self.train_epochs,
+            "train_imgsz": self.train_imgsz,
+            "train_device": self.train_device,
+            "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
+            "has_teach_joints": self.has_joint_positions,
+        }
+        (model_dir / "train_summary.yaml").write_text(
+            yaml.safe_dump(summary, sort_keys=False),
+            encoding="utf-8")
+
+        self.final_model_dir = str(model_dir)
+        self.trained_model_path = str(final_pt)
+        self.trained_onnx_path = str(final_onnx) if final_onnx.exists() else ""
+
+    def write_profile(self) -> None:
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        active_bin = self.active_bin
+        date_stamp = compact_date_for_path()
+        params = {
+            "detection_backend": "yolo11_seg_onnx",
+            "item_name": self.item_name,
+            "teach_date": date_stamp,
+            "class_id": 0,
+            "class_name": self.item_name,
+            "color_topic": self.color_topic,
+            "depth_topic": self.depth_topic,
+            "camera_info_topic": self.camera_info_topic,
+            "overlay_topic": self.overlay_topic,
+            "session_dir": str(self.session_dir),
+            "model_dir": self.final_model_dir,
+            "model_path": self.trained_onnx_path,
+            "model_onnx_path": self.trained_onnx_path,
+            "model_pt_path": self.trained_model_path,
+            "dataset_yaml": str(self.dataset_yaml_path),
+            "sample_count": self.sample_count,
+            "train_epochs": self.train_epochs,
+            "train_imgsz": self.train_imgsz,
+            "trained_model_path": self.trained_model_path,
+            "trained_onnx_path": self.trained_onnx_path,
+            "associated_bin_name": active_bin.bin_name if active_bin else "",
+            "bin_teach_file": str(active_bin.path) if active_bin else "",
+            "detection_mode": "yolo_depth",
+            "depth_window_mm": 50,
+            "align_item_z_axis_to_depth_plane": True,
+            "joint_states_topic": self.joint_states_topic,
+            "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
+            "has_teach_joints": self.has_joint_positions,
+            "roi_points": [
+                int(round(value))
+                for point in (active_bin.roi_points if active_bin else [])
+                for value in point
+            ],
+            "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
+            "depth_plane": active_bin.depth_plane if active_bin else {},
+        }
+        if active_bin:
+            depth_plane = active_bin.depth_plane
+            params["depth_plane_source"] = "bin_teach"
+            params["depth_plane_enabled"] = bool(depth_plane.get("depth_plane_enabled", False))
+            params["depth_plane_a"] = float(depth_plane.get("depth_plane_a", 0.0))
+            params["depth_plane_b"] = float(depth_plane.get("depth_plane_b", 0.0))
+            params["depth_plane_c"] = float(depth_plane.get("depth_plane_c", 0.0))
+            params["depth_plane_reference_depth_m"] = float(
+                depth_plane.get("depth_plane_reference_depth_m", 0.0))
+        profile = {
+            "item_detect": {"ros__parameters": params},
+            "item_yolo": {"ros__parameters": params},
+        }
+        bin_suffix = f"_bin_{safe_name(active_bin.bin_name)}" if active_bin else ""
+        profile_path = (
+            self.profile_dir /
+            f"item_{safe_name(self.item_name)}{bin_suffix}_yolo_{date_stamp}.yaml"
+        )
+        profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+        self.latest_profile_path = str(profile_path)
+
+    def render_mask_overlay(self, image: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+        if mask is None or not self.overlay_enabled:
+            return image
+        overlay = image.copy()
+        overlay[mask > 0] = (70, 210, 80)
+        output = cv2.addWeighted(overlay, 0.45, image, 0.55, 0.0)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(output, contours, -1, (60, 255, 120), 2)
+        return output
+
+    def mask_in_frame(self, frame_shape: Tuple[int, int, int]) -> Optional[np.ndarray]:
+        if self.current_mask is None or self.roi_crop_rect is None:
+            return None
+        x0, y0, rect_w, rect_h = self.roi_crop_rect
+        frame_h, frame_w = frame_shape[:2]
+        if x0 >= frame_w or y0 >= frame_h:
+            return None
+        patch_w = min(rect_w, self.current_mask.shape[1], frame_w - x0)
+        patch_h = min(rect_h, self.current_mask.shape[0], frame_h - y0)
+        if patch_w <= 0 or patch_h <= 0:
+            return None
+        full_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+        full_mask[y0:y0 + patch_h, x0:x0 + patch_w] = self.current_mask[:patch_h, :patch_w]
+        return full_mask
+
+    def crop_point_to_frame(self, point: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+        if self.roi_crop_rect is None:
+            return None
+        x0, y0, _, _ = self.roi_crop_rect
+        return x0 + point[0], y0 + point[1]
+
+    def draw_button(self, canvas: np.ndarray, name: str, rect: Tuple[int, int, int, int],
+                    label: str, enabled: bool = True, active: bool = False) -> None:
+        x, y, w, h = rect
+        if active:
+            fill = (70, 126, 186)
+            border = (126, 202, 255)
+        elif enabled:
+            fill = (48, 64, 76)
+            border = (170, 210, 240)
+        else:
+            fill = (52, 52, 52)
+            border = (102, 106, 112)
+        text = (238, 242, 245) if enabled else (150, 150, 150)
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), fill, -1)
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), border, 2)
+        cv2.putText(canvas, fit_text(label, max(6, w // 11)), (x + 10, y + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, text, 1, cv2.LINE_AA)
+        self.buttons[name] = Button(name, rect, enabled)
+
+    def draw_progress_button(self, canvas: np.ndarray, name: str, rect: Tuple[int, int, int, int],
+                             label: str, progress: float, enabled: bool = True) -> None:
+        x, y, w, h = rect
+        clamped = min(max(float(progress), 0.0), 1.0)
+        fill = (42, 50, 58) if enabled else (52, 52, 52)
+        progress_fill = (64, 138, 92)
+        border = (126, 202, 255) if enabled else (102, 106, 112)
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), fill, -1)
+        if clamped > 0.0:
+            fill_w = int(round(w * clamped))
+            cv2.rectangle(canvas, (x, y), (x + fill_w, y + h), progress_fill, -1)
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), border, 2)
+        cv2.putText(canvas, fit_text(label, max(6, w // 11)), (x + 10, y + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 242, 245), 1, cv2.LINE_AA)
+        self.buttons[name] = Button(name, rect, enabled)
+
+    def update_view(self) -> None:
+        if self.prediction_dirty and not self.predicting:
+            self.run_sam2_prediction()
+
+        if self.frozen_crop_bgr is not None:
+            display_frame = self.frozen_frame_bgr.copy() if self.frozen_frame_bgr is not None else self.frozen_crop_bgr.copy()
+        else:
+            frame = self.latest_frame_copy()
+            if frame is not None and self.active_bin is not None and self.live_view_enabled:
+                live_roi = self.roi_views_from_frame(frame)
+                if live_roi is not None:
+                    _, rect, roi_mask, display_frame, _ = live_roi
+                    self.roi_crop_rect = rect
+                    self.roi_crop_mask = roi_mask
+                else:
+                    display_frame = frame.copy()
+            elif frame is not None and self.live_view_enabled:
+                display_frame = frame.copy()
+            else:
+                display_frame = np.zeros((480, 848, 3), dtype=np.uint8)
+
+        self.preview_source_size = (display_frame.shape[1], display_frame.shape[0])
+        display_mask = self.mask_in_frame(display_frame.shape)
+        display_frame = self.render_mask_overlay(display_frame.copy(), display_mask)
+        for point in self.positive_points:
+            frame_point = self.crop_point_to_frame(point)
+            if frame_point is not None:
+                cv2.circle(display_frame, frame_point, 6, (70, 230, 70), -1)
+                cv2.circle(display_frame, frame_point, 8, (20, 80, 20), 1)
+        for point in self.negative_points:
+            frame_point = self.crop_point_to_frame(point)
+            if frame_point is not None:
+                cv2.circle(display_frame, frame_point, 6, (60, 70, 240), -1)
+                cv2.circle(display_frame, frame_point, 8, (20, 20, 120), 1)
+
+        canvas_h = VIDEO_TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT
+        canvas_w = LEFT_PANEL_WIDTH + PREVIEW_CANVAS_WIDTH
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        canvas[:] = (18, 22, 26)
+
+        preview, scale = self.fit_preview(display_frame)
+        self.preview_scale = scale
+        self.preview_image_size = (preview.shape[1], preview.shape[0])
+        preview_x = LEFT_PANEL_WIDTH
+        preview_y = VIDEO_TOP_BAR_HEIGHT
+        canvas[preview_y:preview_y + preview.shape[0], preview_x:preview_x + preview.shape[1]] = preview
+        self.preview_rect = (preview_x, preview_y, preview.shape[1], preview.shape[0])
+
+        self.draw_panel(canvas)
+        self.draw_video_bar(canvas)
+        cv2.imshow(WINDOW_NAME, canvas)
+        self.handle_key(cv2.waitKey(1))
+
+    def fit_preview(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+        h, w = image.shape[:2]
+        if h <= 0 or w <= 0:
+            return np.zeros((PREVIEW_CANVAS_HEIGHT, PREVIEW_CANVAS_WIDTH, 3), dtype=np.uint8), 1.0
+        scale = min(PREVIEW_CANVAS_WIDTH / float(w), PREVIEW_CANVAS_HEIGHT / float(h))
+        scale *= max(0.1, self.display_scale)
+        scale = min(scale, PREVIEW_CANVAS_WIDTH / float(w), PREVIEW_CANVAS_HEIGHT / float(h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        preview = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        return preview, scale
+
+    def draw_panel(self, canvas: np.ndarray) -> None:
+        panel = canvas[:, :LEFT_PANEL_WIDTH]
+        panel[:] = (30, 34, 40)
+        self.buttons.clear()
+
+        cv2.putText(panel, "YOLO Teach", (PANEL_PAD, 36), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.82, (240, 244, 248), 2, cv2.LINE_AA)
+        cv2.putText(panel, "Item Name", (PANEL_PAD, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, (220, 230, 238), 1, cv2.LINE_AA)
+        input_y = 82
+        input_w = LEFT_PANEL_WIDTH - 2 * PANEL_PAD
+        self.item_name_input_rect = (PANEL_PAD, input_y, input_w, BUTTON_HEIGHT)
+        input_fill = (42, 58, 68) if self.item_name_edit_active else (38, 44, 52)
+        input_border = (126, 202, 255) if self.item_name_edit_active else (112, 132, 148)
+        cv2.rectangle(panel, (PANEL_PAD, input_y), (PANEL_PAD + input_w, input_y + BUTTON_HEIGHT), input_fill, -1)
+        cv2.rectangle(panel, (PANEL_PAD, input_y), (PANEL_PAD + input_w, input_y + BUTTON_HEIGHT), input_border, 2)
+        item_text = self.item_name_edit_buffer if self.item_name_edit_active else self.item_name
+        if self.item_name_edit_active:
+            item_text += "|"
+        cv2.putText(panel, fit_text(item_text, 34), (PANEL_PAD + 10, input_y + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, (238, 242, 245), 1, cv2.LINE_AA)
+
+        y = 136
+        self.draw_button(
+            panel,
+            "bin_dropdown",
+            (PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, BUTTON_HEIGHT),
+            self.bin_dropdown_label(),
+            bool(self.bin_entries),
+            self.bin_dropdown_open,
+        )
+        y += BUTTON_HEIGHT + 24
+
+        cv2.putText(panel, "SAM2 Prompts", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 12
+        cv2.putText(panel, f"Positive: {len(self.positive_points)}    Negative: {len(self.negative_points)}",
+                    (PANEL_PAD, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (205, 218, 226), 1, cv2.LINE_AA)
+        y += 44
+        self.draw_button(panel, "clear_prompts", (PANEL_PAD, y, 186, BUTTON_HEIGHT),
+                         "Clear Prompts", True)
+        self.draw_button(panel, "save_sample", (PANEL_PAD + 202, y, 198, BUTTON_HEIGHT),
+                         "Save Sample", self.current_mask is not None)
+        y += BUTTON_HEIGHT + 24
+
+        cv2.putText(panel, "YOLO11", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 12
+        cv2.putText(panel, f"Samples: {self.sample_count}", (PANEL_PAD, y + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (190, 232, 190), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"Status: {fit_text(self.training_status, 24)}", (PANEL_PAD + 160, y + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (205, 218, 226), 1, cv2.LINE_AA)
+        joint_status = "Teach Position: captured" if self.has_joint_positions else "Teach Position: waiting"
+        cv2.putText(panel, joint_status, (PANEL_PAD, y + 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (184, 224, 194) if self.has_joint_positions else (205, 188, 170),
+                    1,
+                    cv2.LINE_AA)
+        y += 66
+        training_active = self.training_thread is not None and self.training_thread.is_alive()
+        train_rect = (PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, BUTTON_HEIGHT)
+        if training_active:
+            train_label = (
+                f"Training {self.training_epoch_current}/{self.training_epoch_total} "
+                f"({int(round(self.training_progress * 100.0))}%)"
+            )
+            self.draw_progress_button(panel, "train_yolo", train_rect, train_label, self.training_progress, True)
+        elif self.training_status == "done":
+            self.draw_progress_button(panel, "train_yolo", train_rect, "Train YOLO11: done", 1.0, self.sample_count > 0)
+        else:
+            self.draw_button(panel, "train_yolo", train_rect, "Train YOLO11", self.sample_count > 0)
+        y += BUTTON_HEIGHT + 26
+
+        cv2.putText(panel, "Status", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 28
+        self.draw_wrapped_text(panel, self.status, PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, 4)
+        y += 98
+
+        cv2.putText(panel, "Session", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 28
+        self.draw_wrapped_text(panel, str(self.session_dir), PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, 3, 0.43)
+        y += 76
+
+        cv2.putText(panel, "Controls", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 28
+        instructions = [
+            "Left click: positive prompt",
+            "Right click: negative prompt",
+            "Save Sample: mask to YOLO label",
+            "Train YOLO11: train segmentation model",
+        ]
+        for line in instructions:
+            cv2.putText(panel, line, (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.46, (184, 196, 205), 1, cv2.LINE_AA)
+            y += 24
+
+        if self.bin_dropdown_open:
+            self.draw_bin_dropdown(panel)
+
+    def commit_item_name_edit(self) -> None:
+        new_name = self.item_name_edit_buffer.strip()
+        if not new_name:
+            self.status = "Item name cannot be empty"
+            self.item_name_edit_buffer = self.item_name
+            self.item_name_edit_active = False
+            return
+        if new_name != self.item_name:
+            if self.training_thread is not None and self.training_thread.is_alive():
+                self.status = "Cannot change item name while training"
+                self.item_name_edit_buffer = self.item_name
+                self.item_name_edit_active = False
+                return
+            self.reset_runtime_for_item_name(new_name)
+        self.item_name_edit_active = False
+
+    def cancel_item_name_edit(self) -> None:
+        self.item_name_edit_buffer = self.item_name
+        self.item_name_edit_active = False
+        self.status = "Item name edit canceled"
+
+    def handle_key(self, key: int) -> None:
+        if key < 0 or not self.item_name_edit_active:
+            return
+        code = key & 0xFF
+        if code in (10, 13):
+            self.commit_item_name_edit()
+            return
+        if code == 27:
+            self.cancel_item_name_edit()
+            return
+        if code in (8, 127):
+            self.item_name_edit_buffer = self.item_name_edit_buffer[:-1]
+            return
+        if 32 <= code <= 126 and len(self.item_name_edit_buffer) < 64:
+            self.item_name_edit_buffer += chr(code)
+
+    def draw_video_bar(self, canvas: np.ndarray) -> None:
+        bar = canvas[:VIDEO_TOP_BAR_HEIGHT, LEFT_PANEL_WIDTH:]
+        bar[:] = (24, 28, 34)
+        x = LEFT_PANEL_WIDTH + 16
+        y = 16
+        self.draw_button(canvas, "live_view", (x, y, 120, BUTTON_HEIGHT),
+                         "Live: ON" if self.live_view_enabled else "Live: OFF",
+                         True, self.live_view_enabled)
+        x += 134
+        self.draw_button(canvas, "overlay", (x, y, 142, BUTTON_HEIGHT),
+                         "Overlay: ON" if self.overlay_enabled else "Overlay: OFF",
+                         True, self.overlay_enabled)
+        status = "Full frame ROI view"
+        if self.active_bin:
+            status += f" | {self.active_bin.bin_name}"
+        if self.preview_source_size != (0, 0):
+            status += f" | {self.preview_source_size[0]}x{self.preview_source_size[1]}"
+        if self.predicting:
+            status += " | SAM2 running"
+        cv2.putText(canvas, status, (LEFT_PANEL_WIDTH + 16, 74), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.56, (216, 224, 232), 1, cv2.LINE_AA)
+
+    def draw_wrapped_text(self, image: np.ndarray, text: str, x: int, y: int,
+                          width: int, max_lines: int, scale: float = 0.48) -> None:
+        max_chars = max(10, width // 9)
+        words = text.split()
+        lines: List[str] = []
+        current = ""
+        for word in words:
+            trial = f"{current} {word}".strip()
+            if len(trial) <= max_chars:
+                current = trial
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+            if len(lines) >= max_lines:
+                break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+        for i, line in enumerate(lines[:max_lines]):
+            if i == max_lines - 1 and len(lines) == max_lines and len(line) > max_chars - 3:
+                line = line[:max_chars - 3] + "..."
+            cv2.putText(image, line, (x, y + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, (190, 202, 212), 1, cv2.LINE_AA)
+
+    def bin_dropdown_label(self) -> str:
+        if self.active_bin is not None:
+            return f"Load Bin Teach: {self.active_bin.bin_name}"
+        if not self.bin_entries:
+            return "Load Bin Teach: no files"
+        return "Load Bin Teach: choose file"
+
+    def draw_bin_dropdown(self, panel: np.ndarray) -> None:
+        button = self.buttons.get("bin_dropdown")
+        if button is None:
+            return
+        x, y, w, h = button.rect
+        rows = min(MAX_DROPDOWN_ROWS, len(self.bin_entries))
+        for i in range(rows):
+            row_y = y + h + 2 + i * DROPDOWN_ROW_HEIGHT
+            fill = (42, 50, 58) if i != self.active_bin_index else (58, 82, 78)
+            cv2.rectangle(panel, (x, row_y), (x + w, row_y + DROPDOWN_ROW_HEIGHT), fill, -1)
+            cv2.rectangle(panel, (x, row_y), (x + w, row_y + DROPDOWN_ROW_HEIGHT), (120, 140, 150), 1)
+            cv2.putText(panel, fit_text(self.bin_entries[i].label, 44), (x + 8, row_y + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.47, (238, 242, 245), 1, cv2.LINE_AA)
+
+    def mouse_callback(self, event, x: int, y: int, flags, param) -> None:
+        if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+            return
+        if event == cv2.EVENT_LBUTTONDOWN and self.handle_button_click(x, y):
+            return
+        if event == cv2.EVENT_RBUTTONDOWN and (x < LEFT_PANEL_WIDTH or y < VIDEO_TOP_BAR_HEIGHT):
+            return
+        self.handle_prompt_click(event, x, y)
+
+    def handle_button_click(self, x: int, y: int) -> bool:
+        if self.bin_dropdown_open:
+            button = self.buttons.get("bin_dropdown")
+            if button is not None:
+                bx, by, bw, bh = button.rect
+                if bx <= x <= bx + bw and by + bh + 2 <= y <= by + bh + 2 + MAX_DROPDOWN_ROWS * DROPDOWN_ROW_HEIGHT:
+                    row = (y - (by + bh + 2)) // DROPDOWN_ROW_HEIGHT
+                    if 0 <= row < min(MAX_DROPDOWN_ROWS, len(self.bin_entries)):
+                        self.select_bin(int(row))
+                        return True
+        for name, button in list(self.buttons.items()):
+            bx, by, bw, bh = button.rect
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                if not button.enabled and name != "clear_prompts":
+                    return True
+                if name == "bin_dropdown":
+                    self.bin_dropdown_open = not self.bin_dropdown_open
+                elif name == "clear_prompts":
+                    self.clear_prompts()
+                elif name == "save_sample":
+                    self.save_sample()
+                elif name == "train_yolo":
+                    self.start_training()
+                elif name == "live_view":
+                    self.live_view_enabled = not self.live_view_enabled
+                    self.status = "Live view toggled"
+                    self.save_session()
+                elif name == "overlay":
+                    self.overlay_enabled = not self.overlay_enabled
+                    self.status = "Overlay toggled"
+                    self.save_session()
+                return True
+        ix, iy, iw, ih = self.item_name_input_rect
+        if ix <= x <= ix + iw and iy <= y <= iy + ih:
+            self.item_name_edit_active = True
+            self.item_name_edit_buffer = self.item_name
+            self.status = "Type item name, Enter to apply, Esc to cancel"
+            return True
+        if x < LEFT_PANEL_WIDTH or y < VIDEO_TOP_BAR_HEIGHT:
+            if self.item_name_edit_active:
+                self.commit_item_name_edit()
+            self.bin_dropdown_open = False
+            return True
+        return False
+
+    def handle_prompt_click(self, event: int, x: int, y: int) -> None:
+        if self.active_bin is None:
+            self.status = "Choose a bin before prompting"
+            return
+        px, py, pw, ph = self.preview_rect
+        if x < px or y < py or x >= px + pw or y >= py + ph:
+            return
+        frame_x = int(round((x - px) / max(1e-6, self.preview_scale)))
+        frame_y = int(round((y - py) / max(1e-6, self.preview_scale)))
+        if self.frozen_crop_bgr is None and not self.freeze_current_crop():
+            return
+        if self.frozen_crop_bgr is None or self.roi_crop_rect is None:
+            return
+        rect_x, rect_y, _, _ = self.roi_crop_rect
+        crop_x = frame_x - rect_x
+        crop_y = frame_y - rect_y
+        h, w = self.frozen_crop_bgr.shape[:2]
+        if crop_x < 0 or crop_y < 0 or crop_x >= w or crop_y >= h:
+            return
+        if self.roi_crop_mask is not None and self.roi_crop_mask[crop_y, crop_x] == 0:
+            self.status = "Prompt is outside bin ROI"
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.positive_points.append((crop_x, crop_y))
+        else:
+            self.negative_points.append((crop_x, crop_y))
+        self.prediction_dirty = True
+        self.status = f"Prompts +{len(self.positive_points)} -{len(self.negative_points)}"
+        self.save_session()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = ItemTeachYoloNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.save_session()
+        cv2.destroyWindow(WINDOW_NAME)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

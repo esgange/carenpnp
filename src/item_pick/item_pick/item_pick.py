@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import threading
 import time
 import tkinter as tk
@@ -23,6 +24,52 @@ try:
     import yaml
 except Exception:
     yaml = None
+
+
+def workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / 'src').exists() and
+            (
+                (path / 'README.md').exists()
+                or (path / 'docker-compose.yml').exists()
+                or (path / 'src' / 'dobot_msgs_v4').exists()
+            )
+        )
+
+    def find_from(start: Path) -> Path | None:
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+        return None
+
+    for name in ('DOBOT_PICKN_PLACE_ROOT', 'DOBOT_WORKSPACE_ROOT'):
+        value = os.environ.get(name)
+        if value:
+            return find_from(Path(value)) or Path(value).expanduser().resolve()
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for name in ('COLCON_PREFIX_PATH', 'AMENT_PREFIX_PATH'):
+        for token in os.environ.get(name, '').split(os.pathsep):
+            if not token:
+                continue
+            prefix = Path(token)
+            candidates.append(prefix)
+            if 'install' in prefix.parts:
+                candidates.append(Path(*prefix.parts[:prefix.parts.index('install')]))
+
+    for candidate in candidates:
+        found = find_from(candidate)
+        if found is not None:
+            return found
+    return Path.cwd().resolve()
+
+
+def workspace_path(*parts: str) -> Path:
+    return workspace_root().joinpath(*parts)
 
 
 SERVICE_ROOT_DEFAULT = '/dobot_bringup_ros2/srv'
@@ -85,9 +132,9 @@ TOOL_OFFSET_PREVIEW_FRAME_DEFAULT = 'item_pick_tool_offset_preview'
 TOOL_OFFSET_PREVIEW_AXIS_X_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_x_tip'
 TOOL_OFFSET_PREVIEW_AXIS_Y_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_y_tip'
 TOOL_OFFSET_PREVIEW_AXIS_Z_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_z_tip'
-RUNTIME_SETTINGS_PATH = Path.home() / '.ros' / 'item_pick_runtime_settings.json'
-ITEM_PROFILE_STATE_PATH = Path('/home/erds/DOBOT_pickn_place/config/bins/item_detect_selected_profile.txt')
-LEGACY_ITEM_PROFILE_STATE_PATH = Path('/home/erds/DOBOT_pickn_place/config/bins/bin_detect_selected_profile.txt')
+RUNTIME_SETTINGS_PATH = workspace_path('config', 'bins', 'item_pick_runtime_settings.json')
+ITEM_PROFILE_STATE_PATH = workspace_path('config', 'bins', 'item_detect_selected_profile.txt')
+LEGACY_ITEM_PROFILE_STATE_PATH = workspace_path('config', 'bins', 'bin_detect_selected_profile.txt')
 TOOL_TEACH_FILE_SUFFIX = '_tool.yaml'
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
 GOAL_TF_DIAG_AXIS_LENGTH_MM = 60.0

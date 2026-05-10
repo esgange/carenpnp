@@ -13,7 +13,7 @@ intercept target, and dispatches a staged robot motion sequence.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select tray_intercept
 source install/setup.bash
@@ -108,7 +108,7 @@ Published in the robot goal frame, default `base_link`:
 The node auto-loads speed mapping from the newest non-empty file matching:
 
 ```text
-~/DOBOT_pickn_place/calibration/relmovl_speed_calibration*.json
+WORKSPACE_ROOT/calibration/relmovl_speed_calibration*.json
 ```
 
 It also reads startup `CP` and `SpeedFactor` values from the same calibration

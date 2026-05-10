@@ -40,6 +40,8 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
@@ -3855,7 +3857,7 @@ public:
   {
     profiles_dir_ = declare_parameter<std::string>(
       "profiles_dir",
-      "/home/erds/DOBOT_pickn_place/config/trays");
+      dobot_common::paths::workspacePath({"teach", "trays"}, __FILE__).string());
     color_topic_ = declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
     depth_topic_ = declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
     camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/camera/color/camera_info");
@@ -3924,7 +3926,7 @@ public:
       30);
     seek_snapshots_dir_ = declare_parameter<std::string>(
       "seek_snapshots_dir",
-      "/home/erds/DOBOT_pickn_place/debug files/seek_frames");
+      dobot_common::paths::workspacePath({"debug files", "seek_frames"}, __FILE__).string());
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
     const bool start_visualization = declare_parameter<bool>("start_visualization", true);
     display_view_ = start_visualization ? DisplayView::kRgb : DisplayView::kBinarized;
@@ -4189,22 +4191,13 @@ private:
 
   static std::string defaultCalibrationDir()
   {
-    const char *home = std::getenv("HOME");
-    if (home == nullptr)
-    {
-      return {};
-    }
-    return (std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration").string();
+    return dobot_common::paths::workspacePath({"calibration"}, __FILE__).string();
   }
 
   static std::string defaultRuntimeSettingsFile()
   {
-    const char *home = std::getenv("HOME");
-    if (home == nullptr)
-    {
-      return "tray_detect_runtime_settings.yaml";
-    }
-    return (std::filesystem::path(home) / ".ros" / "tray_detect_runtime_settings.yaml").string();
+    return dobot_common::paths::workspacePath(
+      {"config", "trays", "tray_detect_runtime_settings.yaml"}, __FILE__).string();
   }
 
   static std::filesystem::path resolvePath(const std::string &path_text)

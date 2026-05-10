@@ -1,0 +1,14 @@
+{
+  "robot_number": 1,
+  "current_robot": 1,
+  "ros_domain_id": 1,
+  "ros_localhost_only": true,
+  "node_info": [
+    {
+      "ip_address": "192.168.200.1",
+      "robot_type": "cr10",
+      "trajectory_duration": 0.3,
+      "robot_node_name": "pickn_place"
+    }
+  ]
+}

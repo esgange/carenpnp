@@ -4,6 +4,23 @@ install/
 log/
 devel/
 
+# Local Python/SAM2 workspace
+.venv/
+third_party/sam2/
+third_party/yolo/
+config/bins_yolo/runtime/
+runs/
+
+# Workspace runtime/generated data
+Log/
+debug files/
+teach/
+config/bins/
+config/trays/
+calibration/*.yaml
+calibration/*.json
+calibration/*.csv
+
 # Python cache
 __pycache__/
 *.pyc
@@ -13,6 +30,7 @@ src/camera_calibration/calib/axab_calibration_*.yaml
 !src/camera_calibration/calib/axab_calibration_01011970.yaml
 
 # Editor/system files
+.codex
 .vscode/
 .idea/
 .DS_Store

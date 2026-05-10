@@ -15,7 +15,7 @@ source for the perception stack.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select aruco_perception
 source install/setup.bash
@@ -75,7 +75,7 @@ ros2 launch aruco_perception aruco_perception.launch.py \
 ## Calibration Behavior
 
 - With `use_calibration=true`, launch loads the newest non-empty YAML in
-  `~/DOBOT_pickn_place/calibration` unless `calibration_file` is set.
+  `WORKSPACE_ROOT/calibration` unless `calibration_file` is set.
 - If calibration is enabled and no usable file exists, launch fails early with a
   clear error.
 - The loaded YAML is expected to include `calibration_transform.rotation` and

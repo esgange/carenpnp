@@ -9,6 +9,8 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 namespace aruco_perception
 {
 class PerceptionCalibration : public rclcpp::Node
@@ -108,13 +110,7 @@ private:
 
   std::string defaultCalibrationDir() const
   {
-    const char * home = std::getenv("HOME");
-    if (home == nullptr)
-    {
-      return {};
-    }
-    std::filesystem::path p = std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration";
-    return p.string();
+    return dobot_common::paths::workspacePath({"calibration"}, __FILE__).string();
   }
 
   std::string findLatestCalibration() const

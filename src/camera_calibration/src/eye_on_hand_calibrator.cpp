@@ -22,6 +22,8 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <rmw/qos_profiles.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 using std::placeholders::_1;
 using std::placeholders::_2;
 
@@ -29,12 +31,7 @@ namespace
 {
 std::filesystem::path defaultCameraCalibrationDir()
 {
-  const char *home = std::getenv("HOME");
-  if (home == nullptr)
-  {
-    return std::filesystem::path("calibration");
-  }
-  return std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration";
+  return dobot_common::paths::workspacePath({"calibration"}, __FILE__);
 }
 
 std::filesystem::path defaultCameraCalibrationPath()

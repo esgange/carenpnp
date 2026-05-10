@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -39,6 +40,50 @@ CALIB_MODE_EYE_ON_HAND = "eye_on_hand"
 CALIB_MODE_EYE_TO_HAND = "eye_to_hand"
 
 
+def workspace_root() -> Path:
+  def looks_like_root(path: Path) -> bool:
+    return (
+      (path / "src").exists() and
+      ((path / "README.md").exists() or
+       (path / "docker-compose.yml").exists() or
+       (path / "src" / "dobot_msgs_v4").exists())
+    )
+
+  def find_from(start: Path) -> Path | None:
+    path = start.expanduser().resolve()
+    if path.is_file():
+      path = path.parent
+    for candidate in (path, *path.parents):
+      if looks_like_root(candidate):
+        return candidate
+    return None
+
+  for name in ("DOBOT_PICKN_PLACE_ROOT", "DOBOT_WORKSPACE_ROOT"):
+    value = os.environ.get(name)
+    if value:
+      return find_from(Path(value)) or Path(value).expanduser().resolve()
+
+  candidates = [Path.cwd(), Path(__file__).resolve()]
+  for name in ("COLCON_PREFIX_PATH", "AMENT_PREFIX_PATH"):
+    for token in os.environ.get(name, "").split(os.pathsep):
+      if not token:
+        continue
+      prefix = Path(token)
+      candidates.append(prefix)
+      if "install" in prefix.parts:
+        candidates.append(Path(*prefix.parts[:prefix.parts.index("install")]))
+
+  for candidate in candidates:
+    found = find_from(candidate)
+    if found is not None:
+      return found
+  return Path.cwd().resolve()
+
+
+def workspace_path(*parts: str) -> Path:
+  return workspace_root().joinpath(*parts)
+
+
 def normalize_calibration_mode(value):
   mode = str(value or "").strip().lower()
   if mode == CALIB_MODE_EYE_TO_HAND:
@@ -64,7 +109,7 @@ def parse_joint_values_from_robot_return(text):
 
 
 def default_output_path():
-  calib_dir = Path.home() / "DOBOT_pickn_place" / "calibration"
+  calib_dir = workspace_path("calibration")
   try:
     calib_dir.mkdir(parents=True, exist_ok=True)
   except Exception:

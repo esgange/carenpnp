@@ -1,8 +1,10 @@
 import queue
+import re
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import scrolledtext
 
 import rclpy
@@ -33,6 +35,10 @@ TIMING_SLIDER_MAX_SEC = 1.0
 TIMING_SLIDER_STEP_SEC = 0.1
 ROBOT_TCP_STALE_SEC = 1.0
 ROBOT_MONITOR_TIMEOUT_SEC = 30.0
+MOVEMENT_TRACKER_START_LINEAR_MM = ROBOT_LINEAR_MOVE_EPS_MM
+MOVEMENT_TRACKER_START_ROT_DEG = ROBOT_ROT_MOVE_EPS_DEG
+MOVEMENT_TRACKER_LABEL_TTL_SEC = 90.0
+MOVEMENT_TRACKER_LOG_PREFIX = 'Movement tracker'
 SEEK_STATUS_POLL_SEC = 0.1
 SEEK_STATUS_RESPONSE_TIMEOUT_SEC = 0.2
 ARM_CLICK_RESPONSE_TIMEOUT_SEC = 5.5
@@ -51,6 +57,7 @@ TRAY_INTERCEPT_Y_OFFSET_MIN = -50.0
 TRAY_INTERCEPT_Y_OFFSET_MAX = 300.0
 TRAY_EE_ANGLE_MIN_DEG = -90.0
 TRAY_EE_ANGLE_MAX_DEG = 90.0
+MOVEMENT_DELTA_DEBUG_DIRNAME = 'pick_cycle_movement_deltas'
 
 ROBOT_STATUS_STOP = 'stop'
 ROBOT_STATUS_PICKING = 'picking'
@@ -62,6 +69,40 @@ ROBOT_STATUS_LABELS = {
     ROBOT_STATUS_PLACING: 'Placing',
     ROBOT_STATUS_PAUSE: 'On Pause',
 }
+
+
+def _looks_like_workspace_root(path: Path) -> bool:
+    return (
+        (path / 'src').exists()
+        and (
+            (path / 'README.md').exists()
+            or (path / 'docker-compose.yml').exists()
+            or (path / 'src' / 'dobot_msgs_v4').exists()
+        )
+    )
+
+
+def workspace_root() -> Path:
+    for start in (Path(__file__).resolve(), Path.cwd()):
+        path = start if start.is_dir() else start.parent
+        for candidate in (path, *path.parents):
+            if _looks_like_workspace_root(candidate):
+                return candidate
+    return Path.cwd().resolve()
+
+
+def _safe_filename_fragment(text: str, max_length: int = 72) -> str:
+    chars: list[str] = []
+    previous_separator = False
+    for ch in text:
+        if ch.isalnum():
+            chars.append(ch)
+            previous_separator = False
+        elif not previous_separator:
+            chars.append('_')
+            previous_separator = True
+    fragment = ''.join(chars).strip('_')
+    return (fragment[:max_length].strip('_') or 'movement_delta')
 
 
 @dataclass(frozen=True)
@@ -85,6 +126,159 @@ class CycleConfig:
     tray_intercept_x_offset_mm: float
     tray_intercept_y_offset_mm: float
     tray_ee_angle_deg: float
+
+
+class BackgroundMovementTracker:
+    """Passive TCP-feedback-based travel timer.
+
+    The tracker never waits for, blocks, or commands the robot.  It only observes
+    ToolVectorActual feedback and emits a timing line after a physical movement
+    has stopped for the configured stability window.
+    """
+
+    def __init__(self, stability_sec: float = ROBOT_STABILITY_SEC_DEFAULT) -> None:
+        self._lock = threading.Lock()
+        self._events: queue.Queue[str] = queue.Queue()
+        self._stability_sec = max(0.0, float(stability_sec))
+        self._last_pose: tuple[float, float, float, float, float, float] | None = None
+        self._stable_anchor_pose: tuple[float, float, float, float, float, float] | None = None
+        self._stable_since: float | None = None
+        self._moving = False
+        self._move_start_time = 0.0
+        self._move_start_pose: tuple[float, float, float, float, float, float] | None = None
+        self._active_labels: list[str] = []
+        self._pending_labels: list[tuple[float, str]] = []
+
+    def set_stability_sec(self, stability_sec: float) -> None:
+        with self._lock:
+            self._stability_sec = max(0.0, float(stability_sec))
+
+    def mark_command(self, label: str) -> None:
+        now = time.monotonic()
+        clean_label = str(label).strip()
+        if not clean_label:
+            return
+        with self._lock:
+            if self._moving:
+                self._active_labels.append(clean_label)
+            else:
+                self._pending_labels.append((now, clean_label))
+                self._drop_stale_pending_locked(now)
+
+    def cancel_command(self, label: str) -> None:
+        clean_label = str(label).strip()
+        if not clean_label:
+            return
+        with self._lock:
+            self._pending_labels = [entry for entry in self._pending_labels if entry[1] != clean_label]
+            if self._moving:
+                self._active_labels = [entry for entry in self._active_labels if entry != clean_label]
+
+    def update(self, pose: tuple[float, float, float, float, float, float], now: float) -> None:
+        with self._lock:
+            if self._last_pose is None:
+                self._last_pose = pose
+                self._stable_anchor_pose = pose
+                self._stable_since = now
+                return
+
+            if not self._moving:
+                anchor_pose = self._stable_anchor_pose or self._last_pose
+                linear_delta, rot_delta = self._pose_delta(pose, anchor_pose)
+                if linear_delta > MOVEMENT_TRACKER_START_LINEAR_MM or rot_delta > MOVEMENT_TRACKER_START_ROT_DEG:
+                    self._moving = True
+                    self._move_start_time = now
+                    self._move_start_pose = anchor_pose
+                    self._active_labels = self._consume_pending_labels_locked(now)
+                    self._stable_anchor_pose = pose
+                    self._stable_since = now
+                else:
+                    self._stable_anchor_pose = pose
+                    self._stable_since = now
+                self._last_pose = pose
+                return
+
+            anchor_pose = self._stable_anchor_pose or self._last_pose
+            linear_delta, rot_delta = self._pose_delta(pose, anchor_pose)
+            if linear_delta > ROBOT_LINEAR_MOVE_EPS_MM or rot_delta > ROBOT_ROT_MOVE_EPS_DEG:
+                self._stable_anchor_pose = pose
+                self._stable_since = now
+            elif self._stable_since is not None and (now - self._stable_since) >= self._stability_sec:
+                self._finish_movement_locked(pose, now)
+
+            self._last_pose = pose
+
+    def drain_events(self) -> list[str]:
+        events: list[str] = []
+        while True:
+            try:
+                events.append(self._events.get_nowait())
+            except queue.Empty:
+                break
+        return events
+
+    def _consume_pending_labels_locked(self, now: float) -> list[str]:
+        self._drop_stale_pending_locked(now)
+        labels = [label for _, label in self._pending_labels]
+        self._pending_labels.clear()
+        return labels
+
+    def _drop_stale_pending_locked(self, now: float) -> None:
+        cutoff = now - MOVEMENT_TRACKER_LABEL_TTL_SEC
+        self._pending_labels = [(label_time, label) for label_time, label in self._pending_labels if label_time >= cutoff]
+
+    def _finish_movement_locked(
+        self,
+        end_pose: tuple[float, float, float, float, float, float],
+        end_time: float,
+    ) -> None:
+        start_pose = self._move_start_pose or self._last_pose or end_pose
+        duration_sec = max(0.0, end_time - self._move_start_time)
+        linear_delta, rot_delta = self._pose_delta(end_pose, start_pose)
+        label = self._format_labels(self._active_labels)
+        self._events.put(
+            f'{MOVEMENT_TRACKER_LOG_PREFIX}: {label} travel took {duration_sec:.2f}s '
+            f'(TCP delta {linear_delta:.1f}mm, {rot_delta:.1f}deg)'
+        )
+        self._moving = False
+        self._move_start_time = 0.0
+        self._move_start_pose = None
+        self._active_labels = []
+        self._stable_anchor_pose = end_pose
+        self._stable_since = end_time
+
+    @staticmethod
+    def _format_labels(labels: list[str]) -> str:
+        if not labels:
+            return 'unlabeled robot movement'
+        compact_labels: list[str] = []
+        for label in labels:
+            if not compact_labels or compact_labels[-1] != label:
+                compact_labels.append(label)
+        if len(compact_labels) <= 4:
+            return ' -> '.join(compact_labels)
+        return f'{compact_labels[0]} -> ... -> {compact_labels[-1]}'
+
+    @staticmethod
+    def _pose_delta(
+        lhs: tuple[float, float, float, float, float, float],
+        rhs: tuple[float, float, float, float, float, float],
+    ) -> tuple[float, float]:
+        linear_delta = (
+            (lhs[0] - rhs[0]) ** 2 +
+            (lhs[1] - rhs[1]) ** 2 +
+            (lhs[2] - rhs[2]) ** 2
+        ) ** 0.5
+        rot_delta = max(
+            BackgroundMovementTracker._angle_delta_deg(lhs[3], rhs[3]),
+            BackgroundMovementTracker._angle_delta_deg(lhs[4], rhs[4]),
+            BackgroundMovementTracker._angle_delta_deg(lhs[5], rhs[5]),
+        )
+        return linear_delta, rot_delta
+
+    @staticmethod
+    def _angle_delta_deg(lhs: float, rhs: float) -> float:
+        return abs((float(lhs) - float(rhs) + 180.0) % 360.0 - 180.0)
 
 
 class PickCycleNode(Node):
@@ -180,6 +374,7 @@ class PickCycleNode(Node):
         self._tcp_seq = 0
         self._latest_tcp: tuple[float, float, float, float, float, float] | None = None
         self._last_tcp_receive_time = 0.0
+        self._movement_tracker = BackgroundMovementTracker()
 
         self.create_subscription(ToolVectorActual, self.robot_tcp_topic, self._tcp_callback, 10)
 
@@ -206,6 +401,18 @@ class PickCycleNode(Node):
 
     def topic_names(self) -> list[tuple[str, str]]:
         return [('Robot Feedback', self.robot_tcp_topic)]
+
+    def set_movement_tracker_stability_sec(self, stability_sec: float) -> None:
+        self._movement_tracker.set_stability_sec(stability_sec)
+
+    def mark_movement_command(self, label: str) -> None:
+        self._movement_tracker.mark_command(label)
+
+    def cancel_movement_command(self, label: str) -> None:
+        self._movement_tracker.cancel_command(label)
+
+    def drain_movement_events(self) -> list[str]:
+        return self._movement_tracker.drain_events()
 
     def verify_trigger_services(
         self,
@@ -499,6 +706,7 @@ class PickCycleNode(Node):
             self._latest_tcp = tcp
             self._last_tcp_receive_time = now
             self._tcp_condition.notify_all()
+        self._movement_tracker.update(tcp, now)
 
     @staticmethod
     def _pose_delta(
@@ -536,6 +744,10 @@ class PickCycleGui:
         self._cycle_count = 0
         self._robot_status = ROBOT_STATUS_STOP
         self._startup_services_ok = bool(startup_result.success)
+        self._movement_delta_debug_dir = workspace_root() / 'debug files' / MOVEMENT_DELTA_DEBUG_DIRNAME
+        self._movement_delta_cycle_files: dict[int, Path] = {}
+        self._movement_delta_cycle_started_at: dict[int, str] = {}
+        self._movement_delta_cycle_events: dict[int, list[str]] = {}
 
         self.status_var = tk.StringVar(
             value='Idle' if self._startup_services_ok else 'Startup service check failed'
@@ -687,6 +899,7 @@ class PickCycleGui:
         if self._running:
             return
         config = self._read_config()
+        self.node.set_movement_tracker_stability_sec(config.stability_sec)
         self._stop_event.clear()
         self._running = True
         self._set_running_controls(True)
@@ -808,7 +1021,11 @@ class PickCycleGui:
     ) -> bool:
         self._set_status(f'Cycle {cycle_index}: {label}')
         self._log(f'[{cycle_index}] {label}...')
+        movement_label = f'Cycle {cycle_index}: {label}'
+        self.node.mark_movement_command(movement_label)
         result = self.node.click_trigger(client_key, wait_response_sec)
+        if not result.success:
+            self.node.cancel_movement_command(movement_label)
         success_label = 'OK' if wait_response_sec is not None else 'SENT'
         self._log(f'[{cycle_index}] {label}: {success_label if result.success else "FAIL"} - {result.message}')
         return result.success and not self._stop_event.is_set()
@@ -869,7 +1086,11 @@ class PickCycleGui:
                 f'y={config.tray_intercept_y_offset_mm:.0f}mm, '
                 f'rz={config.tray_ee_angle_deg:.0f}deg...'
             )
+            movement_label = f'Cycle {cycle_index}: {arm_label}'
+            self.node.mark_movement_command(movement_label)
             result = self.node.start_tray_intercept(config, ARM_CLICK_RESPONSE_TIMEOUT_SEC)
+            if not result.success:
+                self.node.cancel_movement_command(movement_label)
             self._log(f'[{cycle_index}] {arm_label}: {"OK" if result.success else "FAIL"} - {result.message}')
             if not result.success or self._stop_event.is_set():
                 return False
@@ -1019,7 +1240,53 @@ class PickCycleGui:
                     self.status_var.set('Idle' if not self._stop_event.is_set() else 'Stopped')
         except queue.Empty:
             pass
+
+        for movement_event in self.node.drain_movement_events():
+            timestamp = time.strftime('%H:%M:%S')
+            self._append_log(f'{timestamp}  {movement_event}')
+            self.node.get_logger().info(movement_event)
+            self._write_cycle_movement_delta_debug_file(movement_event)
+
         self.root.after(100, self._drain_queue)
+
+    def _write_cycle_movement_delta_debug_file(self, movement_event: str) -> None:
+        cycle_index = self._cycle_index_from_movement_event(movement_event)
+        wall_timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        if cycle_index not in self._movement_delta_cycle_files:
+            filename_timestamp = time.strftime('%Y%m%d_%H%M%S')
+            filename_label = _safe_filename_fragment(f'cycle_{cycle_index}')
+            filename = f'{filename_timestamp}_{filename_label}_movement_deltas.txt'
+            self._movement_delta_cycle_files[cycle_index] = self._movement_delta_debug_dir / filename
+            self._movement_delta_cycle_started_at[cycle_index] = wall_timestamp
+            self._movement_delta_cycle_events[cycle_index] = []
+
+        self._movement_delta_cycle_events[cycle_index].append(f'{wall_timestamp}  {movement_event}')
+        path = self._movement_delta_cycle_files[cycle_index]
+        try:
+            self._movement_delta_debug_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                '\n'.join([
+                    'pick_cycle cycle movement delta debug',
+                    f'cycle: {cycle_index}',
+                    f'cycle_file_started_at: {self._movement_delta_cycle_started_at[cycle_index]}',
+                    f'last_updated_at: {wall_timestamp}',
+                    f'node: {self.node.get_name()}',
+                    '',
+                    'events:',
+                    *self._movement_delta_cycle_events[cycle_index],
+                    '',
+                ]),
+                encoding='utf-8',
+            )
+        except Exception as exc:
+            self.node.get_logger().warn(f'Failed to write cycle movement delta debug file "{path}": {exc}')
+
+    @staticmethod
+    def _cycle_index_from_movement_event(movement_event: str) -> int:
+        match = re.search(r'\bCycle\s+(\d+)\b', movement_event)
+        if match:
+            return int(match.group(1))
+        return 0
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)

@@ -13,7 +13,7 @@ bringup service and provides quick grip/release actions.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select gripper_control
 source install/setup.bash
