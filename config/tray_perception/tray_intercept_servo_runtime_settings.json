@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "tf_only_mode": false,
+  "tray_vector_wait_timeout_sec": 60.0,
+  "ee_intercept_speed_mm_s": 650.0,
+  "ee_final_pose_angle_deg": 0.0,
+  "tray_intercept_x_offset_mm": 110.0,
+  "tray_intercept_y_offset_mm": 96.0,
+  "tray_standoff_z_mm": 100.0,
+  "command_hysteresis_sec": 0.2,
+  "follow_distance_mm": 200.0,
+  "post_follow_z_up_mm": 300.0,
+  "release_grip_enabled": false,
+  "preview_tray_length_mm": 258.0,
+  "preview_tray_width_mm": 171.0,
+  "preview_tray_border_mm": 19.0,
+  "preview_intercept_dot_diameter_mm": 11.0
+}

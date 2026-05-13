@@ -1,0 +1,29 @@
+item_teach_yolo_session:
+  item_name: paper_cutlery
+  session_dir: /home/erds/DOBOT_pickn_place/teach/bins_yolo/runtime/paper_cutlery_20260509_191354
+  dataset_yaml: /home/erds/DOBOT_pickn_place/teach/bins_yolo/runtime/paper_cutlery_20260509_191354/dataset.yaml
+  sample_count: 25
+  training_status: done
+  training_epoch_current: 80
+  training_epoch_total: 80
+  training_progress: 1.0
+  trained_model_path: /home/erds/DOBOT_pickn_place/teach/bins_yolo/models/item_paper_cutlery_bin_blue_bin_09052026/best.pt
+  trained_onnx_path: /home/erds/DOBOT_pickn_place/teach/bins_yolo/models/item_paper_cutlery_bin_blue_bin_09052026/best.onnx
+  final_model_dir: /home/erds/DOBOT_pickn_place/teach/bins_yolo/models/item_paper_cutlery_bin_blue_bin_09052026
+  latest_profile_path: /home/erds/DOBOT_pickn_place/teach/bins_yolo/profiles/item_paper_cutlery_bin_blue_bin_yolo_09052026.yaml
+  active_bin_name: blue_bin
+  active_bin_file: /home/erds/DOBOT_pickn_place/teach/bin_teach/blue_bin.yaml
+  roi_crop_rect:
+  - 212
+  - 34
+  - 466
+  - 415
+  teach_joints_deg:
+  - 20.666003828384177
+  - 22.758008568699402
+  - -102.91798988259193
+  - -8.815002291038521
+  - 92.98599084547061
+  - 19.891009945119773
+  positive_prompt_count: 0
+  negative_prompt_count: 0

@@ -1,7 +1,6 @@
 {
   "robot_number": 1,
   "current_robot": 1,
-  "ros_domain_id": 1,
   "ros_localhost_only": true,
   "node_info": [
     {

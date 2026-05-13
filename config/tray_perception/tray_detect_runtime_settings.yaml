@@ -1,0 +1,7 @@
+selected_profile_path: /home/erds/DOBOT_pickn_place/teach/tray_teach/tray_brown_tray_09052026.yaml
+view_mode: rgb
+overlay_enabled: true
+edge_tolerance_percent: 15
+seek_window_sec: 60
+seek_decay_sec: 1
+seek_valid_frames_confidence: 12
