@@ -23,6 +23,8 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
@@ -58,7 +60,7 @@ constexpr int kDepthEdgeOffsetMinPx = 1;
 constexpr int kDepthEdgeOffsetMaxPx = 20;
 constexpr std::size_t kTeachRoiPointCount = 4;
 
-double remapOutlierSensitivityToLegacyRange(int outlier_sensitivity)
+double remapOutlierSensitivityToFitRange(int outlier_sensitivity)
 {
   const int clamped = std::clamp(outlier_sensitivity, 1, 100);
   return 50.0 + (static_cast<double>(clamped - 1) * 100.0 / 99.0);
@@ -364,7 +366,7 @@ SideFitResult fitSideLineWithTrimming(
   const cv::Point2f &fallback_b,
   int outlier_sensitivity)
 {
-  const double remapped_sensitivity = remapOutlierSensitivityToLegacyRange(outlier_sensitivity);
+  const double remapped_sensitivity = remapOutlierSensitivityToFitRange(outlier_sensitivity);
   const double sensitivity_factor = std::clamp(4.0 - 0.03 * remapped_sensitivity, 1.0, 4.0);
   const double consensus_threshold = std::clamp(
     9.0 - 0.05 * remapped_sensitivity,
@@ -513,7 +515,7 @@ std::vector<cv::Point2f> rejectSideOutliers(
 {
   std::vector<cv::Point2f> corners(4);
   rough_rect.points(corners.data());
-  const double remapped_sensitivity = remapOutlierSensitivityToLegacyRange(outlier_sensitivity);
+  const double remapped_sensitivity = remapOutlierSensitivityToFitRange(outlier_sensitivity);
   const double sensitivity_factor = std::clamp(4.0 - 0.03 * remapped_sensitivity, 1.0, 4.0);
 
   std::vector<std::vector<cv::Point2f>> side_groups(4);
@@ -2160,7 +2162,7 @@ std::optional<AxisSideFitResult> fitAxisAlignedSide(
     deviations.push_back(std::fabs(coordinate - median));
   }
 
-  const double remapped_sensitivity = remapOutlierSensitivityToLegacyRange(outlier_sensitivity);
+  const double remapped_sensitivity = remapOutlierSensitivityToFitRange(outlier_sensitivity);
   const double sensitivity_factor = std::clamp(4.0 - 0.03 * remapped_sensitivity, 1.0, 4.0);
   const float median_deviation = medianCoordinate(deviations);
   const float threshold = static_cast<float>(std::max(
@@ -3058,25 +3060,25 @@ public:
   TrayDetectorNode()
   : Node("tray_teach")
   {
-    color_topic_ = declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
-    depth_topic_ = declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
-    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/camera/color/camera_info");
+    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
+    depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
+    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
     joint_states_topic_ = declare_parameter<std::string>("joint_states_topic", "/joint_states_robot");
     overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
     profiles_dir_ = declare_parameter<std::string>(
       "profiles_dir",
-      "/home/erds/DOBOT_pickn_place/config/trays");
+      dobot_common::paths::workspacePath({"teach", "tray_teach"}, __FILE__).string());
     settings_path_ = declare_parameter<std::string>(
       "settings_path",
-      "/home/erds/DOBOT_pickn_place/config/trays/tray_teach_settings.yaml");
+      dobot_common::paths::workspacePath(
+        {"config", "tray_perception", "tray_teach_settings.yaml"}, __FILE__).string());
     runtime_settings_path_ = declare_parameter<std::string>(
       "runtime_settings_path",
-      "/home/erds/DOBOT_pickn_place/config/trays/tray_teach_runtime.yaml");
+      dobot_common::paths::workspacePath(
+        {"config", "tray_perception", "tray_teach_runtime.yaml"}, __FILE__).string());
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
     display_scale_ = declare_parameter<double>("display_scale", 1.0);
-    const int legacy_ray_step = declare_parameter<int>("ray_step_mm", 3);
-    const int legacy_ray_count = std::clamp(static_cast<int>(declare_parameter<int>("ray_count", 50)), 50, 150);
-    ray_step_px_ = declare_parameter<int>("ray_step_px", legacy_ray_step);
+    ray_step_px_ = declare_parameter<int>("ray_step_px", 3);
     depth_edge_offset_px_ = std::clamp(
       static_cast<int>(declare_parameter<int>("depth_edge_offset_px", 4)),
       kDepthEdgeOffsetMinPx,
@@ -3086,11 +3088,11 @@ public:
       20,
       100);
     horizontal_ray_count_ = std::clamp(
-      static_cast<int>(declare_parameter<int>("horizontal_ray_count", legacy_ray_count)),
+      static_cast<int>(declare_parameter<int>("horizontal_ray_count", 50)),
       kHorizontalRayCountMin,
       kHorizontalRayCountMax);
     vertical_ray_count_ = std::clamp(
-      static_cast<int>(declare_parameter<int>("vertical_ray_count", legacy_ray_count)),
+      static_cast<int>(declare_parameter<int>("vertical_ray_count", 50)),
       50,
       150);
     trace_out_to_in_ = declare_parameter<bool>("trace_out_to_in", false);

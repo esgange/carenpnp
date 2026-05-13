@@ -41,11 +41,11 @@ ArucoDetectorNode::ArucoDetectorNode()
 : Node("aruco_detector")
 {
   color_topic_ = this->declare_parameter<std::string>(
-    "color_topic", "/camera/color/image_raw");
+    "color_topic", "/robot_camera/color/image_raw");
   depth_topic_ = this->declare_parameter<std::string>(
-    "depth_topic", "/camera/depth/image_raw");
+    "depth_topic", "/robot_camera/depth/image_raw");
   camera_info_topic_ = this->declare_parameter<std::string>(
-    "camera_info_topic", "/camera/color/camera_info");
+    "camera_info_topic", "/robot_camera/color/camera_info");
   overlay_topic_ = this->declare_parameter<std::string>(
     "overlay_topic", "/aruco_overlay");
   detections_topic_ = this->declare_parameter<std::string>(
@@ -1056,10 +1056,10 @@ bool ArucoDetectorNode::loadCalibrationFromFile(const std::string &path, Eigen::
     return false;
   }
 
-  const auto calib = root["calibration_transform"];
+  const auto calib = root["transform"];
   if (!calib)
   {
-    reason = "missing 'calibration_transform'";
+    reason = "missing 'transform'";
     return false;
   }
   const auto rot = calib["rotation"];

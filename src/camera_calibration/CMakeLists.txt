@@ -23,6 +23,7 @@ set(CMAKE_AUTOMOC ON)
 
 include_directories(
   include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
 add_executable(eye_on_hand_calibrator src/eye_on_hand_calibrator.cpp)

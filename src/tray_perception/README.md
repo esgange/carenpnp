@@ -15,7 +15,7 @@ motion packages.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select tray_perception
 source install/setup.bash
@@ -39,9 +39,9 @@ Camera topic overrides:
 
 ```bash
 ros2 launch tray_perception tray_detect.launch.py \
-  color_topic:=/camera/color/image_raw \
-  depth_topic:=/camera/depth/image_raw \
-  camera_info_topic:=/camera/color/camera_info
+  color_topic:=/robot_camera/color/image_raw \
+  depth_topic:=/robot_camera/depth/image_raw \
+  camera_info_topic:=/robot_camera/color/camera_info
 ```
 
 ## Teach Workflow
@@ -71,7 +71,9 @@ saved plane instead of recomputing it every frame.
 - resets seek evidence after `seek_decay_sec` without a valid frame;
 - publishes first/last seek artifacts for successful confidence runs;
 - uses the lower-left tray corner as the pose and overlay origin;
-- sets `+X` along the tray long side and `+Y` along the short side.
+- sets `+X` along the tray long side and `+Y` along the short side;
+- derives `+Z` naturally from `X cross Y`, so Z may point up or down
+  depending on the tray orientation in the image.
 - keeps that lower-left origin fixed; seek direction no longer flips the axes.
 
 ## Calibration
@@ -86,7 +88,7 @@ Defaults:
 | `use_calibration` | `true` |
 | `parent_frame` | `Link6` |
 | `child_frame` | `calibrated_camera_link` |
-| `calibration_dir` | `~/DOBOT_pickn_place/calibration` |
+| `calibration_dir` | `WORKSPACE_ROOT/calibration` |
 
 If calibration is enabled and no usable YAML is available, launch shows an error
 dialog and exits.
@@ -95,16 +97,16 @@ dialog and exits.
 
 | Topic | Type |
 | --- | --- |
-| `/camera/color/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/depth/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
+| `/robot_camera/color/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/depth/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
 
 ## Outputs
 
 | Output | Type | Notes |
 | --- | --- | --- |
 | `tray_overlay` | `sensor_msgs/msg/Image` | Runtime debug/preview image. |
-| `tray_pose` | `geometry_msgs/msg/PoseStamped` | Filtered canonical tray pose: overlay origin/X, robot/base-up Z. |
+| `tray_pose` | `geometry_msgs/msg/PoseStamped` | Filtered canonical tray pose: lower-left origin, tray edge X/Y, natural right-handed Z. |
 | `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | The same 2D origin and X/Y unit directions drawn on the camera overlay. |
 | `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | Pose, timing, velocity, speed, and direction. |
 | `tray_cube_marker` | `visualization_msgs/msg/Marker` | RViz cube marker. |
@@ -115,7 +117,7 @@ dialog and exits.
 Profiles are stored in:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/trays
+WORKSPACE_ROOT/teach/tray_teach
 ```
 
 Current dated profiles use:
@@ -124,7 +126,13 @@ Current dated profiles use:
 tray_<name>_<ddmmyyyy>.yaml
 ```
 
-The compatibility/latest file is:
+Runtime state and the latest-profile alias are stored under:
+
+```text
+WORKSPACE_ROOT/config/tray_perception
+```
+
+The latest-profile alias is:
 
 ```text
 tray_teach_settings.yaml
@@ -133,7 +141,7 @@ tray_teach_settings.yaml
 Seek artifacts are written under:
 
 ```text
-/home/erds/DOBOT_pickn_place/debug files/seek_frames
+WORKSPACE_ROOT/debug files/seek_frames
 ```
 
 ## Key Runtime Defaults

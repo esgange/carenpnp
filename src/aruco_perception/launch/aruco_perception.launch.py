@@ -8,6 +8,32 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+def repo_path(*parts: str) -> str:
+  def looks_like_root(path: Path) -> bool:
+    return (
+      (path / "src").exists() and
+      (
+        (path / "README.md").exists()
+        or (path / "docker-compose.yml").exists()
+        or (path / "src" / "dobot_msgs_v4").exists()
+      )
+    )
+
+  for name in ("DOBOT_PICKN_PLACE_ROOT", "DOBOT_WORKSPACE_ROOT"):
+    value = os.environ.get(name)
+    if value:
+      return str(Path(value).expanduser().resolve().joinpath(*parts))
+
+  for start in (Path.cwd(), Path(__file__).resolve()):
+    path = start.expanduser().resolve()
+    if path.is_file():
+      path = path.parent
+    for candidate in (path, *path.parents):
+      if looks_like_root(candidate):
+        return str(candidate.joinpath(*parts))
+  return str(Path.cwd().resolve().joinpath(*parts))
+
+
 def show_missing_calibration_dialog(message: str) -> None:
   try:
     import tkinter as tk
@@ -22,17 +48,41 @@ def show_missing_calibration_dialog(message: str) -> None:
     print(f"[aruco_perception.launch] Could not open GUI dialog: {exc}")
     print(message)
 
+def _ros_domain_action():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / 'src' / 'dobot_bringup_v4' / 'launch' / 'ros_domain.py',
+            parent / 'install' / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location('_dobot_ros_domain', helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.ros_domain_action()
+
+    raise RuntimeError('Could not find ros_domain.py helper for ROS_DOMAIN_ID')
+
 
 def generate_launch_description():
   return LaunchDescription(
     [
+      _ros_domain_action(),
       DeclareLaunchArgument("use_calibration", default_value="true",
                             description="Require and load calibration YAML by default; set false only for raw-frame calibration workflow."),
       DeclareLaunchArgument("parent_frame", default_value="Link6",
                             description="Parent frame for calibrated camera."),
       DeclareLaunchArgument("child_frame", default_value="calibrated_camera_link",
                             description="Name of calibrated camera frame."),
-      DeclareLaunchArgument("calibration_dir", default_value="~/DOBOT_pickn_place/calibration",
+      DeclareLaunchArgument("calibration_dir", default_value=repo_path("calibration"),
                             description="Directory to search for calibration YAMLs."),
       DeclareLaunchArgument("calibration_file", default_value="",
                             description="Explicit calibration YAML path (overrides discovery)."),
@@ -44,11 +94,11 @@ def generate_launch_description():
                             description="Maximum overlay publish/window update rate; <=0 means camera rate."),
       DeclareLaunchArgument("detections_topic", default_value="/aruco_detections",
                             description="Current-frame ArUco detection output topic."),
-      DeclareLaunchArgument("color_topic", default_value="/camera/color/image_raw",
+      DeclareLaunchArgument("color_topic", default_value="/robot_camera/color/image_raw",
                             description="RGB image topic for ArUco detection."),
-      DeclareLaunchArgument("depth_topic", default_value="/camera/depth/image_raw",
+      DeclareLaunchArgument("depth_topic", default_value="/robot_camera/depth/image_raw",
                             description="Depth image topic for ArUco detection."),
-      DeclareLaunchArgument("camera_info_topic", default_value="/camera/color/camera_info",
+      DeclareLaunchArgument("camera_info_topic", default_value="/robot_camera/color/camera_info",
                             description="Camera info topic for ArUco detection."),
       OpaqueFunction(function=launch_setup),
     ]
@@ -133,10 +183,13 @@ def find_latest_calibration(calibration_dir: str) -> str:
     base = Path(calibration_dir).expanduser()
     if not base.exists() or not base.is_dir():
       return ""
-    yaml_files = [
-      p for p in base.iterdir()
-      if p.is_file() and p.suffix == ".yaml" and p.stat().st_size > 0
-    ]
+    yaml_files = []
+    for path in base.iterdir():
+      if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
+        continue
+      name = path.name
+      if name.startswith("axab_calibration_eyeonhand_"):
+        yaml_files.append(path)
     if not yaml_files:
       return ""
     latest = max(yaml_files, key=lambda p: p.stat().st_mtime)

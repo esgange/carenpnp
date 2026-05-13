@@ -13,7 +13,7 @@ intercept target, and dispatches a staged robot motion sequence.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select tray_intercept
 source install/setup.bash
@@ -36,10 +36,17 @@ ros2 run tray_intercept tray_intercept
 | Input | Type | Source |
 | --- | --- | --- |
 | `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | `tray_detect` motion estimate. |
+| `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | Live 2D tray origin and X/Y axes for the GUI preview. |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | DOBOT bringup TCP feedback. |
 
 The GUI automatically calls `tray_detect/get_tray_dimensions` to keep the tray
 preview size synced when the service is available.
+
+GUI runtime settings are saved to:
+
+```text
+WORKSPACE_ROOT/config/tray_perception/tray_intercept_runtime_settings.json
+```
 
 ## Services
 
@@ -63,7 +70,7 @@ Example:
 
 ```bash
 ros2 service call /tray_intercept/start_sequence dobot_msgs_v4/srv/TrayInterceptStart \
-"{tray_vector_wait_timeout_sec: 60.0, ee_intercept_speed_mm_s: 650.0, tray_intercept_x_offset_mm: 0.0, tray_intercept_y_offset_mm: 0.0, tray_standoff_z_mm: 100.0, follow_distance_mm: 200.0, post_follow_z_up_mm: 300.0, troubleshoot_tf_only: false}"
+"{tray_vector_wait_timeout_sec: 60.0, ee_intercept_speed_mm_s: 650.0, tray_intercept_x_offset_mm: 0.0, tray_intercept_y_offset_mm: 0.0, ee_final_pose_angle_deg: 0.0, tray_standoff_z_mm: 100.0, follow_distance_mm: 200.0, post_follow_z_up_mm: 300.0, troubleshoot_tf_only: false}"
 ```
 
 ## Runtime Flow
@@ -85,12 +92,14 @@ CCW, positive rotates CW, and zero preserves the current TCP orientation instead
 of aligning the EE to the tray axes. The tray-direction follow move still uses
 detected tray speed, and post-follow Z-up uses the configured arm max speed.
 The tray standoff Z offset is applied in robot/base +Z, so positive Z remains
-an upward standoff even if a detected tray frame is noisy.
+an upward standoff even if the detected tray frame has a downward natural Z.
+Tray X/Y offsets are projected into the robot base XY plane before motion.
 
 The preview origin is fixed at the lower-left tray corner. X/Y preview clicks
 are converted from that displayed bottom origin and sent directly in the
-canonical tray frame from `tray_detect`. The preview is a flat top-down 2D tray
-view based only on tray length and width.
+canonical tray frame from `tray_detect`. The flat top-down preview uses live
+2D axes from `tray_axis_overlay`, so it follows runtime tray orientation without
+waiting for a seek `tray_vector`.
 
 ## Debug TF Frames
 
@@ -105,7 +114,7 @@ Published in the robot goal frame, default `base_link`:
 The node auto-loads speed mapping from the newest non-empty file matching:
 
 ```text
-~/DOBOT_pickn_place/calibration/relmovl_speed_calibration*.json
+WORKSPACE_ROOT/calibration/relmovl_speed_calibration*.json
 ```
 
 It also reads startup `CP` and `SpeedFactor` values from the same calibration

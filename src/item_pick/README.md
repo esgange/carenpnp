@@ -14,7 +14,7 @@ retract, and final Z-up motions.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select item_pick
 source install/setup.bash
@@ -43,11 +43,14 @@ ros2 run item_pick item_pick
 The active profile export is read from:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/bins/item_detect_selected_profile.txt
+WORKSPACE_ROOT/config/item_perception/item_detect_selected_profile.txt
 ```
 
-The old `bin_detect_selected_profile.txt` path is still accepted as a fallback
-so existing teach files do not break during migration.
+GUI runtime settings are saved to:
+
+```text
+WORKSPACE_ROOT/config/item_perception/item_pick_runtime_settings.json
+```
 
 ## Services
 
@@ -67,7 +70,7 @@ Example:
 
 ```bash
 ros2 service call /item_pick/start_sequence dobot_msgs_v4/srv/TrayInterceptStart \
-"{tray_vector_wait_timeout_sec: 60.0, ee_intercept_speed_mm_s: 350.0, tray_intercept_x_offset_mm: 0.0, tray_intercept_y_offset_mm: 0.0, tray_standoff_z_mm: 100.0, follow_distance_mm: 200.0, post_follow_z_up_mm: 300.0, troubleshoot_tf_only: false}"
+"{tray_vector_wait_timeout_sec: 60.0, ee_intercept_speed_mm_s: 350.0, tray_intercept_x_offset_mm: 0.0, tray_intercept_y_offset_mm: 0.0, ee_final_pose_angle_deg: 0.0, tray_standoff_z_mm: 100.0, follow_distance_mm: 200.0, post_follow_z_up_mm: 300.0, troubleshoot_tf_only: false}"
 ```
 
 Robot service clients use the DOBOT bringup service root:
@@ -86,13 +89,13 @@ Main robot services used:
 ## Tool Teach Sidecars
 
 Each item-detect profile requires a saved tool teach sidecar before arming. The
-sidecar stores the Link6/tool offset and operator pick heights for the active
-item teach.
+sidecar stores the Link6/tool offset, operator pick heights, pre-pick settling,
+and pickup-depth settling for the active item teach.
 
 Sidecar pattern:
 
 ```text
-/home/erds/DOBOT_pickn_place/config/bins/<item_name>_tool.yaml
+WORKSPACE_ROOT/teach/item_teach/<item_name>_tool.yaml
 ```
 
 The GUI can:
@@ -104,16 +107,20 @@ The GUI can:
 
 ## Motion Sequence
 
-On trigger, the node:
+On trigger, the node arms for a fresh `bin_seek_pose`. When the pose arrives, it:
 
-1. Sends `Stop`.
-2. Builds the two valid long-axis item poses: preferred and 180-degree flipped.
-3. Prefers the pose that keeps `calibrated_camera_link` inside the active bin
+1. Builds the two valid long-axis item poses: preferred and 180-degree flipped.
+2. Prefers the pose that keeps `calibrated_camera_link` inside the active bin
    teach footprint. If both are outside, it logs a warning and continues with
    the preferred pose anyway.
-4. Moves with `MovL` to the approach pose above the pick goal.
-5. Moves to pick depth with open gripper and suction enabled.
-6. Closes the gripper, retracts to approach, then moves to final Z-up.
+3. Moves with `MovL` to the approach pose above the pick goal.
+4. Opens the gripper with suction off, then waits the configured pre-pick
+   settling time.
+5. Uses `MovLIO` at 6% speed factor to move to pick depth while triggering
+   suction at the start of the descent, waits for TCP reach, then waits the
+   configured pick settling time at pickup depth.
+6. Closes the gripper, retracts to approach, waits for TCP reach, then moves to
+   final Z-up at 100% speed factor.
 
 Camera-bin pose preference can be disabled with `prefer_camera_inside_bin:=false`.
 The checked frames default to `Link6` and `calibrated_camera_link`.

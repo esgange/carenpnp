@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>orbbec_camera_launcher</name>
+  <version>0.0.1</version>
+  <description>Operator GUI for launching two Orbbec cameras by serial number.</description>
+  <maintainer email="maintainer@example.com">maintainer</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>orbbec_camera</exec_depend>
+  <exec_depend>python3-tk</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

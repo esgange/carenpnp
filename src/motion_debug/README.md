@@ -13,7 +13,7 @@ diagnostic and commissioning tool, not an autonomous pick workflow.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select motion_debug
 source install/setup.bash
@@ -74,7 +74,7 @@ Common services used:
 Scripts are stored by default in:
 
 ```text
-~/.ros/motion_debug_scripts
+WORKSPACE_ROOT/config/motion_calibrate
 ```
 
 Script files are JSON and can include a top-level speed profile:
@@ -87,8 +87,6 @@ Script files are JSON and can include a top-level speed profile:
   }
 }
 ```
-
-Legacy scripts with top-level `cp` and `speed_factor` are still loaded.
 
 Script behavior:
 

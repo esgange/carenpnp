@@ -7,7 +7,7 @@ workspace-specific interfaces for tray and bin workflows.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select dobot_msgs_v4
 source install/setup.bash

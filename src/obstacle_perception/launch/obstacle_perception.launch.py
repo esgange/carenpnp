@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
@@ -7,6 +8,59 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch.conditions import IfCondition
 from ament_index_python.packages import get_package_share_directory
+
+
+def _workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / "src").exists() and
+            (
+                (path / "README.md").exists()
+                or (path / "docker-compose.yml").exists()
+                or (path / "src" / "dobot_msgs_v4").exists()
+            )
+        )
+
+    for name in ("DOBOT_PICKN_PLACE_ROOT", "DOBOT_WORKSPACE_ROOT"):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser().resolve()
+
+    for start in (Path.cwd(), Path(__file__).resolve()):
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+    return Path.cwd().resolve()
+
+
+def _repo_path(*parts: str) -> str:
+    return str(_workspace_root().joinpath(*parts))
+
+def _ros_domain_action():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / 'src' / 'dobot_bringup_v4' / 'launch' / 'ros_domain.py',
+            parent / 'install' / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location('_dobot_ros_domain', helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.ros_domain_action()
+
+    raise RuntimeError('Could not find ros_domain.py helper for ROS_DOMAIN_ID')
 
 
 def generate_launch_description():
@@ -45,14 +99,15 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            _ros_domain_action(),
             DeclareLaunchArgument(
-                "color_topic", default_value="/camera/color/image_raw"
+                "color_topic", default_value="/robot_camera/color/image_raw"
             ),
             DeclareLaunchArgument(
-                "depth_topic", default_value="/camera/depth/image_raw"
+                "depth_topic", default_value="/robot_camera/depth/image_raw"
             ),
             DeclareLaunchArgument(
-                "camera_info_topic", default_value="/camera/color/camera_info"
+                "camera_info_topic", default_value="/robot_camera/color/camera_info"
             ),
             DeclareLaunchArgument("enable_memory", default_value="true"),
             DeclareLaunchArgument("memory_voxel_size", default_value="0.03"),
@@ -85,12 +140,12 @@ def generate_launch_description():
             DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
             DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
             DeclareLaunchArgument(
-                "calibration_dir", default_value="~/DOBOT_pickn_place/calibration"
+                "calibration_dir", default_value=_repo_path("calibration")
             ),
             DeclareLaunchArgument(
                 "calibration_file",
                 default_value="",
-                description="Optional explicit calibration YAML; empty means auto-discover newest in calibration_dir.",
+                description="Optional explicit calibration YAML; empty means auto-discover newest eye-on-hand calibration in calibration_dir.",
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(

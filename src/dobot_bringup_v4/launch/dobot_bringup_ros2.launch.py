@@ -1,15 +1,62 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_path
 from pathlib import Path
 import json
+import os
+
+
+def _ros_bool(value, *, default=False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ('1', 'true', 'yes', 'on'):
+            return True
+        if normalized in ('0', 'false', 'no', 'off'):
+            return False
+    raise ValueError("[cr_robot_ros2] `ros_localhost_only` must be true/false or 1/0.")
+
+
+def _workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / 'config' / 'robot_bringup' / 'param.json').exists()
+            or (path / 'src' / 'dobot_msgs_v4').exists()
+            or (path / 'docker-compose.yml').exists()
+        )
+
+    for name in ('DOBOT_PICKN_PLACE_ROOT', 'DOBOT_WORKSPACE_ROOT'):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser().resolve()
+
+    for start in (Path.cwd(), Path(__file__).resolve()):
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+    return Path.cwd().resolve()
+
+
+def _default_config_path() -> str:
+    workspace_config = _workspace_root() / 'config' / 'robot_bringup' / 'param.json'
+    if workspace_config.exists():
+        return str(workspace_config)
+    return str(get_package_share_path('cr_robot_ros2') / 'config' / 'param.json')
 
 
 def _launch_setup(context, *args, **kwargs):
-    # Resolve the config path (defaults to the package's param.json)
-    config_path = Path(LaunchConfiguration('config').perform(context))
+    config_path = Path(LaunchConfiguration('config').perform(context)).expanduser()
     if not config_path.exists():
         raise FileNotFoundError(f"[cr_robot_ros2] param.json not found at: {config_path}")
 
@@ -19,6 +66,15 @@ def _launch_setup(context, *args, **kwargs):
     # Read high-level config
     robot_number = int(cfg.get('robot_number', 1))
     current_robot = int(cfg.get('current_robot', 1))
+    ros_domain_id_value = cfg.get('ros_domain_id')
+    ros_domain_id = None
+    if ros_domain_id_value is not None and not (
+        isinstance(ros_domain_id_value, str) and not ros_domain_id_value.strip()
+    ):
+        ros_domain_id = int(ros_domain_id_value)
+        if ros_domain_id < 0 or ros_domain_id > 232:
+            raise ValueError("[cr_robot_ros2] `ros_domain_id` must be between 0 and 232.")
+    ros_localhost_only = '1' if _ros_bool(cfg.get('ros_localhost_only'), default=False) else '0'
 
     node_info = cfg.get('node_info', [])
     if not isinstance(node_info, list) or len(node_info) == 0:
@@ -51,18 +107,44 @@ def _launch_setup(context, *args, **kwargs):
         parameters=[params],
     )
 
-    return [bringup]
+    env_actions = [
+        SetEnvironmentVariable(name='ROS_LOCALHOST_ONLY', value=ros_localhost_only),
+    ]
+    if ros_domain_id is not None:
+        env_actions.insert(0, SetEnvironmentVariable(name='ROS_DOMAIN_ID', value=str(ros_domain_id)))
+
+    return env_actions + [bringup]
+
+def _ros_domain_action():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / 'src' / 'dobot_bringup_v4' / 'launch' / 'ros_domain.py',
+            parent / 'install' / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location('_dobot_ros_domain', helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.ros_domain_action()
+
+    raise RuntimeError('Could not find ros_domain.py helper for ROS_DOMAIN_ID')
 
 
 def generate_launch_description():
-    # Default to the installed share/config/param.json inside this package
-    share_dir = get_package_share_path('cr_robot_ros2')
-    default_config = str(share_dir / 'config' / 'param.json')
-
     return LaunchDescription([
+        _ros_domain_action(),
         DeclareLaunchArgument(
             'config',
-            default_value=default_config,
+            default_value=_default_config_path(),
             description='Path to the param.json containing robot connection info.'
         ),
         OpaqueFunction(function=_launch_setup),

@@ -1,0 +1,1 @@
+# Keep vendored Python projects out of ROS/colcon package discovery.

@@ -36,12 +36,11 @@
 #include <dobot_msgs_v4/srv/get_tray_dimensions.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include <tf2/exceptions.h>
-#include <tf2_ros/buffer.h>
 #include <tf2_ros/static_transform_broadcaster.h>
-#include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <yaml-cpp/yaml.h>
+
+#include <dobot_common/workspace_paths.hpp>
 
 namespace
 {
@@ -92,7 +91,7 @@ builtin_interfaces::msg::Time toBuiltinTime(const rclcpp::Time &stamp)
   return output;
 }
 
-double remapOutlierSensitivityToLegacyRange(int outlier_sensitivity)
+double remapOutlierSensitivityToFitRange(int outlier_sensitivity)
 {
   const int clamped = std::clamp(outlier_sensitivity, 1, 100);
   return 50.0 + (static_cast<double>(clamped - 1) * 100.0 / 99.0);
@@ -340,9 +339,9 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
 
     TrayProfile profile;
     profile.path = path;
-    profile.color_topic = params["color_topic"] ? params["color_topic"].as<std::string>() : "/camera/color/image_raw";
-    profile.depth_topic = params["depth_topic"] ? params["depth_topic"].as<std::string>() : "/camera/depth/image_raw";
-    profile.camera_info_topic = params["camera_info_topic"] ? params["camera_info_topic"].as<std::string>() : "/camera/color/camera_info";
+    profile.color_topic = params["color_topic"] ? params["color_topic"].as<std::string>() : "/robot_camera/color/image_raw";
+    profile.depth_topic = params["depth_topic"] ? params["depth_topic"].as<std::string>() : "/robot_camera/depth/image_raw";
+    profile.camera_info_topic = params["camera_info_topic"] ? params["camera_info_topic"].as<std::string>() : "/robot_camera/color/camera_info";
     profile.overlay_topic = params["overlay_topic"] ? params["overlay_topic"].as<std::string>() : "tray_overlay";
     if (params["detection_mode"])
     {
@@ -355,12 +354,7 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
     profile.red_threshold = params["red_threshold"] ? params["red_threshold"].as<int>() : 120;
     profile.green_threshold = params["green_threshold"] ? params["green_threshold"].as<int>() : 120;
     profile.blue_threshold = params["blue_threshold"] ? params["blue_threshold"].as<int>() : 120;
-    const int legacy_ray_step = params["ray_step_mm"] ? params["ray_step_mm"].as<int>() : 3;
-    const int legacy_ray_count = std::clamp(
-      params["ray_count"] ? params["ray_count"].as<int>() : 50,
-      50,
-      150);
-    profile.ray_step_px = params["ray_step_px"] ? params["ray_step_px"].as<int>() : legacy_ray_step;
+    profile.ray_step_px = params["ray_step_px"] ? params["ray_step_px"].as<int>() : profile.ray_step_px;
     profile.depth_edge_offset_px = std::clamp(
       params["depth_edge_offset_px"] ? params["depth_edge_offset_px"].as<int>() : 4,
       kDepthEdgeOffsetMinPx,
@@ -370,11 +364,11 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
       20,
       100);
     profile.horizontal_ray_count = std::clamp(
-      params["horizontal_ray_count"] ? params["horizontal_ray_count"].as<int>() : legacy_ray_count,
+      params["horizontal_ray_count"] ? params["horizontal_ray_count"].as<int>() : profile.horizontal_ray_count,
       50,
       100);
     profile.vertical_ray_count = std::clamp(
-      params["vertical_ray_count"] ? params["vertical_ray_count"].as<int>() : legacy_ray_count,
+      params["vertical_ray_count"] ? params["vertical_ray_count"].as<int>() : profile.vertical_ray_count,
       50,
       150);
     profile.outlier_sensitivity = std::clamp(
@@ -492,9 +486,9 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
       profile.roi_points.size() >= 2 &&
       profile.roi_points.size() <= 4)
     {
-      if (const auto legacy_bounds = roiBoundsFromSelection(profile.roi_points); legacy_bounds.has_value())
+      if (const auto selected_bounds = roiBoundsFromSelection(profile.roi_points); selected_bounds.has_value())
       {
-        profile.roi_points = roiPointsFromBounds(*legacy_bounds);
+        profile.roi_points = roiPointsFromBounds(*selected_bounds);
       }
     }
     if (profile.roi_points.size() < 4)
@@ -518,7 +512,7 @@ std::vector<TrayProfile> loadTrayProfilesFromDirectory(const std::filesystem::pa
     return profiles;
   }
 
-  std::vector<TrayProfile> legacy_profiles;
+  std::vector<TrayProfile> alias_profiles;
   for (const auto &entry : std::filesystem::directory_iterator(profiles_dir))
   {
     if (!entry.is_regular_file())
@@ -540,7 +534,7 @@ std::vector<TrayProfile> loadTrayProfilesFromDirectory(const std::filesystem::pa
 
     if (entry.path().filename() == "tray_teach_settings.yaml")
     {
-      legacy_profiles.push_back(*profile);
+      alias_profiles.push_back(*profile);
     }
     else
     {
@@ -558,7 +552,7 @@ std::vector<TrayProfile> loadTrayProfilesFromDirectory(const std::filesystem::pa
   };
 
   std::sort(profiles.begin(), profiles.end(), by_recent_date);
-  std::sort(legacy_profiles.begin(), legacy_profiles.end(), by_recent_date);
+  std::sort(alias_profiles.begin(), alias_profiles.end(), by_recent_date);
 
   auto same_teach_profile = [](const TrayProfile &a, const TrayProfile &b)
   {
@@ -579,27 +573,27 @@ std::vector<TrayProfile> loadTrayProfilesFromDirectory(const std::filesystem::pa
       (edge_lengths_match || std::fabs(a.taught_area_cm2 - b.taught_area_cm2) < 1e-6);
   };
 
-  for (const auto &legacy_profile : legacy_profiles)
+  for (const auto &alias_profile : alias_profiles)
   {
     const auto existing_it = std::find_if(
       profiles.begin(),
       profiles.end(),
       [&](const TrayProfile &profile)
       {
-        return same_teach_profile(profile, legacy_profile);
+        return same_teach_profile(profile, alias_profile);
       });
 
     if (existing_it == profiles.end())
     {
-      profiles.push_back(legacy_profile);
+      profiles.push_back(alias_profile);
       continue;
     }
 
     const bool existing_missing_roi = existing_it->roi_points.size() < 4;
-    const bool legacy_has_roi = legacy_profile.roi_points.size() >= 4;
-    if (existing_missing_roi && legacy_has_roi)
+    const bool alias_has_roi = alias_profile.roi_points.size() >= 4;
+    if (existing_missing_roi && alias_has_roi)
     {
-      *existing_it = legacy_profile;
+      *existing_it = alias_profile;
     }
   }
 
@@ -829,7 +823,7 @@ SideFitResult fitSideLineWithTrimming(
   const cv::Point2f &fallback_b,
   int outlier_sensitivity)
 {
-  const double remapped_sensitivity = remapOutlierSensitivityToLegacyRange(outlier_sensitivity);
+  const double remapped_sensitivity = remapOutlierSensitivityToFitRange(outlier_sensitivity);
   const double sensitivity_factor = std::clamp(4.0 - 0.03 * remapped_sensitivity, 1.0, 4.0);
   const double consensus_threshold = std::clamp(
     9.0 - 0.05 * remapped_sensitivity,
@@ -978,7 +972,7 @@ std::vector<cv::Point2f> rejectSideOutliers(
 {
   std::vector<cv::Point2f> corners(4);
   rough_rect.points(corners.data());
-  const double remapped_sensitivity = remapOutlierSensitivityToLegacyRange(outlier_sensitivity);
+  const double remapped_sensitivity = remapOutlierSensitivityToFitRange(outlier_sensitivity);
   const double sensitivity_factor = std::clamp(4.0 - 0.03 * remapped_sensitivity, 1.0, 4.0);
 
   std::vector<std::vector<cv::Point2f>> side_groups(4);
@@ -2181,26 +2175,11 @@ int lowerLeftCornerIndex(const std::vector<cv::Point2f> &corners)
   return lower_idx;
 }
 
-std::optional<cv::Point2f> projectedVector2D(const cv::Vec3d &vector)
-{
-  cv::Point2f axis(
-    static_cast<float>(vector[0]),
-    static_cast<float>(vector[1]));
-  const float norm = std::sqrt(axis.dot(axis));
-  if (norm < 1e-6F)
-  {
-    return std::nullopt;
-  }
-  axis *= (1.0F / norm);
-  return axis;
-}
-
 std::optional<TrayPose3D> estimateTrayPose3D(
   const TrayEstimate &estimate,
   const cv::Mat &depth_m,
   const CameraInfoMsg &camera_info,
-  int depth_edge_offset_px,
-  const cv::Vec3d &base_up_in_frame)
+  int depth_edge_offset_px)
 {
   auto camera_points = estimateTrayCornerCameraPointsFromDepthLines(
     estimate.corners,
@@ -2225,53 +2204,25 @@ std::optional<TrayPose3D> estimateTrayPose3D(
     return std::nullopt;
   }
 
-  cv::Vec3d z_axis = base_up_in_frame;
+  const cv::Vec3d origin = (*camera_points)[overlay_axes->origin_idx];
+  const cv::Vec3d x_edge = (*camera_points)[overlay_axes->x_idx] - origin;
+  const cv::Vec3d y_edge = (*camera_points)[overlay_axes->y_idx] - origin;
+  cv::Vec3d x_axis = x_edge;
+  if (!normalizeVectorInPlace(x_axis))
+  {
+    return std::nullopt;
+  }
+
+  cv::Vec3d z_axis = x_axis.cross(y_edge);
   if (!normalizeVectorInPlace(z_axis))
   {
     return std::nullopt;
   }
 
-  const cv::Vec3d origin = (*camera_points)[overlay_axes->origin_idx];
-  const cv::Vec3d x_edge = (*camera_points)[overlay_axes->x_idx] - origin;
-  const cv::Vec3d y_edge = (*camera_points)[overlay_axes->y_idx] - origin;
-  cv::Vec3d y_axis = y_edge - z_axis * y_edge.dot(z_axis);
-  bool used_y_edge = normalizeVectorInPlace(y_axis);
-
-  cv::Vec3d x_axis;
-  if (used_y_edge)
+  cv::Vec3d y_axis = z_axis.cross(x_axis);
+  if (!normalizeVectorInPlace(y_axis))
   {
-    x_axis = y_axis.cross(z_axis);
-    if (!normalizeVectorInPlace(x_axis))
-    {
-      return std::nullopt;
-    }
-  }
-  else
-  {
-    x_axis = x_edge - z_axis * x_edge.dot(z_axis);
-    if (!normalizeVectorInPlace(x_axis))
-    {
-      return std::nullopt;
-    }
-    y_axis = z_axis.cross(x_axis);
-    if (!normalizeVectorInPlace(y_axis))
-    {
-      return std::nullopt;
-    }
-  }
-
-  const auto x_projected = projectedVector2D(x_axis);
-  const auto y_projected = projectedVector2D(y_axis);
-  if (x_projected.has_value() && y_projected.has_value())
-  {
-    const float positive_score =
-      x_projected->dot(overlay_axes->x_dir) + y_projected->dot(overlay_axes->y_dir);
-    const float negative_score = -positive_score;
-    if (negative_score > positive_score)
-    {
-      x_axis *= -1.0;
-      y_axis *= -1.0;
-    }
+    return std::nullopt;
   }
 
   TrayPose3D pose;
@@ -2955,7 +2906,7 @@ std::optional<AxisSideFitResult> fitAxisAlignedSide(
     deviations.push_back(std::fabs(coordinate - median));
   }
 
-  const double remapped_sensitivity = remapOutlierSensitivityToLegacyRange(outlier_sensitivity);
+  const double remapped_sensitivity = remapOutlierSensitivityToFitRange(outlier_sensitivity);
   const double sensitivity_factor = std::clamp(4.0 - 0.03 * remapped_sensitivity, 1.0, 4.0);
   const float median_deviation = medianCoordinate(deviations);
   const float threshold = static_cast<float>(std::max(
@@ -3901,10 +3852,10 @@ public:
   {
     profiles_dir_ = declare_parameter<std::string>(
       "profiles_dir",
-      "/home/erds/DOBOT_pickn_place/config/trays");
-    color_topic_ = declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
-    depth_topic_ = declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
-    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/camera/color/camera_info");
+      dobot_common::paths::workspacePath({"teach", "tray_teach"}, __FILE__).string());
+    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
+    depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
+    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
     overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
     tray_pose_topic_ = declare_parameter<std::string>("tray_pose_topic", "tray_pose");
     tray_axis_overlay_topic_ = declare_parameter<std::string>("tray_axis_overlay_topic", "tray_axis_overlay");
@@ -3928,8 +3879,6 @@ public:
     movj_service_name_ = declare_parameter<std::string>("movj_service", "/dobot_bringup_ros2/srv/MovJ");
     use_calibration_ = declare_parameter<bool>("use_calibration", true);
     publish_static_calibration_tf_ = declare_parameter<bool>("publish_static_calibration_tf", true);
-    (void)declare_parameter<bool>("sterilize_tray_z_axis_to_base_normal", true);
-    sterilize_tray_z_axis_to_base_normal_ = true;
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link");
     calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "Link6");
     calibration_child_frame_ = declare_parameter<std::string>(
@@ -3972,7 +3921,7 @@ public:
       30);
     seek_snapshots_dir_ = declare_parameter<std::string>(
       "seek_snapshots_dir",
-      "/home/erds/DOBOT_pickn_place/debug files/seek_frames");
+      dobot_common::paths::workspacePath({"debug files", "seek_frames"}, __FILE__).string());
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
     const bool start_visualization = declare_parameter<bool>("start_visualization", true);
     display_view_ = start_visualization ? DisplayView::kRgb : DisplayView::kBinarized;
@@ -4033,9 +3982,7 @@ public:
     red_threshold_ = declare_parameter<int>("red_threshold", 120);
     green_threshold_ = declare_parameter<int>("green_threshold", 120);
     blue_threshold_ = declare_parameter<int>("blue_threshold", 120);
-    const int legacy_ray_step = declare_parameter<int>("ray_step_mm", 3);
-    const int legacy_ray_count = std::clamp(static_cast<int>(declare_parameter<int>("ray_count", 50)), 50, 150);
-    ray_step_px_ = declare_parameter<int>("ray_step_px", legacy_ray_step);
+    ray_step_px_ = declare_parameter<int>("ray_step_px", 3);
     depth_edge_offset_px_ = std::clamp(
       static_cast<int>(declare_parameter<int>("depth_edge_offset_px", 4)),
       kDepthEdgeOffsetMinPx,
@@ -4045,11 +3992,11 @@ public:
       20,
       100);
     horizontal_ray_count_ = std::clamp(
-      static_cast<int>(declare_parameter<int>("horizontal_ray_count", legacy_ray_count)),
+      static_cast<int>(declare_parameter<int>("horizontal_ray_count", 50)),
       50,
       100);
     vertical_ray_count_ = std::clamp(
-      static_cast<int>(declare_parameter<int>("vertical_ray_count", legacy_ray_count)),
+      static_cast<int>(declare_parameter<int>("vertical_ray_count", 50)),
       50,
       150);
     outlier_sensitivity_ = std::clamp(
@@ -4122,9 +4069,6 @@ public:
     loadRuntimeUiSettings();
     createRosInterfaces();
     movj_client_ = create_client<MovJSrv>(movj_service_name_);
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
     cv::namedWindow(kDetectWindowName, cv::WINDOW_NORMAL);
     cv::resizeWindow(kDetectWindowName, kPreviewCanvasWidth, kTopBarBaseHeight + kPreviewCanvasHeight);
     cv::setMouseCallback(kDetectWindowName, &TrayDetectNode::onMouseThunk, this);
@@ -4133,7 +4077,7 @@ public:
       get_logger(),
       "Tray detect ready. Overlay topic=%s tray_pose topic=%s tray_vector topic=%s tray_cube_marker topic=%s "
       "(enabled=%s thickness=%.1fmm) detect_mode=%s depth_threshold=+/- %dmm depth_plane=%s "
-      "z_axis_sterilize=%s base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
+      "z_axis=natural_edge base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
       "selected_profile=%s profiles=%zu",
       overlay_topic_.c_str(),
       tray_pose_topic_.c_str(),
@@ -4144,7 +4088,6 @@ public:
       detectionModeToString(detection_use_depth_).c_str(),
       depth_threshold_mm_,
       depth_plane_model_.valid ? "fixed" : "missing",
-      sterilize_tray_z_axis_to_base_normal_ ? "on" : "off",
       robot_base_frame_.c_str(),
       pose_filter_window_sec_,
       pose_filter_min_samples_,
@@ -4241,22 +4184,13 @@ private:
 
   static std::string defaultCalibrationDir()
   {
-    const char *home = std::getenv("HOME");
-    if (home == nullptr)
-    {
-      return {};
-    }
-    return (std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration").string();
+    return dobot_common::paths::workspacePath({"calibration"}, __FILE__).string();
   }
 
   static std::string defaultRuntimeSettingsFile()
   {
-    const char *home = std::getenv("HOME");
-    if (home == nullptr)
-    {
-      return "tray_detect_runtime_settings.yaml";
-    }
-    return (std::filesystem::path(home) / ".ros" / "tray_detect_runtime_settings.yaml").string();
+    return dobot_common::paths::workspacePath(
+      {"config", "tray_perception", "tray_detect_runtime_settings.yaml"}, __FILE__).string();
   }
 
   static std::filesystem::path resolvePath(const std::string &path_text)
@@ -4296,8 +4230,8 @@ private:
         return {};
       }
 
-      std::filesystem::path latest_path;
-      std::filesystem::file_time_type latest_time;
+      std::filesystem::path preferred_path;
+      std::filesystem::file_time_type preferred_time;
       for (const auto &entry : std::filesystem::directory_iterator(base))
       {
         if (!entry.is_regular_file())
@@ -4313,13 +4247,18 @@ private:
         {
           continue;
         }
-        if (latest_path.empty() || entry.last_write_time() > latest_time)
+        const std::string filename = p.filename().string();
+        if (filename.rfind("axab_calibration_eyeonhand_", 0) != 0)
         {
-          latest_path = p;
-          latest_time = entry.last_write_time();
+          continue;
+        }
+        if (preferred_path.empty() || entry.last_write_time() > preferred_time)
+        {
+          preferred_path = p;
+          preferred_time = entry.last_write_time();
         }
       }
-      return latest_path.string();
+      return preferred_path.string();
     }
     catch (const std::exception &ex)
     {
@@ -4361,10 +4300,10 @@ private:
       return false;
     }
 
-    const auto calib = root["calibration_transform"];
+    const auto calib = root["transform"];
     if (!calib)
     {
-      reason = "Missing 'calibration_transform' key";
+      reason = "Missing 'transform' key";
       return false;
     }
     const auto rot = calib["rotation"];
@@ -4670,73 +4609,6 @@ private:
     return filtered_pose;
   }
 
-  cv::Matx33d quaternionToRotationMatrix(const geometry_msgs::msg::Quaternion &quaternion) const
-  {
-    double qw = quaternion.w;
-    double qx = quaternion.x;
-    double qy = quaternion.y;
-    double qz = quaternion.z;
-    const double norm = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
-    if (norm > 1e-12)
-    {
-      const double inv = 1.0 / norm;
-      qw *= inv;
-      qx *= inv;
-      qy *= inv;
-      qz *= inv;
-    }
-
-    const double xx = qx * qx;
-    const double yy = qy * qy;
-    const double zz = qz * qz;
-    const double xy = qx * qy;
-    const double xz = qx * qz;
-    const double yz = qy * qz;
-    const double wx = qw * qx;
-    const double wy = qw * qy;
-    const double wz = qw * qz;
-
-    return cv::Matx33d(
-      1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy),
-      2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),
-      2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy));
-  }
-
-  std::optional<cv::Vec3d> baseNormalInFrame(const std::string &frame_id)
-  {
-    if (frame_id.empty() || robot_base_frame_.empty() || !tf_buffer_)
-    {
-      return std::nullopt;
-    }
-
-    try
-    {
-      const auto tf = tf_buffer_->lookupTransform(frame_id, robot_base_frame_, tf2::TimePointZero);
-      const cv::Matx33d rotation_frame_base = quaternionToRotationMatrix(tf.transform.rotation);
-      cv::Vec3d base_z_in_frame(
-        rotation_frame_base(0, 2),
-        rotation_frame_base(1, 2),
-        rotation_frame_base(2, 2));
-      if (!normalizeVectorInPlace(base_z_in_frame))
-      {
-        return std::nullopt;
-      }
-      return base_z_in_frame;
-    }
-    catch (const tf2::TransformException &ex)
-    {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(),
-        *get_clock(),
-        3000,
-        "Tray Z-axis sterilization skipped: missing TF %s -> %s (%s)",
-        robot_base_frame_.c_str(),
-        frame_id.c_str(),
-        ex.what());
-      return std::nullopt;
-    }
-  }
-
   void refreshTrayProfiles()
   {
     tray_profiles_ = loadTrayProfilesFromDirectory(profiles_dir_);
@@ -4793,12 +4665,12 @@ private:
     profile_status_message_ = "Loaded " + tray_profiles_[selected_profile_index_].display_label;
   }
 
-  std::filesystem::path legacyProfilePath() const
+  std::filesystem::path latestAliasProfilePath() const
   {
     return std::filesystem::path(profiles_dir_) / "tray_teach_settings.yaml";
   }
 
-  static bool profilesMatchForLegacySync(const TrayProfile &a, const TrayProfile &b)
+  static bool profilesMatchForAliasSync(const TrayProfile &a, const TrayProfile &b)
   {
     const bool has_edges_a = hasValidEdgeLengthsCm(a.taught_edge_lengths_cm);
     const bool has_edges_b = hasValidEdgeLengthsCm(b.taught_edge_lengths_cm);
@@ -4817,16 +4689,16 @@ private:
       (edge_lengths_match || std::fabs(a.taught_area_cm2 - b.taught_area_cm2) < 1e-6);
   }
 
-  void syncLegacyProfileAfterDelete(const TrayProfile &deleted_profile)
+  void syncLatestAliasProfileAfterDelete(const TrayProfile &deleted_profile)
   {
-    const std::filesystem::path legacy_path = legacyProfilePath();
-    if (!std::filesystem::exists(legacy_path))
+    const std::filesystem::path alias_path = latestAliasProfilePath();
+    if (!std::filesystem::exists(alias_path))
     {
       return;
     }
 
-    const auto legacy_profile = loadTrayProfileFile(legacy_path);
-    if (!legacy_profile.has_value() || !profilesMatchForLegacySync(*legacy_profile, deleted_profile))
+    const auto alias_profile = loadTrayProfileFile(alias_path);
+    if (!alias_profile.has_value() || !profilesMatchForAliasSync(*alias_profile, deleted_profile))
     {
       return;
     }
@@ -4836,13 +4708,13 @@ private:
     {
       std::filesystem::copy_file(
         tray_profiles_.front().path,
-        legacy_path,
+        alias_path,
         std::filesystem::copy_options::overwrite_existing,
         fs_error);
     }
     else
     {
-      std::filesystem::remove(legacy_path, fs_error);
+      std::filesystem::remove(alias_path, fs_error);
     }
   }
 
@@ -5192,7 +5064,7 @@ private:
 
     selected_profile_path_.clear();
     refreshTrayProfiles();
-    syncLegacyProfileAfterDelete(deleted_profile);
+    syncLatestAliasProfileAfterDelete(deleted_profile);
     refreshTrayProfiles();
 
     if (!tray_profiles_.empty())
@@ -6353,31 +6225,20 @@ private:
 
     if (accepted_estimate.has_value())
     {
-      const auto base_up = baseNormalInFrame(resolved_frame_id);
-      if (base_up.has_value())
+      const auto tray_pose_3d = estimateTrayPose3D(
+        *accepted_estimate,
+        depth_m,
+        *info,
+        depth_edge_offset_px_);
+      if (tray_pose_3d.has_value())
       {
-        const auto tray_pose_3d = estimateTrayPose3D(
-          *accepted_estimate,
-          depth_m,
-          *info,
-          depth_edge_offset_px_,
-          *base_up);
-        if (tray_pose_3d.has_value())
-        {
-          detected_tray_pose_3d = tray_pose_3d;
-        }
-        else
-        {
-          RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000,
-            "Tray detected in image but canonical 3D tray pose estimation failed.");
-        }
+        detected_tray_pose_3d = tray_pose_3d;
       }
       else
       {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "Tray detected but base-up TF is unavailable; skipping tray pose/vector publish for safety.");
+          "Tray detected in image but natural 3D tray pose estimation failed.");
       }
     }
     latest_live_tray_size_m_ = measuredTrayPlanarSizeMeters(accepted_estimate);
@@ -7275,7 +7136,6 @@ private:
   bool auto_discover_calibration_ {true};
   bool publish_overlay_ {true};
   bool publish_tray_cube_marker_ {true};
-  bool sterilize_tray_z_axis_to_base_normal_ {true};
   bool detection_use_depth_ {false};
   cv::Size rendered_window_size_ {};
   int red_threshold_ {120};
@@ -7373,8 +7233,6 @@ private:
   rclcpp::TimerBase::SharedPtr camera_status_timer_;
   rclcpp::Client<MovJSrv>::SharedPtr movj_client_;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
-  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
   rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;

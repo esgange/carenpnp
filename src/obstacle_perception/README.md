@@ -15,7 +15,7 @@ camera moves with the robot.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select obstacle_perception
 source install/setup.bash
@@ -37,7 +37,7 @@ Use a specific calibration:
 
 ```bash
 ros2 launch obstacle_perception obstacle_perception.launch.py \
-  calibration_file:=/abs/path/to/axab_calibration.yaml
+  calibration_file:=/abs/path/to/axab_calibration_eyeonhand_09052026.yaml
 ```
 
 ## Launch Composition
@@ -56,9 +56,9 @@ early with a clear error.
 
 | Topic | Type |
 | --- | --- |
-| `/camera/color/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/depth/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
+| `/robot_camera/color/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/depth/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
 
 Camera topics can be overridden with `color_topic`, `depth_topic`, and
 `camera_info_topic`.

@@ -18,6 +18,8 @@ find_package(OpenCV REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+
 add_executable(tray_teach_node src/tray_detector_node.cpp)
 target_include_directories(tray_teach_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

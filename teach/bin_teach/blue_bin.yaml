@@ -1,0 +1,115 @@
+bin_teach:
+  bin_name: blue_bin
+  created_at: "2026-05-08 23:29:36"
+  parent_frame: robot_platform_1
+  bin_frame: bin_blue_bin_frame
+  platform_reference:
+    enabled: true
+    platform_name: robot_platform_1
+    platform_frame: robot_platform_1
+    platform_parent_frame: base_link
+    platform_calibration_file: /home/erds/DOBOT_pickn_place/calibration/platform_calibration_robot_platform_1.yaml
+  marker_prefix: aruco_marker
+  allowed_marker_ids: [1, 2, 3, 4]
+  required_marker_count: 4
+  marker_ids: [2, 1, 1, 3]
+  center_method: marker_position_bounds_center
+  transform:
+    translation: {x: -0.192803943, y: -0.305975777, z: 0.014937109}
+    rotation: {x: 0.018649798, y: -0.007369794, z: -0.999565002, w: 0.021625871}
+  arm_pose_at_save:
+    source_topic: dobot_msgs_v4/msg/ToolVectorActual
+    base_frame: base_link
+    gripper_frame: Link6
+    position_units: mm
+    rotation_units: deg
+    valid: true
+    tcp: {x: 488.409180, y: -11.003995, z: 727.570679, rx: -179.887985, ry: 2.276939, rz: -88.901001}
+  image:
+    width: 848
+    height: 480
+    coordinate_frame: color_image_pixels
+  roi_points: [212, 51, 671, 34, 677, 448, 219, 448]
+  roi_points_normalized: [0.250000000, 0.106250000, 0.791273585, 0.070833333, 0.798349057, 0.933333333, 0.258254717, 0.933333333]
+  dot_positions:
+    - role: upper_left
+      pixel: {x: 212.000, y: 51.000}
+      marker_id: 1
+      detection_index: 2
+      same_id_index: 2
+    - role: upper_right
+      pixel: {x: 671.000, y: 34.000}
+      marker_id: 3
+      detection_index: 3
+      same_id_index: 1
+    - role: lower_right
+      pixel: {x: 677.000, y: 448.000}
+      marker_id: 1
+      detection_index: 1
+      same_id_index: 1
+    - role: lower_left
+      pixel: {x: 219.000, y: 448.000}
+      marker_id: 2
+      detection_index: 0
+      same_id_index: 1
+  depth_plane_enabled: true
+  depth_plane_a: -0.051844945669
+  depth_plane_b: -0.007910904832
+  depth_plane_c: 0.706893630126
+  depth_plane_reference_depth_m: 0.675620026588
+  depth_plane_roi: [212, 34, 677, 448]
+  depth_plane_source: aruco_marker_centers
+  depth_plane_source_frame: calibrated_camera_link
+  depth_plane_units: m
+  depth_plane_samples:
+    - x_norm: 0.280991736
+      y_norm: 0.897703549
+      depth_m: 0.684320042
+      marker_id: 2
+      detection_index: 0
+      same_id_index: 1
+    - x_norm: 0.778040142
+      y_norm: 0.893528184
+      depth_m: 0.660360022
+      marker_id: 1
+      detection_index: 1
+      same_id_index: 1
+    - x_norm: 0.272727273
+      y_norm: 0.144050104
+      depth_m: 0.692520025
+      marker_id: 1
+      detection_index: 2
+      same_id_index: 2
+    - x_norm: 0.768595041
+      y_norm: 0.112734864
+      depth_m: 0.665280018
+      marker_id: 3
+      detection_index: 3
+      same_id_index: 1
+  axes:
+    x: {x: -0.998369013, y: -0.043507818, z: -0.036964614}
+    y: {x: 0.042958037, y: -0.998956016, z: 0.015539813}
+    z: {x: -0.037602127, y: 0.013926541, z: 0.999195742}
+  marker_positions:
+    marker_1_id_2: {x: 0.094268269, y: -0.018175739, z: 0.009007768}
+    marker_2_id_1: {x: -0.516937537, y: -0.056653308, z: 0.009006812}
+    marker_3_id_1: {x: 0.131329651, y: -0.555326231, z: 0.017771281}
+    marker_4_id_3: {x: -0.484411175, y: -0.593775816, z: 0.020867405}
+  marker_observations:
+    - key: marker_1_id_2
+      id: 2
+      detection_index: 0
+      same_id_index: 1
+    - key: marker_2_id_1
+      id: 1
+      detection_index: 1
+      same_id_index: 1
+    - key: marker_3_id_1
+      id: 1
+      detection_index: 2
+      same_id_index: 2
+    - key: marker_4_id_3
+      id: 3
+      detection_index: 3
+      same_id_index: 1
+  notes: "transform origin is the center of the configured marker position bounds; marker positions are not averaged. Orientation normal is averaged from marker poses. roi_points are saved in item_teach-compatible color-image pixel order: upper-left, upper-right, lower-right, lower-left. depth_plane_* is fitted from ArUco marker center depths in normalized image coordinates and is the reference plane item_teach should inherit."

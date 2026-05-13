@@ -25,7 +25,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
 )
 
-include_directories(include)
+include_directories(
+  include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
 
 add_executable(aruco_detector_node src/aruco_detector_node.cpp)
 ament_target_dependencies(aruco_detector_node

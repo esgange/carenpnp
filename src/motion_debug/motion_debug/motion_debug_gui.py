@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -43,6 +44,52 @@ from dobot_msgs_v4.srv import (
 )
 
 
+def workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / 'src').exists() and
+            (
+                (path / 'README.md').exists()
+                or (path / 'docker-compose.yml').exists()
+                or (path / 'src' / 'dobot_msgs_v4').exists()
+            )
+        )
+
+    def find_from(start: Path) -> Path | None:
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+        return None
+
+    for name in ('DOBOT_PICKN_PLACE_ROOT', 'DOBOT_WORKSPACE_ROOT'):
+        value = os.environ.get(name)
+        if value:
+            return find_from(Path(value)) or Path(value).expanduser().resolve()
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for name in ('COLCON_PREFIX_PATH', 'AMENT_PREFIX_PATH'):
+        for token in os.environ.get(name, '').split(os.pathsep):
+            if not token:
+                continue
+            prefix = Path(token)
+            candidates.append(prefix)
+            if 'install' in prefix.parts:
+                candidates.append(Path(*prefix.parts[:prefix.parts.index('install')]))
+
+    for candidate in candidates:
+        found = find_from(candidate)
+        if found is not None:
+            return found
+    return Path.cwd().resolve()
+
+
+def workspace_path(*parts: str) -> Path:
+    return workspace_root().joinpath(*parts)
+
+
 JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 TCP_FIELDS = [
     ('x', 'X', 'mm', (-1000.0, 1000.0)),
@@ -75,7 +122,7 @@ QUEUED_MOTION_SERVICES = {
     f'{SERVICE_ROOT}/MovJ',
     f'{SERVICE_ROOT}/MovL',
 }
-SCRIPT_DIR_NAME = 'motion_debug_scripts'
+SCRIPT_DIR_NAME = 'motion_calibrate'
 SCRIPT_FILE_SUFFIX = '.json'
 SCRIPT_NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$')
 SCRIPT_POINT_PATTERN = re.compile(
@@ -142,12 +189,11 @@ TCP_WORKSPACE_PROFILES = {
 
 def _load_robot_type_from_bringup_config() -> str:
     candidate_paths: list[Path] = []
+    candidate_paths.append(workspace_path('config', 'robot_bringup', 'param.json'))
     try:
         candidate_paths.append(Path(get_package_share_path('cr_robot_ros2')) / 'config' / 'param.json')
     except Exception:
         pass
-
-    candidate_paths.append(Path(__file__).resolve().parents[2] / 'dobot_bringup_v4' / 'config' / 'param.json')
 
     seen_paths: set[Path] = set()
     for config_path in candidate_paths:
@@ -337,7 +383,7 @@ class MotionDebugNode(Node):
             )
 
     def _create_launch_log_file(self) -> Path:
-        log_dir = Path.home() / '.ros' / 'motion_debug_logs'
+        log_dir = workspace_path('Log', 'motion_debug')
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         log_path = log_dir / f'log_{timestamp}.txt'
@@ -2062,7 +2108,7 @@ class MotionDebugApp:
         self.script_name_input_var = tk.StringVar(value='')
         self.script_open_var = tk.StringVar(value='')
         self.script_status_var = tk.StringVar(value='Script: none loaded')
-        self._scripts_dir = Path.home() / '.ros' / SCRIPT_DIR_NAME
+        self._scripts_dir = workspace_path('config', SCRIPT_DIR_NAME)
         self._current_script_name: str | None = None
         self._current_script_points: list[dict[str, object]] = []
         self._current_script_speed_profile: dict[str, int] = self.node.get_script_speed_profile_snapshot()
@@ -3035,14 +3081,6 @@ class MotionDebugApp:
                 normalized_points.append(normalized_point)
 
         loaded_speed_profile = payload.get('speed_profile')
-        if not isinstance(loaded_speed_profile, dict):
-            legacy_cp = payload.get('cp')
-            legacy_speed_factor = payload.get('speed_factor')
-            if legacy_cp is not None or legacy_speed_factor is not None:
-                loaded_speed_profile = {
-                    'cp': legacy_cp,
-                    'speed_factor': legacy_speed_factor,
-                }
         speed_profile_from_script = isinstance(loaded_speed_profile, dict)
         if speed_profile_from_script:
             applied_speed_profile = self.node.apply_script_speed_profile_cache(loaded_speed_profile)

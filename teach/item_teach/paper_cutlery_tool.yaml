@@ -1,0 +1,16 @@
+# item_pick tool teach sidecar
+tool_teach_version: 3
+item_teach_name: paper_cutlery
+item_detect_profile_path: /home/erds/DOBOT_pickn_place/teach/item_teach/item_paper_cutlery_bin_blue_bin_08052026.yaml
+item_standoff_z_mm: 97
+approach_z_up_mm: 50
+final_z_up_mm: 200
+pre_pick_settling_time_sec: 1
+pick_settling_time_sec: 0.2
+settling_time_sec: 0.2
+tool_offset_x_mm: 0
+tool_offset_y_mm: 0
+tool_offset_z_mm: 0
+tool_offset_rx_deg: 0
+tool_offset_ry_deg: 0
+tool_offset_rz_deg: 0

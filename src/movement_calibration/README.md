@@ -14,7 +14,7 @@ TCP trace CSV files that downstream motion packages can load.
 ## Build
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd WORKSPACE_ROOT
 source /opt/ros/humble/setup.bash
 colcon build --packages-select movement_calibration
 source install/setup.bash
@@ -51,7 +51,7 @@ ros2 run movement_calibration movement_calibration_gui
 Create calibration scripts with `motion_debug` in:
 
 ```text
-~/.ros/motion_debug_scripts
+WORKSPACE_ROOT/config/motion_calibrate
 ```
 
 Default script names:
@@ -81,7 +81,7 @@ Services used:
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `scripts_dir` | `~/.ros/motion_debug_scripts` | Folder containing calibration scripts. |
+| `scripts_dir` | `WORKSPACE_ROOT/config/motion_calibrate` | Folder containing calibration scripts. |
 | `script_names_csv` | `x_calibrate,y_calibrate,z_calibrate` | Scripts executed in order. |
 | `startup_cp` | `100` | Applied before calibration. |
 | `startup_speed_factor` | `50` | Applied before calibration. |
@@ -104,13 +104,13 @@ ros2 launch movement_calibration movement_calibration.launch.py \
 Default JSON output:
 
 ```text
-~/DOBOT_pickn_place/calibration/relmovl_speed_calibration_<ddmmyyyy>.json
+WORKSPACE_ROOT/calibration/relmovl_speed_calibration_<ddmmyyyy>.json
 ```
 
 Default raw trace:
 
 ```text
-~/DOBOT_pickn_place/calibration/relmovl_speed_calibration_<ddmmyyyy>_tcp_trace.csv
+WORKSPACE_ROOT/calibration/relmovl_speed_calibration_<ddmmyyyy>_tcp_trace.csv
 ```
 
 The JSON includes:

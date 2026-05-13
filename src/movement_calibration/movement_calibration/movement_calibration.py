@@ -1,6 +1,7 @@
 import csv
 import json
 import math
+import os
 import re
 import sys
 import threading
@@ -25,15 +26,61 @@ SCRIPT_POINT_PATTERN = re.compile(
 TRANSLATION_AXES = ('x', 'y', 'z')
 
 
+def workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / 'src').exists() and
+            (
+                (path / 'README.md').exists()
+                or (path / 'docker-compose.yml').exists()
+                or (path / 'src' / 'dobot_msgs_v4').exists()
+            )
+        )
+
+    def find_from(start: Path) -> Path | None:
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+        return None
+
+    for name in ('DOBOT_PICKN_PLACE_ROOT', 'DOBOT_WORKSPACE_ROOT'):
+        value = os.environ.get(name)
+        if value:
+            return find_from(Path(value)) or Path(value).expanduser().resolve()
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for name in ('COLCON_PREFIX_PATH', 'AMENT_PREFIX_PATH'):
+        for token in os.environ.get(name, '').split(os.pathsep):
+            if not token:
+                continue
+            prefix = Path(token)
+            candidates.append(prefix)
+            if 'install' in prefix.parts:
+                candidates.append(Path(*prefix.parts[:prefix.parts.index('install')]))
+
+    for candidate in candidates:
+        found = find_from(candidate)
+        if found is not None:
+            return found
+    return Path.cwd().resolve()
+
+
+def workspace_path(*parts: str) -> Path:
+    return workspace_root().joinpath(*parts)
+
+
 def _default_output_file_path() -> Path:
     stamp = datetime.now().strftime('%d%m%Y')
     filename = f'relmovl_speed_calibration_{stamp}.json'
-    calibration_dir = Path.home() / 'DOBOT_pickn_place' / 'calibration'
+    calibration_dir = workspace_path('calibration')
     try:
         calibration_dir.mkdir(parents=True, exist_ok=True)
         return calibration_dir / filename
     except Exception:
-        return Path.home() / '.ros' / 'relmovl_speed_calibration.json'
+        return workspace_path('calibration', 'relmovl_speed_calibration.json')
 
 
 @dataclass(frozen=True)
@@ -98,7 +145,10 @@ class MovementCalibrationNode(Node):
         self._tcp_topic = self.declare_parameter(
             'tcp_topic', 'dobot_msgs_v4/msg/ToolVectorActual').value
         self._scripts_dir = Path(
-            str(self.declare_parameter('scripts_dir', '~/.ros/motion_debug_scripts').value)
+            str(self.declare_parameter(
+                'scripts_dir',
+                str(workspace_path('config', 'motion_calibrate')),
+            ).value)
         ).expanduser()
         self._script_names_csv = str(self.declare_parameter(
             'script_names_csv', 'x_calibrate,y_calibrate,z_calibrate').value)

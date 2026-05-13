@@ -1,0 +1,6 @@
+selected_profile_path: /home/erds/DOBOT_pickn_place/teach/item_teach/item_paper_cutlery_bin_blue_bin_08052026.yaml
+view_mode: binarized
+overlay_enabled: true
+blob_tolerance_percent: 50
+seek_window_sec: 60
+seek_decay_sec: 1

@@ -22,6 +22,8 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <rmw/qos_profiles.h>
 
+#include <dobot_common/workspace_paths.hpp>
+
 using std::placeholders::_1;
 using std::placeholders::_2;
 
@@ -29,24 +31,56 @@ namespace
 {
 std::filesystem::path defaultCameraCalibrationDir()
 {
-  const char *home = std::getenv("HOME");
-  if (home == nullptr)
-  {
-    return std::filesystem::path("calibration");
-  }
-  return std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration";
+  return dobot_common::paths::workspacePath({"calibration"}, __FILE__);
 }
 
-std::filesystem::path defaultCameraCalibrationPath()
+std::string currentDateStamp()
 {
-  return defaultCameraCalibrationDir() / "axab_calibration.yaml";
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &now_time);
+#else
+  localtime_r(&now_time, &tm);
+#endif
+  std::ostringstream stream;
+  stream << std::put_time(&tm, "%d%m%Y");
+  return stream.str();
 }
 
-bool isCameraCalibrationYaml(const std::filesystem::path &path)
+std::string calibrationModeFilenameToken(const std::string &mode)
+{
+  return mode == "eye_to_hand" ? "eyetohand" : "eyeonhand";
+}
+
+std::filesystem::path defaultCameraCalibrationPath(const std::string &mode)
+{
+  return defaultCameraCalibrationDir() /
+         ("axab_calibration_" + calibrationModeFilenameToken(mode) + "_" + currentDateStamp() + ".yaml");
+}
+
+bool shouldReplaceCameraCalibrationYaml(const std::filesystem::path &path, const std::string &mode)
 {
   const std::string filename = path.filename().string();
-  return path.extension() == ".yaml" &&
-         (filename == "axab_calibration.yaml" || filename.rfind("axab_calibration_", 0) == 0);
+  if (path.extension() != ".yaml")
+  {
+    return false;
+  }
+  const std::string prefix = "axab_calibration_" + calibrationModeFilenameToken(mode) + "_";
+  return filename.rfind(prefix, 0) == 0;
+}
+
+bool isStandardCalibrationFilenameForMode(const std::string &filename, const std::string &mode)
+{
+  const std::string prefix = "axab_calibration_" + calibrationModeFilenameToken(mode) + "_";
+  return filename.rfind(prefix, 0) == 0 && std::filesystem::path(filename).extension() == ".yaml";
+}
+
+bool shouldNormalizeOutputPath(const std::string &path_text, const std::string &mode)
+{
+  const std::string filename = std::filesystem::path(path_text).filename().string();
+  return filename.empty() || !isStandardCalibrationFilenameForMode(filename, mode);
 }
 }  // namespace
 
@@ -55,21 +89,6 @@ namespace camera_calibration
 EyeOnHandCalibrator::EyeOnHandCalibrator()
 : rclcpp::Node("eye_on_hand_calibrator")
 {
-  std::string default_output = "axab_calibration.yaml";
-  try
-  {
-    const auto calib_dir = defaultCameraCalibrationDir();
-    std::filesystem::create_directories(calib_dir);
-    default_output = defaultCameraCalibrationPath().string();
-  }
-  catch (const std::exception &ex)
-  {
-    RCLCPP_WARN(get_logger(),
-                "Could not resolve calibration directory in HOME, defaulting output to %s (%s)",
-                default_output.c_str(), ex.what());
-  }
-
-  output_path_ = this->declare_parameter<std::string>("output_path", default_output);
   base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
   gripper_frame_ = this->declare_parameter<std::string>("gripper_frame", "Link6");
   camera_frame_ = this->declare_parameter<std::string>("camera_frame", "camera_link");
@@ -86,6 +105,26 @@ EyeOnHandCalibrator::EyeOnHandCalibrator()
     RCLCPP_WARN(get_logger(),
                 "Unsupported calibration_mode '%s'; falling back to '%s'.",
                 requested_mode.c_str(), calibration_mode_.c_str());
+  }
+  std::string default_output = "axab_calibration_" + calibrationModeFilenameToken(calibration_mode_) +
+                               "_" + currentDateStamp() + ".yaml";
+  try
+  {
+    const auto calib_dir = defaultCameraCalibrationDir();
+    std::filesystem::create_directories(calib_dir);
+    default_output = defaultCameraCalibrationPath(calibration_mode_).string();
+  }
+  catch (const std::exception &ex)
+  {
+    RCLCPP_WARN(get_logger(),
+                "Could not resolve calibration directory in HOME, defaulting output to %s (%s)",
+                default_output.c_str(), ex.what());
+  }
+
+  output_path_ = this->declare_parameter<std::string>("output_path", default_output);
+  if (shouldNormalizeOutputPath(output_path_, calibration_mode_))
+  {
+    output_path_ = default_output;
   }
 
   RCLCPP_INFO(get_logger(), "Writing calibration output to: %s", output_path_.c_str());
@@ -336,7 +375,7 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
           continue;
         }
         const auto candidate = entry.path();
-        if (candidate == output_path || !isCameraCalibrationYaml(candidate))
+        if (candidate == output_path || !shouldReplaceCameraCalibrationYaml(candidate, calibration_mode_))
         {
           continue;
         }
@@ -366,58 +405,21 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
 
   Eigen::Quaterniond q(rotation);
   q.normalize();
-  tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
-  double roll_rad, pitch_rad, yaw_rad;
-  tf2::Matrix3x3(tf_q).getRPY(roll_rad, pitch_rad, yaw_rad);
-  constexpr double RAD_TO_DEG = 180.0 / M_PI;
-  const double roll_deg = roll_rad * RAD_TO_DEG;
-  const double pitch_deg = pitch_rad * RAD_TO_DEG;
-  const double yaw_deg = yaw_rad * RAD_TO_DEG;
+  (void)camera_frame;
+  (void)transform_parent_frame;
+  (void)sample_count;
 
-  const auto now = this->now();
-  int64_t nanoseconds = now.nanoseconds();
-  int64_t seconds = nanoseconds / 1000000000LL;
-  int64_t nanorem = nanoseconds % 1000000000LL;
-  if (nanorem < 0)
-  {
-    nanorem += 1000000000LL;
-    --seconds;
-  }
-  std::time_t time_sec = static_cast<std::time_t>(seconds);
-  std::tm tm = *std::gmtime(&time_sec);
-  std::stringstream timestamp_ss;
-  timestamp_ss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S")
-               << "." << std::setw(6) << std::setfill('0') << (nanorem / 1000);
-
-  out << std::fixed << std::setprecision(6);
-  out << "calibration_transform:\n";
-  out << "  rotation:\n";
-  out << "    w: " << q.w() << "\n";
-  out << "    x: " << q.x() << "\n";
-  out << "    y: " << q.y() << "\n";
-  out << "    z: " << q.z() << "\n";
-  out << "  rotation_degrees:\n";
-  out << "    roll: " << roll_deg << "\n";
-  out << "    pitch: " << pitch_deg << "\n";
-  out << "    yaw: " << yaw_deg << "\n";
+  out << std::fixed << std::setprecision(12);
+  out << "transform:\n";
   out << "  translation:\n";
   out << "    x: " << translation.x() << "\n";
   out << "    y: " << translation.y() << "\n";
   out << "    z: " << translation.z() << "\n";
-  out << "metadata:\n";
-  out << "  calibration_mode: " << calibration_mode_ << "\n";
-  out << "  transform_parent_frame: " << transform_parent_frame << "\n";
-  out << "  transform_child_frame: calibrated_camera_link\n";
-  out << "  transform_type: " << (isEyeToHandMode() ? "base_to_camera" : "gripper_to_camera") << "\n";
-  out << "  sample_count: " << sample_count << "\n";
-  out << "  base_frame: " << base_frame_ << "\n";
-  out << "  gripper_frame: " << gripper_frame_ << "\n";
-  out << "  camera_frame: " << camera_frame << "\n";
-  out << "  target_frame: " << target_frame_ << "\n";
-  out << "  units:\n";
-  out << "    rotation: quaternion/degrees\n";
-  out << "    translation: meter\n";
-  out << "timestamp: '" << timestamp_ss.str() << "'\n";
+  out << "  rotation:\n";
+  out << "    x: " << q.x() << "\n";
+  out << "    y: " << q.y() << "\n";
+  out << "    z: " << q.z() << "\n";
+  out << "    w: " << q.w() << "\n";
   return true;
 }
 

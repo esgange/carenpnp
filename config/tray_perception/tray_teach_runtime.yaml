@@ -1,0 +1,27 @@
+tray_teach_runtime:
+  ros__parameters:
+    tray_name: brown_tray
+    red_threshold: 64
+    green_threshold: 110
+    blue_threshold: 135
+    depth_threshold_mm: 10
+    detection_mode: rgb
+    ray_step_px: 26
+    depth_edge_offset_px: 20
+    previous_color_percent: 87
+    horizontal_ray_count: 57
+    vertical_ray_count: 53
+    outlier_sensitivity: 91
+    live_view_enabled: true
+    view_mode: 0
+    overlay_enabled: true
+    show_rays_enabled: false
+    detect_black_to_white: true
+    trace_out_to_in: true
+    depth_plane_enabled: false
+    depth_plane_a: 0
+    depth_plane_b: 0
+    depth_plane_c: 0
+    depth_plane_reference_depth_m: 0
+    depth_plane_roi: [0, 0, 0, 0]
+    roi_points: [168, 16, 661, 14, 681, 456, 178, 456]
