@@ -169,9 +169,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         _ros_domain_action(),
-        DeclareLaunchArgument("color_topic", default_value="/camera/color/image_raw"),
-        DeclareLaunchArgument("depth_topic", default_value="/camera/depth/image_raw"),
-        DeclareLaunchArgument("camera_info_topic", default_value="/camera/color/camera_info"),
+        DeclareLaunchArgument("color_topic", default_value="/robot_camera/color/image_raw"),
+        DeclareLaunchArgument("depth_topic", default_value="/robot_camera/depth/image_raw"),
+        DeclareLaunchArgument("camera_info_topic", default_value="/robot_camera/color/camera_info"),
         DeclareLaunchArgument("use_calibration", default_value="true"),
         DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
         DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
@@ -184,7 +184,7 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_frame", default_value="calibrated_camera_link"),
         DeclareLaunchArgument("use_platform_calibration", default_value="true"),
         DeclareLaunchArgument("auto_discover_platform_calibration", default_value="true"),
-        DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("teach", "platform")),
+        DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("calibration")),
         DeclareLaunchArgument("platform_calibration_file", default_value=""),
         DeclareLaunchArgument("marker_prefix", default_value="aruco_marker"),
         DeclareLaunchArgument("overlay_topic", default_value="/aruco_overlay"),

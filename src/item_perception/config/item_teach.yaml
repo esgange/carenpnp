@@ -1,12 +1,21 @@
 item_teach:
   ros__parameters:
-    color_topic: /camera/color/image_raw
-    depth_topic: /camera/depth/image_raw
-    camera_info_topic: /camera/color/camera_info
+    color_topic: /robot_camera/color/image_raw
+    depth_topic: /robot_camera/depth/image_raw
+    camera_info_topic: /robot_camera/color/camera_info
     joint_states_topic: /joint_states_robot
     overlay_topic: bin_overlay
     publish_overlay: true
     align_item_z_axis_to_depth_plane: true
+    camera_control_service_root: /robot_camera
+    color_exposure_us: 0
+    depth_exposure_us: 0
+    color_exposure_percent: 0
+    depth_exposure_percent: 0
+    color_exposure_min_us: 1
+    color_exposure_max_us: 100
+    depth_exposure_min_us: 1
+    depth_exposure_max_us: 32000
     motion_service_root: /dobot_bringup_ros2/srv
     bin_roi_move_speed_percent: 100
     display_scale: 1.0

@@ -57,7 +57,7 @@ install(DIRECTORY launch
 
 ament_environment_hooks(environment/ros_domain_id.sh)
 
-set(WORKSPACE_PARAM_JSON "${CMAKE_CURRENT_SOURCE_DIR}/../../config/dobot_bringup_v4/param.json")
+set(WORKSPACE_PARAM_JSON "${CMAKE_CURRENT_SOURCE_DIR}/../../config/robot_bringup/param.json")
 if(EXISTS "${WORKSPACE_PARAM_JSON}")
   install(FILES "${WORKSPACE_PARAM_JSON}"
     DESTINATION share/${PROJECT_NAME}/config)

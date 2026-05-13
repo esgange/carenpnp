@@ -8,14 +8,9 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
-find_package(visualization_msgs REQUIRED)
 find_package(dobot_msgs_v4 REQUIRED)
 find_package(aruco_perception REQUIRED)
-find_package(cv_bridge REQUIRED)
-find_package(OpenCV REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
@@ -38,40 +33,7 @@ ament_target_dependencies(bin_teach
 )
 target_link_libraries(bin_teach Qt5::Widgets yaml-cpp)
 
-add_executable(item_teach src/item_teach_node.cpp)
-target_include_directories(item_teach PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(item_teach
-  geometry_msgs
-  rclcpp
-  sensor_msgs
-  dobot_msgs_v4
-  cv_bridge
-  tf2_ros
-  OpenCV
-)
-target_link_libraries(item_teach yaml-cpp ${OpenCV_LIBS})
-
-add_executable(item_detect src/item_detect_node.cpp)
-target_include_directories(item_detect PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(item_detect
-  geometry_msgs
-  rclcpp
-  nav_msgs
-  sensor_msgs
-  std_srvs
-  visualization_msgs
-  dobot_msgs_v4
-  cv_bridge
-  tf2_ros
-  OpenCV
-)
-target_link_libraries(item_detect yaml-cpp ${OpenCV_LIBS})
-
-install(TARGETS bin_teach item_teach item_detect
+install(TARGETS bin_teach
   DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS

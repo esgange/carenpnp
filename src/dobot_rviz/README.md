@@ -22,7 +22,7 @@ ros2 launch dobot_rviz dobot_rviz.launch.py
 
 ## What the Launch Does
 
-- Reads `robot_type` from `WORKSPACE_ROOT/config/dobot_bringup_v4/param.json`.
+- Reads `robot_type` from `WORKSPACE_ROOT/config/robot_bringup/param.json`.
 - Selects the matching URDF from `urdf/`.
 - Falls back to `cr5_robot.urdf` if the configured model has no URDF.
 - Starts `robot_state_publisher`.
@@ -63,7 +63,7 @@ Useful debug TFs include:
 
 ## Notes
 
-- Keep `robot_type` in `WORKSPACE_ROOT/config/dobot_bringup_v4/param.json` aligned with the
+- Keep `robot_type` in `WORKSPACE_ROOT/config/robot_bringup/param.json` aligned with the
   physical robot.
 - Run perception packages alongside RViz to populate obstacle, tray, bin, and
   debug overlays.

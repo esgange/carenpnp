@@ -28,7 +28,7 @@ def _ros_bool(value, *, default=False) -> bool:
 def _workspace_root() -> Path:
     def looks_like_root(path: Path) -> bool:
         return (
-            (path / 'config' / 'dobot_bringup_v4' / 'param.json').exists()
+            (path / 'config' / 'robot_bringup' / 'param.json').exists()
             or (path / 'src' / 'dobot_msgs_v4').exists()
             or (path / 'docker-compose.yml').exists()
         )
@@ -49,7 +49,7 @@ def _workspace_root() -> Path:
 
 
 def _default_config_path() -> str:
-    workspace_config = _workspace_root() / 'config' / 'dobot_bringup_v4' / 'param.json'
+    workspace_config = _workspace_root() / 'config' / 'robot_bringup' / 'param.json'
     if workspace_config.exists():
         return str(workspace_config)
     return str(get_package_share_path('cr_robot_ros2') / 'config' / 'param.json')
@@ -66,9 +66,14 @@ def _launch_setup(context, *args, **kwargs):
     # Read high-level config
     robot_number = int(cfg.get('robot_number', 1))
     current_robot = int(cfg.get('current_robot', 1))
-    ros_domain_id = int(cfg.get('ros_domain_id', 0))
-    if ros_domain_id < 0 or ros_domain_id > 232:
-        raise ValueError("[cr_robot_ros2] `ros_domain_id` must be between 0 and 232.")
+    ros_domain_id_value = cfg.get('ros_domain_id')
+    ros_domain_id = None
+    if ros_domain_id_value is not None and not (
+        isinstance(ros_domain_id_value, str) and not ros_domain_id_value.strip()
+    ):
+        ros_domain_id = int(ros_domain_id_value)
+        if ros_domain_id < 0 or ros_domain_id > 232:
+            raise ValueError("[cr_robot_ros2] `ros_domain_id` must be between 0 and 232.")
     ros_localhost_only = '1' if _ros_bool(cfg.get('ros_localhost_only'), default=False) else '0'
 
     node_info = cfg.get('node_info', [])
@@ -102,11 +107,13 @@ def _launch_setup(context, *args, **kwargs):
         parameters=[params],
     )
 
-    return [
-        SetEnvironmentVariable(name='ROS_DOMAIN_ID', value=str(ros_domain_id)),
+    env_actions = [
         SetEnvironmentVariable(name='ROS_LOCALHOST_ONLY', value=ros_localhost_only),
-        bringup,
     ]
+    if ros_domain_id is not None:
+        env_actions.insert(0, SetEnvironmentVariable(name='ROS_DOMAIN_ID', value=str(ros_domain_id)))
+
+    return env_actions + [bringup]
 
 def _ros_domain_action():
     import importlib.util

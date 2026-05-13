@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -48,12 +50,30 @@ def _ros_domain_action():
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'tray_post_follow_z_up_servo_p_t_sec',
+            default_value='1.0',
+            description='ServoP point runtime in seconds for tray post-follow Z-up.',
+        ),
+        DeclareLaunchArgument(
+            'return_to_item_teach_servo_j_t_sec',
+            default_value='1.5',
+            description='ServoJ joint runtime in seconds for returning to item perception teach.',
+        ),
         _ros_domain_action(),
         Node(
             package='tray_intercept_servo',
             executable='tray_intercept_servo',
             name='tray_intercept_servo',
             output='screen',
+            parameters=[{
+                'tray_post_follow_z_up_servo_p_t_sec': LaunchConfiguration(
+                    'tray_post_follow_z_up_servo_p_t_sec'
+                ),
+                'return_to_item_teach_servo_j_t_sec': LaunchConfiguration(
+                    'return_to_item_teach_servo_j_t_sec'
+                ),
+            }],
             additional_env={
                 'PYTHONPATH': _tray_intercept_servo_pythonpath(),
             },

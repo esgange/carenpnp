@@ -31,7 +31,7 @@ Common overrides:
 
 ```bash
 ros2 launch aruco_perception aruco_perception.launch.py \
-  calibration_file:=/abs/path/to/axab_calibration.yaml \
+  calibration_file:=/abs/path/to/axab_calibration_eyeonhand_09052026.yaml \
   show_overlay_window:=false
 ```
 
@@ -50,9 +50,9 @@ Default topics:
 
 | Topic | Type |
 | --- | --- |
-| `/camera/color/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/depth/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
+| `/robot_camera/color/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/depth/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
 
 If the camera namespace changes, pass matching launch overrides:
 
@@ -78,8 +78,8 @@ ros2 launch aruco_perception aruco_perception.launch.py \
   `WORKSPACE_ROOT/calibration` unless `calibration_file` is set.
 - If calibration is enabled and no usable file exists, launch fails early with a
   clear error.
-- The loaded YAML is expected to include `calibration_transform.rotation` and
-  `calibration_transform.translation`.
+- The loaded YAML is expected to include `transform.rotation` and
+  `transform.translation`.
 - When calibration is enabled, marker poses are published in
   `calibrated_camera_link` by default.
 - When calibration is disabled, marker poses are published in `parent_frame`.
@@ -87,8 +87,8 @@ ros2 launch aruco_perception aruco_perception.launch.py \
 ## Quick Checks
 
 ```bash
-ros2 topic hz /camera/color/image_raw
-ros2 topic hz /camera/depth/image_raw
+ros2 topic hz /robot_camera/color/image_raw
+ros2 topic hz /robot_camera/depth/image_raw
 ros2 topic echo /marker_pose --once
 ros2 topic hz /aruco_overlay
 ros2 run tf2_ros tf2_echo calibrated_camera_link aruco_marker_1

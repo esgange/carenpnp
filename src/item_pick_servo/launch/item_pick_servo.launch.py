@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -48,12 +50,34 @@ def _ros_domain_action():
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'item_approach_servo_p_t_sec',
+            default_value='1.5',
+            description='ServoP point runtime in seconds for item approach.',
+        ),
+        DeclareLaunchArgument(
+            'item_final_z_up_servo_p_t_sec',
+            default_value='1.0',
+            description='ServoP point runtime in seconds for item final Z-up.',
+        ),
+        DeclareLaunchArgument(
+            'return_to_tray_teach_servo_j_t_sec',
+            default_value='1.5',
+            description='ServoJ joint runtime in seconds for returning to tray perception teach.',
+        ),
         _ros_domain_action(),
         Node(
             package='item_pick_servo',
             executable='item_pick_servo',
             name='item_pick_servo',
             output='screen',
+            parameters=[{
+                'item_approach_servo_p_t_sec': LaunchConfiguration('item_approach_servo_p_t_sec'),
+                'item_final_z_up_servo_p_t_sec': LaunchConfiguration('item_final_z_up_servo_p_t_sec'),
+                'return_to_tray_teach_servo_j_t_sec': LaunchConfiguration(
+                    'return_to_tray_teach_servo_j_t_sec'
+                ),
+            }],
             additional_env={
                 'PYTHONPATH': _item_pick_servo_pythonpath(),
             },

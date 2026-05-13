@@ -14,17 +14,29 @@ from rclpy.node import Node
 from rclpy.time import Time
 
 from dobot_msgs_v4.msg import ToolVectorActual, TrayVector
-from dobot_msgs_v4.srv import CP, GetTrayDimensions, MovL, MovLIO, SpeedFactor, Stop, TrayInterceptStart
+from dobot_msgs_v4.srv import CP, DO, GetTrayDimensions, MovL, MovLIO, ServoJ, ServoP, SpeedFactor, Stop, TrayInterceptStart
 from geometry_msgs.msg import PolygonStamped, TransformStamped
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
+try:
+    import yaml
+except Exception:
+    yaml = None
+
 
 SERVICE_ROOT_DEFAULT = '/dobot_bringup_ros2/srv'
+GRIPPER_DO_SERVICE_DEFAULT = f'{SERVICE_ROOT_DEFAULT}/DO'
 LINEAR_SPEED_MM_S_MIN = 50.0
 LINEAR_SPEED_MM_S_MAX = 650.0
 DEFAULT_ACC_PERCENT = 100
+TRAY_POST_FOLLOW_Z_UP_SERVO_P_T_SEC_DEFAULT = 1.0
+SERVO_P_AHEADTIME = 50.0
+SERVO_P_GAIN = 500.0
+RETURN_TO_ITEM_TEACH_SERVO_J_T_SEC_DEFAULT = 1.5
+SERVO_J_AHEADTIME = 50.0
+SERVO_J_GAIN = 500.0
 TCP_FIELDS = ('x', 'y', 'z', 'rx', 'ry', 'rz')
 TRANSLATION_AXES = ('x', 'y', 'z')
 
@@ -128,7 +140,8 @@ TRAY_PREVIEW_BORDER_MAX_MM = 150.0
 INTERCEPT_DOT_DIAMETER_DEFAULT_MM = 10.0
 INTERCEPT_DOT_DIAMETER_MIN_MM = 2.0
 INTERCEPT_DOT_DIAMETER_MAX_MM = 60.0
-RUNTIME_SETTINGS_PATH = workspace_path('config', 'trays', 'tray_intercept_servo_runtime_settings.json')
+RUNTIME_SETTINGS_PATH = workspace_path('config', 'tray_perception', 'tray_intercept_servo_runtime_settings.json')
+ITEM_PROFILE_STATE_PATH = workspace_path('config', 'item_perception', 'item_detect_selected_profile.txt')
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
 MOTION_PROFILE_ENFORCE_WAIT_SEC = 12.0
 MOTION_PROFILE_ENFORCE_CALL_SEC = 8.0
@@ -137,6 +150,114 @@ MOVLIO_RELEASE_START_DISTANCE_PERCENT = 1
 GRIPPER_DO_CLOSE_INDEX = 1
 GRIPPER_DO_OPEN_INDEX = 2
 GRIPPER_DO_SUCTION_INDEX = 3
+
+
+def _parse_simple_yaml_scalar(raw_value: str) -> object:
+    text = str(raw_value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    lowered = text.lower()
+    if lowered == 'true':
+        return True
+    if lowered == 'false':
+        return False
+    try:
+        if any(ch in text for ch in ('.', 'e', 'E')):
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def read_simple_yaml_mapping(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    payload: dict[str, object] = {}
+    with path.open('r', encoding='utf-8') as infile:
+        for line in infile:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#') or ':' not in stripped:
+                continue
+            key, raw_value = stripped.split(':', 1)
+            key = key.strip()
+            if not key:
+                continue
+            payload[key] = _parse_simple_yaml_scalar(raw_value)
+    return payload
+
+
+def _read_yaml_document(path: Path) -> object | None:
+    if not path.exists():
+        return None
+    try:
+        if yaml is not None:
+            with path.open('r', encoding='utf-8') as infile:
+                return yaml.safe_load(infile)
+        return read_simple_yaml_mapping(path)
+    except Exception:
+        return None
+
+
+def _resolve_workspace_path_text(raw_value: object) -> Path | None:
+    text = str(raw_value or '').strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = workspace_path(text)
+    return path
+
+
+def _ros_parameters_mapping(document: object, root_key: str) -> dict[str, object]:
+    if not isinstance(document, dict):
+        return {}
+    root = document.get(root_key)
+    if isinstance(root, dict):
+        params = root.get('ros__parameters')
+        if isinstance(params, dict):
+            return params
+        return root
+    return document
+
+
+def _parse_float_sequence(value: object, expected_count: int = 6) -> tuple[float, ...] | None:
+    if isinstance(value, (list, tuple)):
+        raw_values = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith('[') and text.endswith(']'):
+            text = text[1:-1]
+        raw_values = [part.strip() for part in text.split(',') if part.strip()]
+    else:
+        return None
+    if len(raw_values) != expected_count:
+        return None
+    try:
+        parsed = tuple(float(raw) for raw in raw_values)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in parsed):
+        return None
+    return parsed
+
+
+def _teach_joints_from_profile(path: Path, root_key: str) -> tuple[float, ...] | None:
+    document = _read_yaml_document(path)
+    params = _ros_parameters_mapping(document, root_key)
+    return _parse_float_sequence(params.get('teach_joints_deg'))
+
+
+def _selected_item_profile_path() -> Path | None:
+    if not ITEM_PROFILE_STATE_PATH.exists():
+        return None
+    try:
+        text = ITEM_PROFILE_STATE_PATH.read_text(encoding='utf-8').strip()
+    except OSError:
+        return None
+    candidate = _resolve_workspace_path_text(text)
+    if candidate is not None and candidate.exists():
+        return candidate
+    return None
 
 
 @dataclass
@@ -221,6 +342,18 @@ class RelMovLMiniNode(Node):
                 ),
             ),
         )
+        self._tray_post_follow_z_up_servo_p_t_sec = float(
+            self.declare_parameter(
+                'tray_post_follow_z_up_servo_p_t_sec',
+                TRAY_POST_FOLLOW_Z_UP_SERVO_P_T_SEC_DEFAULT,
+            ).value
+        )
+        self._return_to_item_teach_servo_j_t_sec = float(
+            self.declare_parameter(
+                'return_to_item_teach_servo_j_t_sec',
+                RETURN_TO_ITEM_TEACH_SERVO_J_T_SEC_DEFAULT,
+            ).value
+        )
         self._follow_distance_mm = 200.0
         self._post_follow_z_up_mm = 300.0
         self._release_grip_enabled = False
@@ -301,9 +434,12 @@ class RelMovLMiniNode(Node):
 
         self._mov_l_client = self.create_client(MovL, f'{SERVICE_ROOT_DEFAULT}/MovL')
         self._mov_lio_client = self.create_client(MovLIO, f'{SERVICE_ROOT_DEFAULT}/MovLIO')
+        self._servo_p_client = self.create_client(ServoP, f'{SERVICE_ROOT_DEFAULT}/ServoP')
+        self._servo_j_client = self.create_client(ServoJ, f'{SERVICE_ROOT_DEFAULT}/ServoJ')
         self._stop_client = self.create_client(Stop, f'{SERVICE_ROOT_DEFAULT}/Stop')
         self._cp_client = self.create_client(CP, f'{SERVICE_ROOT_DEFAULT}/CP')
         self._speed_factor_client = self.create_client(SpeedFactor, f'{SERVICE_ROOT_DEFAULT}/SpeedFactor')
+        self._do_client = self.create_client(DO, GRIPPER_DO_SERVICE_DEFAULT)
         self._tray_dimensions_client = self.create_client(
             GetTrayDimensions,
             self._tray_dimensions_service_name,
@@ -354,6 +490,8 @@ class RelMovLMiniNode(Node):
             f'hysteresis={self._command_hysteresis_sec:.2f}s, '
             f'follow={self._follow_distance_mm:.0f} mm, '
             f'post_z_up={self._post_follow_z_up_mm:.0f} mm, '
+            f'tray_post_follow_z_up_servo_p_t={self._tray_post_follow_z_up_servo_p_t_sec:.3f}s, '
+            f'return_to_item_teach_servo_j_t={self._return_to_item_teach_servo_j_t_sec:.3f}s, '
             f'release_grip={"on" if self._release_grip_enabled else "off"}'
         )
         if self._calibration_startup_cp is not None and self._calibration_startup_speed_factor is not None:
@@ -1056,6 +1194,86 @@ class RelMovLMiniNode(Node):
             return False, v_percent, mapping_source
         return True, v_percent, mapping_source
 
+    def _send_servop_goal(
+        self,
+        goal: tuple[float, float, float, float, float, float],
+        label_prefix: str,
+        t_sec: float,
+    ) -> tuple[bool, float, str]:
+        if not self._wait_for_service(self._servo_p_client, 'ServoP'):
+            return False, float(t_sec), 'service_unavailable'
+
+        servo_p_request = ServoP.Request()
+        servo_p_request.a = float(goal[0])
+        servo_p_request.b = float(goal[1])
+        servo_p_request.c = float(goal[2])
+        servo_p_request.d = float(goal[3])
+        servo_p_request.e = float(goal[4])
+        servo_p_request.f = float(goal[5])
+        servo_p_request.param_value = self._build_servo_p_param_value(t_sec)
+
+        servo_p_label = (
+            f'{label_prefix}('
+            f'{servo_p_request.a:.1f},{servo_p_request.b:.1f},{servo_p_request.c:.1f},'
+            f'{servo_p_request.d:.2f},{servo_p_request.e:.2f},{servo_p_request.f:.2f},'
+            f'{",".join(servo_p_request.param_value)})'
+        )
+        servo_p_response = self._call_service(self._servo_p_client, servo_p_request, servo_p_label)
+        if servo_p_response is None:
+            return False, float(t_sec), 'servo_p'
+        if int(getattr(servo_p_response, 'res', -1)) < 0:
+            return False, float(t_sec), 'servo_p'
+        return True, float(t_sec), 'servo_p'
+
+    def _send_servoj_teach_goal(
+        self,
+        joints_deg: tuple[float, ...],
+        label_prefix: str,
+        t_sec: float,
+    ) -> tuple[bool, float, str]:
+        if len(joints_deg) != 6:
+            self._set_action_text(f'{label_prefix}: invalid teach joint count.')
+            return False, float(t_sec), 'invalid_joints'
+        if not self._wait_for_service(self._servo_j_client, 'ServoJ'):
+            return False, float(t_sec), 'service_unavailable'
+
+        servo_j_request = ServoJ.Request()
+        servo_j_request.a = float(joints_deg[0])
+        servo_j_request.b = float(joints_deg[1])
+        servo_j_request.c = float(joints_deg[2])
+        servo_j_request.d = float(joints_deg[3])
+        servo_j_request.e = float(joints_deg[4])
+        servo_j_request.f = float(joints_deg[5])
+        servo_j_request.param_value = self._build_servo_j_param_value(t_sec)
+
+        servo_j_label = (
+            f'{label_prefix}('
+            f'{servo_j_request.a:.2f},{servo_j_request.b:.2f},{servo_j_request.c:.2f},'
+            f'{servo_j_request.d:.2f},{servo_j_request.e:.2f},{servo_j_request.f:.2f},'
+            f'{",".join(servo_j_request.param_value)})'
+        )
+        servo_j_response = self._call_service(self._servo_j_client, servo_j_request, servo_j_label)
+        if servo_j_response is None:
+            return False, float(t_sec), 'servo_j'
+        if int(getattr(servo_j_response, 'res', -1)) < 0:
+            return False, float(t_sec), 'servo_j'
+        return True, float(t_sec), 'servo_j'
+
+    def _load_item_teach_joints_goal(self) -> tuple[Path, tuple[float, ...]] | None:
+        item_profile_path = _selected_item_profile_path()
+        if item_profile_path is None:
+            self._set_action_text(
+                'No active item teach selected in item_detect. Load an item teach profile first.'
+            )
+            return None
+        joints = _teach_joints_from_profile(item_profile_path, 'item_detect')
+        if joints is None:
+            self._set_action_text(
+                f'Active item teach has no valid teach_joints_deg: {item_profile_path}'
+            )
+            return None
+        return item_profile_path, joints
+
     @staticmethod
     def _build_movelio_do_token(
         mode: int,
@@ -1087,27 +1305,29 @@ class RelMovLMiniNode(Node):
             ),
         ]
 
-    def _build_release_post_follow_mdis(self) -> list[str]:
-        return [
-            self._build_movelio_do_token(
-                MOVLIO_RELEASE_MODE_PERCENT,
-                MOVLIO_RELEASE_START_DISTANCE_PERCENT,
-                GRIPPER_DO_CLOSE_INDEX,
-                0,
-            ),
-            self._build_movelio_do_token(
-                MOVLIO_RELEASE_MODE_PERCENT,
-                MOVLIO_RELEASE_START_DISTANCE_PERCENT,
-                GRIPPER_DO_OPEN_INDEX,
-                0,
-            ),
-            self._build_movelio_do_token(
-                MOVLIO_RELEASE_MODE_PERCENT,
-                MOVLIO_RELEASE_START_DISTANCE_PERCENT,
-                GRIPPER_DO_SUCTION_INDEX,
-                0,
-            ),
-        ]
+    def _send_do(self, index: int, status: int, time_ms: int = 0) -> bool:
+        if not self._wait_for_service(self._do_client, 'DO'):
+            return False
+
+        request = DO.Request()
+        request.index = int(index)
+        request.status = int(status)
+        request.time = int(time_ms)
+        label = f'DO(index={request.index},status={request.status},time={request.time})'
+        response = self._call_service(
+            self._do_client,
+            request,
+            label,
+            timeout_sec=4.0,
+        )
+        return response is not None and int(getattr(response, 'res', -1)) >= 0
+
+    def _set_release_post_follow_neutral(self) -> bool:
+        if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_OPEN_INDEX, 0):
+            return False
+        return self._send_do(GRIPPER_DO_SUCTION_INDEX, 0)
 
     def _send_movelio_goal(
         self,
@@ -1335,7 +1555,7 @@ class RelMovLMiniNode(Node):
         release_grip_enabled: bool,
     ) -> None:
         seek_complete_notified = False
-        busy_released_after_zup_queue = False
+        busy_released_after_teach_return_queue = False
         try:
             if self._is_cancel_requested():
                 self._set_action_text('Sequence cancelled before dispatch.')
@@ -1470,51 +1690,68 @@ class RelMovLMiniNode(Node):
             if not follow_ok:
                 return
 
-            zup_mdis = self._build_release_post_follow_mdis() if release_grip_enabled else None
-            if release_grip_enabled:
-                zup_ok, zup_v, zup_map = self._send_movelio_goal(
-                    post_follow_goal,
-                    follow_goal,
-                    post_z_up_speed_mm_s,
-                    'MovLIO post-follow z-up + release IO',
-                    mdis=zup_mdis,
-                )
-                zup_cmd = 'MovLIO'
-            else:
-                zup_ok, zup_v, zup_map = self._send_movel_goal(
-                    post_follow_goal,
-                    follow_goal,
-                    post_z_up_speed_mm_s,
-                    'MovL post-follow z-up + tray follow',
-                )
-                zup_cmd = 'MovL'
-            if not zup_ok:
-                return
-
-            seek_complete_notified = self._notify_tray_detect_seek_complete()
-            busy_released_after_zup_queue = True
-            self._set_busy(False)
-            self._set_action_text(
-                'Queued tray sequence through final post-follow Z-up. Ready for next arm.'
-            )
+            self._set_action_text('Queued tray follow. Monitoring follow goal before ServoP post-follow Z-up...')
             if not self._wait_for_tcp_xyz_goal(
-                (post_follow_goal[0], post_follow_goal[1], post_follow_goal[2]),
-                update_action_text=False,
+                (follow_goal[0], follow_goal[1], follow_goal[2]),
             ):
                 return
 
+            if release_grip_enabled:
+                self._set_action_text('Neutralizing release IO before ServoP post-follow Z-up...')
+                if not self._set_release_post_follow_neutral():
+                    return
+
+            zup_ok, zup_v, zup_map = self._send_servop_goal(
+                post_follow_goal,
+                'ServoP post-follow Z-up',
+                self._tray_post_follow_z_up_servo_p_t_sec,
+            )
+            zup_cmd = 'ServoP'
+            if not zup_ok:
+                return
+
+            self._set_action_text('ServoP post-follow Z-up sent. Monitoring Z-up before item teach return...')
+            if not self._wait_for_tcp_xyz_goal(
+                (post_follow_goal[0], post_follow_goal[1], post_follow_goal[2]),
+            ):
+                return
+
+            item_teach_goal = self._load_item_teach_joints_goal()
+            if item_teach_goal is None:
+                return
+            item_teach_path, item_teach_joints = item_teach_goal
+            return_ok, return_t, return_map = self._send_servoj_teach_goal(
+                item_teach_joints,
+                f'ServoJ return to item teach {item_teach_path.name}',
+                self._return_to_item_teach_servo_j_t_sec,
+            )
+            if not return_ok:
+                return
+
+            seek_complete_notified = self._notify_tray_detect_seek_complete()
+            busy_released_after_teach_return_queue = True
+            self._set_busy(False)
+            self._set_action_text(
+                'Sent tray sequence through ServoJ item teach return. Ready for next arm.'
+            )
+
             self.get_logger().info(
-                f'Completed queued tray sequence (MovL intercept + {follow_cmd} follow + {zup_cmd} post-follow): '
+                f'Completed queued tray sequence (MovL intercept + {follow_cmd} follow + {zup_cmd} post-follow + '
+                'ServoJ item teach return): '
                 f'intercept offsets (X {x_offset_mm:.0f}, Y {y_offset_mm:.0f}, Z {z_offset_mm:.0f} mm), '
                 f'intercept {intercept_speed_mm_s:.0f} mm/s, follow {follow_distance_mm:.0f} mm '
                 f'at tray speed {follow_speed_mm_s:.0f} mm/s, '
                 f'post Z-up {post_follow_z_up_mm:.0f} mm with tray-follow {zup_follow_distance_mm:.1f} mm. '
                 f'ee_angle={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
                 f'release_grip={"on" if release_grip_enabled else "off"} '
+                f'tray_post_follow_z_up_servo_p_t={self._tray_post_follow_z_up_servo_p_t_sec:.3f}s '
+                f'return_to_item_teach_servo_j_t={return_t:.3f}s '
+                f'item_teach_profile="{item_teach_path}" '
                 f'age={base_goal.tray_age_sec:.3f}s lead={base_goal.lead_time_sec:.3f}s '
                 f'tray_speed={base_goal.tray_speed_base_mmps:.1f} mm/s '
                 f'(v: intercept={intercept_v}/{intercept_map}, '
-                f'follow={follow_v}/{follow_map}, z-up={zup_v}/{zup_map}).'
+                f'follow={follow_v}/{follow_map}, z-up={zup_v:.3f}s/{zup_map}, '
+                f'item-teach-return={return_t:.3f}s/{return_map}).'
             )
         except Exception as exc:
             self.get_logger().error(f'MovL predicted-goal flow failed: {exc}')
@@ -1522,7 +1759,7 @@ class RelMovLMiniNode(Node):
         finally:
             if not seek_complete_notified:
                 self._notify_tray_detect_seek_complete()
-            if not busy_released_after_zup_queue:
+            if not busy_released_after_teach_return_queue:
                 self._set_busy(False)
 
     def _set_action_text(self, text: str) -> None:
@@ -1828,6 +2065,20 @@ class RelMovLMiniNode(Node):
         if include_tool:
             args.append('tool=1')
         return [','.join(args)]
+
+    def _build_servo_p_param_value(self, t_sec: float) -> list[str]:
+        return [
+            f't={float(t_sec):.3f}',
+            f'aheadtime={SERVO_P_AHEADTIME:.1f}',
+            f'gain={SERVO_P_GAIN:.1f}',
+        ]
+
+    def _build_servo_j_param_value(self, t_sec: float) -> list[str]:
+        return [
+            f't={float(t_sec):.3f}',
+            f'aheadtime={SERVO_J_AHEADTIME:.1f}',
+            f'gain={SERVO_J_GAIN:.1f}',
+        ]
 
     def get_command_hysteresis_sec(self) -> float:
         with self._lock:

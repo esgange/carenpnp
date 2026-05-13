@@ -146,7 +146,7 @@ class ItemTeachYoloNode(Node):
         super().__init__("item_teach_yolo")
         self.bridge = CvBridge()
 
-        self.color_topic = self.declare_parameter("color_topic", "/camera/color/image_raw").value
+        self.color_topic = self.declare_parameter("color_topic", "/robot_camera/color/image_raw").value
         self.joint_states_topic = self.declare_parameter("joint_states_topic", "/joint_states_robot").value
         self.item_name = self.declare_parameter("item_name", "item").value
         self.bin_teach_dir = resolve_path(
@@ -169,9 +169,9 @@ class ItemTeachYoloNode(Node):
                 "model_root",
                 str(workspace_path("teach", "bins_yolo", "models")),
             ).value)
-        self.depth_topic = self.declare_parameter("depth_topic", "/camera/depth/image_raw").value
+        self.depth_topic = self.declare_parameter("depth_topic", "/robot_camera/depth/image_raw").value
         self.camera_info_topic = self.declare_parameter(
-            "camera_info_topic", "/camera/color/camera_info").value
+            "camera_info_topic", "/robot_camera/color/camera_info").value
         self.overlay_topic = self.declare_parameter("overlay_topic", "bin_overlay").value
         self.sam2_checkpoint = resolve_path(
             self.declare_parameter(

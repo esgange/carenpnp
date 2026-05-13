@@ -76,7 +76,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     scripts_dir_arg = DeclareLaunchArgument(
         'scripts_dir',
-        default_value=_repo_path('config', 'motion_debug_scripts'),
+        default_value=_repo_path('config', 'motion_calibrate'),
         description='Directory containing calibration scripts',
     )
     script_names_csv_arg = DeclareLaunchArgument(

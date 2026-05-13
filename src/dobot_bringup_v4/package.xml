@@ -10,6 +10,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>
+  <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>dobot_msgs_v4</depend>
   <build_depend>message_generation</build_depend>

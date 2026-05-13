@@ -13,7 +13,7 @@ ROS_DOMAIN_ID_MAX = 232
 
 def _looks_like_workspace_root(path: Path) -> bool:
     return (
-        (path / 'config' / 'dobot_bringup_v4' / 'param.json').exists()
+        (path / 'config' / 'robot_bringup' / 'param.json').exists()
         or (path / 'src' / 'dobot_msgs_v4').exists()
         or (path / 'docker-compose.yml').exists()
     )
@@ -36,7 +36,7 @@ def _workspace_root() -> Path:
 
 
 def _default_config_path() -> Path:
-    workspace_config = _workspace_root() / 'config' / 'dobot_bringup_v4' / 'param.json'
+    workspace_config = _workspace_root() / 'config' / 'robot_bringup' / 'param.json'
     if workspace_config.exists():
         return workspace_config
 
@@ -47,10 +47,12 @@ def _default_config_path() -> Path:
 def ros_domain_id(config_path: str | Path | None = None) -> str:
     path = Path(config_path).expanduser() if config_path is not None else _default_config_path()
     if not path.exists():
-        return '0'
+        return ''
 
     data = json.loads(path.read_text())
-    value = data.get('ros_domain_id', 0)
+    value = data.get('ros_domain_id')
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ''
     domain_id = int(value)
     if domain_id < ROS_DOMAIN_ID_MIN or domain_id > ROS_DOMAIN_ID_MAX:
         raise ValueError(
@@ -83,10 +85,13 @@ def ros_localhost_only(config_path: str | Path | None = None) -> str:
 
 
 def ros_domain_env(config_path: str | Path | None = None) -> dict[str, str]:
-    return {
-        'ROS_DOMAIN_ID': ros_domain_id(config_path),
+    env = {
         'ROS_LOCALHOST_ONLY': ros_localhost_only(config_path),
     }
+    domain_id = ros_domain_id(config_path)
+    if domain_id:
+        env['ROS_DOMAIN_ID'] = domain_id
+    return env
 
 
 def ros_domain_action(config_path: str | Path | None = None) -> OpaqueFunction:

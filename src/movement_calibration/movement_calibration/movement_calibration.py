@@ -147,7 +147,7 @@ class MovementCalibrationNode(Node):
         self._scripts_dir = Path(
             str(self.declare_parameter(
                 'scripts_dir',
-                str(workspace_path('config', 'motion_debug_scripts')),
+                str(workspace_path('config', 'motion_calibrate')),
             ).value)
         ).expanduser()
         self._script_names_csv = str(self.declare_parameter(

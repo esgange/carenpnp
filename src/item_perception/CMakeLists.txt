@@ -16,6 +16,7 @@ find_package(dobot_msgs_v4 REQUIRED)
 find_package(aruco_perception REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(orbbec_camera_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
@@ -46,6 +47,8 @@ ament_target_dependencies(item_teach
   geometry_msgs
   rclcpp
   sensor_msgs
+  std_srvs
+  orbbec_camera_msgs
   dobot_msgs_v4
   cv_bridge
   tf2_ros
@@ -63,6 +66,7 @@ ament_target_dependencies(item_detect
   nav_msgs
   sensor_msgs
   std_srvs
+  orbbec_camera_msgs
   visualization_msgs
   dobot_msgs_v4
   cv_bridge
@@ -71,7 +75,26 @@ ament_target_dependencies(item_detect
 )
 target_link_libraries(item_detect yaml-cpp ${OpenCV_LIBS})
 
-install(TARGETS bin_teach item_teach item_detect
+add_executable(item_detect_eyetohand src/item_detect_eyetohand_node.cpp)
+target_include_directories(item_detect_eyetohand PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(item_detect_eyetohand
+  geometry_msgs
+  rclcpp
+  nav_msgs
+  sensor_msgs
+  std_srvs
+  orbbec_camera_msgs
+  visualization_msgs
+  dobot_msgs_v4
+  cv_bridge
+  tf2_ros
+  OpenCV
+)
+target_link_libraries(item_detect_eyetohand yaml-cpp ${OpenCV_LIBS})
+
+install(TARGETS bin_teach item_teach item_detect item_detect_eyetohand
   DESTINATION lib/${PROJECT_NAME})
 
 

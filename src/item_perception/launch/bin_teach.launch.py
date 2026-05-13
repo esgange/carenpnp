@@ -7,6 +7,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def _workspace_root() -> Path:
@@ -77,8 +78,14 @@ def generate_launch_description():
     base_frame = LaunchConfiguration("base_frame")
     gripper_frame = LaunchConfiguration("gripper_frame")
     camera_frame = LaunchConfiguration("camera_frame")
-    use_platform_calibration = LaunchConfiguration("use_platform_calibration")
-    auto_discover_platform_calibration = LaunchConfiguration("auto_discover_platform_calibration")
+    use_platform_calibration = ParameterValue(
+        LaunchConfiguration("use_platform_calibration"),
+        value_type=bool,
+    )
+    auto_discover_platform_calibration = ParameterValue(
+        LaunchConfiguration("auto_discover_platform_calibration"),
+        value_type=bool,
+    )
     platform_calibration_dir = LaunchConfiguration("platform_calibration_dir")
     platform_calibration_file = LaunchConfiguration("platform_calibration_file")
     marker_prefix = LaunchConfiguration("marker_prefix")
@@ -90,20 +97,26 @@ def generate_launch_description():
     show_aruco_overlay = LaunchConfiguration("show_aruco_overlay")
     publish_aruco_overlay = LaunchConfiguration("publish_aruco_overlay")
     aruco_overlay_rate_hz = LaunchConfiguration("aruco_overlay_rate_hz")
-    use_aruco_overlay = LaunchConfiguration("use_aruco_overlay")
+    use_aruco_overlay = ParameterValue(LaunchConfiguration("use_aruco_overlay"), value_type=bool)
     motion_service_root = LaunchConfiguration("motion_service_root")
-    align_distance_mm = LaunchConfiguration("align_distance_mm")
-    align_pose_speed_percent = LaunchConfiguration("align_pose_speed_percent")
-    align_visible_max_age_sec = LaunchConfiguration("align_visible_max_age_sec")
-    align_initial_timeout_sec = LaunchConfiguration("align_initial_timeout_sec")
-    align_min_base_z_mm = LaunchConfiguration("align_min_base_z_mm")
-    align_goal_pos_tol_mm = LaunchConfiguration("align_goal_pos_tol_mm")
-    align_goal_rot_tol_deg = LaunchConfiguration("align_goal_rot_tol_deg")
-    align_up_max_distance_mm = LaunchConfiguration("align_up_max_distance_mm")
-    align_up_speed_factor_percent = LaunchConfiguration("align_up_speed_factor_percent")
-    align_up_timeout_sec = LaunchConfiguration("align_up_timeout_sec")
-    align_up_user_index = LaunchConfiguration("align_up_user_index")
-    align_restore_speed_factor_percent = LaunchConfiguration("align_restore_speed_factor_percent")
+    align_distance_mm = ParameterValue(LaunchConfiguration("align_distance_mm"), value_type=float)
+    align_pose_speed_percent = ParameterValue(LaunchConfiguration("align_pose_speed_percent"), value_type=int)
+    align_visible_max_age_sec = ParameterValue(LaunchConfiguration("align_visible_max_age_sec"), value_type=float)
+    align_initial_timeout_sec = ParameterValue(LaunchConfiguration("align_initial_timeout_sec"), value_type=float)
+    align_min_base_z_mm = ParameterValue(LaunchConfiguration("align_min_base_z_mm"), value_type=float)
+    align_goal_pos_tol_mm = ParameterValue(LaunchConfiguration("align_goal_pos_tol_mm"), value_type=float)
+    align_goal_rot_tol_deg = ParameterValue(LaunchConfiguration("align_goal_rot_tol_deg"), value_type=float)
+    align_up_max_distance_mm = ParameterValue(LaunchConfiguration("align_up_max_distance_mm"), value_type=float)
+    align_up_speed_factor_percent = ParameterValue(
+        LaunchConfiguration("align_up_speed_factor_percent"),
+        value_type=int,
+    )
+    align_up_timeout_sec = ParameterValue(LaunchConfiguration("align_up_timeout_sec"), value_type=float)
+    align_up_user_index = ParameterValue(LaunchConfiguration("align_up_user_index"), value_type=int)
+    align_restore_speed_factor_percent = ParameterValue(
+        LaunchConfiguration("align_restore_speed_factor_percent"),
+        value_type=int,
+    )
 
     aruco_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -170,9 +183,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         _ros_domain_action(),
-        DeclareLaunchArgument("color_topic", default_value="/camera/color/image_raw"),
-        DeclareLaunchArgument("depth_topic", default_value="/camera/depth/image_raw"),
-        DeclareLaunchArgument("camera_info_topic", default_value="/camera/color/camera_info"),
+        DeclareLaunchArgument("color_topic", default_value="/robot_camera/color/image_raw"),
+        DeclareLaunchArgument("depth_topic", default_value="/robot_camera/depth/image_raw"),
+        DeclareLaunchArgument("camera_info_topic", default_value="/robot_camera/color/camera_info"),
         DeclareLaunchArgument("use_calibration", default_value="true"),
         DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
         DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
@@ -185,7 +198,7 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_frame", default_value="calibrated_camera_link"),
         DeclareLaunchArgument("use_platform_calibration", default_value="true"),
         DeclareLaunchArgument("auto_discover_platform_calibration", default_value="true"),
-        DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("teach", "platform")),
+        DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("calibration")),
         DeclareLaunchArgument("platform_calibration_file", default_value=""),
         DeclareLaunchArgument("marker_prefix", default_value="aruco_marker"),
         DeclareLaunchArgument("overlay_topic", default_value="/aruco_overlay"),

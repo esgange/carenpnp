@@ -101,13 +101,13 @@ def generate_launch_description():
         [
             _ros_domain_action(),
             DeclareLaunchArgument(
-                "color_topic", default_value="/camera/color/image_raw"
+                "color_topic", default_value="/robot_camera/color/image_raw"
             ),
             DeclareLaunchArgument(
-                "depth_topic", default_value="/camera/depth/image_raw"
+                "depth_topic", default_value="/robot_camera/depth/image_raw"
             ),
             DeclareLaunchArgument(
-                "camera_info_topic", default_value="/camera/color/camera_info"
+                "camera_info_topic", default_value="/robot_camera/color/camera_info"
             ),
             DeclareLaunchArgument("enable_memory", default_value="true"),
             DeclareLaunchArgument("memory_voxel_size", default_value="0.03"),
@@ -145,7 +145,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "calibration_file",
                 default_value="",
-                description="Optional explicit calibration YAML; empty means auto-discover newest in calibration_dir.",
+                description="Optional explicit calibration YAML; empty means auto-discover newest eye-on-hand calibration in calibration_dir.",
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(

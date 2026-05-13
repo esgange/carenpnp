@@ -1,0 +1,25 @@
+transform:
+  translation:
+    x: 0.275462320
+    y: 0.214143494
+    z: 0.012809495
+  rotation:
+    x: 0.010640836
+    y: -0.000964997
+    z: 0.697513379
+    w: 0.716492099
+metadata:
+  calibration_type: platform_reference
+  platform_name: robot_platform_1
+  transform_parent_frame: base_link
+  transform_child_frame: robot_platform_1
+  transform_type: base_to_platform
+  observed_board_frame: platform_board_observed
+  camera_frame: calibrated_camera_link
+  marker_prefix: aruco_marker
+  marker_ids: [1, 2, 3, 4]
+  units:
+    rotation: quaternion
+    translation: meter
+timestamp: '2026-05-04T09:30:51.958977'
+notes: 'Platform calibration is the saved pose of the calibration board in the robot base frame. Bin teach transforms are saved relative to this platform frame.'

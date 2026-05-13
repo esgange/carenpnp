@@ -1,10 +1,10 @@
 item_teach_yolo:
   ros__parameters:
-    color_topic: /camera/color/image_raw
+    color_topic: /robot_camera/color/image_raw
     joint_states_topic: /joint_states_robot
     item_name: item
-    depth_topic: /camera/depth/image_raw
-    camera_info_topic: /camera/color/camera_info
+    depth_topic: /robot_camera/depth/image_raw
+    camera_info_topic: /robot_camera/color/camera_info
     overlay_topic: bin_overlay
     sam2_config: configs/sam2.1/sam2.1_hiera_t.yaml
     train_epochs: 80

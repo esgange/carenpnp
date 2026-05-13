@@ -60,7 +60,7 @@ def workspace_path(*parts: str) -> Path:
     return workspace_root().joinpath(*parts)
 
 
-DEFAULT_SCRIPTS_DIR = workspace_path('config', 'motion_debug_scripts')
+DEFAULT_SCRIPTS_DIR = workspace_path('config', 'motion_calibrate')
 
 
 def _default_output_file() -> Path:

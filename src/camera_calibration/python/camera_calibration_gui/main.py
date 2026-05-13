@@ -91,6 +91,14 @@ def normalize_calibration_mode(value):
   return CALIB_MODE_EYE_ON_HAND
 
 
+def calibration_mode_filename_token(mode):
+  return "eyetohand" if normalize_calibration_mode(mode) == CALIB_MODE_EYE_TO_HAND else "eyeonhand"
+
+
+def calibration_filename_for_mode(mode):
+  return f"axab_calibration_{calibration_mode_filename_token(mode)}_{datetime.now().strftime('%d%m%Y')}.yaml"
+
+
 def parse_joint_values_from_robot_return(text):
   raw = str(text or "")
   if not raw:
@@ -108,20 +116,27 @@ def parse_joint_values_from_robot_return(text):
   return None
 
 
-def default_output_path():
+def default_output_path(mode=CALIB_MODE_EYE_ON_HAND):
   calib_dir = workspace_path("calibration")
   try:
     calib_dir.mkdir(parents=True, exist_ok=True)
   except Exception:
     pass
-  return str(calib_dir / "axab_calibration.yaml")
+  return str(calib_dir / calibration_filename_for_mode(mode))
 
 
-def normalize_output_path_setting(path_text):
-  path = Path(str(path_text or "").strip()).expanduser()
-  if path.name.startswith("axab_calibration_") and path.suffix == ".yaml":
-    return default_output_path()
-  return str(path) if str(path) else default_output_path()
+def is_standard_calibration_filename_for_mode(name, mode):
+  return name.startswith(f"axab_calibration_{calibration_mode_filename_token(mode)}_") and name.endswith(".yaml")
+
+
+def normalize_output_path_setting(path_text, mode=CALIB_MODE_EYE_ON_HAND):
+  raw_text = str(path_text or "").strip()
+  if not raw_text:
+    return default_output_path(mode)
+  path = Path(raw_text).expanduser()
+  if not is_standard_calibration_filename_for_mode(path.name, mode):
+    return default_output_path(mode)
+  return str(path)
 
 
 def rpy_deg_to_quaternion(roll_deg, pitch_deg, yaw_deg):
@@ -900,7 +915,11 @@ class CalibGui(QtWidgets.QWidget):
     return values
 
   def _on_calibration_mode_changed(self, *_):
-    self.ros_if.apply_calibration_mode_tool(self._current_calibration_mode())
+    mode = self._current_calibration_mode()
+    self.ros_if.apply_calibration_mode_tool(mode)
+    output_name = Path(self.output_path.text().strip()).expanduser().name
+    if not is_standard_calibration_filename_for_mode(output_name, mode):
+      self.output_path.setText(default_output_path(mode))
     if self.generated_goals and (not self.auto_running):
       self.generated_goals = []
       self.start_btn.setEnabled(False)
@@ -908,10 +927,11 @@ class CalibGui(QtWidgets.QWidget):
     self._save_setting(
       "calibration_mode",
       "Calibration mode",
-      self._current_calibration_mode(),
+      mode,
       display_value=self.calibration_mode.currentText(),
       emit_log=True,
     )
+    self._save_setting("output_path", "Output YAML path", self.output_path.text().strip(), emit_log=False)
     self._update_window_title()
     self._update_mode_dependent_ui()
 
@@ -991,7 +1011,10 @@ class CalibGui(QtWidgets.QWidget):
     self.camera_frame.setText(self._read_text_setting("camera_frame", self.camera_frame.text()))
     self.target_frame.setText(self._read_text_setting("target_frame", self.target_frame.text()))
     self.output_path.setText(
-      normalize_output_path_setting(self._read_text_setting("output_path", self.output_path.text()))
+      normalize_output_path_setting(
+        self._read_text_setting("output_path", self.output_path.text()),
+        self._current_calibration_mode(),
+      )
     )
     self.tag_tool_offset.setText(
       self._read_text_setting("tag_tool_offset", self.tag_tool_offset.text())
@@ -1222,6 +1245,11 @@ class CalibGui(QtWidgets.QWidget):
     if self.calib_process is not None:
       return True
 
+    output_path = normalize_output_path_setting(self.output_path.text(), self._current_calibration_mode())
+    if output_path != self.output_path.text().strip():
+      self.output_path.setText(output_path)
+      self._save_setting("output_path", "Output YAML path", output_path, emit_log=False)
+
     cmd = [
       "ros2",
       "run",
@@ -1239,7 +1267,7 @@ class CalibGui(QtWidgets.QWidget):
       "-p",
       f"target_frame:={self.target_frame.text()}",
       "-p",
-      f"output_path:={self.output_path.text()}",
+      f"output_path:={output_path}",
       "-p",
       f"min_samples:={self.min_samples.value()}",
     ]

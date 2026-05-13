@@ -26,6 +26,15 @@ source install/setup.bash
 ros2 launch item_pick_servo item_pick_servo.launch.py
 ```
 
+ServoP point runtimes can be adjusted from launch:
+
+```bash
+ros2 launch item_pick_servo item_pick_servo.launch.py \
+  item_approach_servo_p_t_sec:=1.5 \
+  item_final_z_up_servo_p_t_sec:=1.0 \
+  return_to_tray_teach_servo_j_t_sec:=1.5
+```
+
 Direct run:
 
 ```bash
@@ -39,15 +48,25 @@ ros2 run item_pick_servo item_pick_servo
 | `bin_seek_pose` | `geometry_msgs/msg/PoseStamped` | `item_detect` selected item pose. |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | DOBOT bringup TCP feedback. |
 | `item_detect_selected_profile.txt` | text file | Active profile exported by `item_detect`. |
+| `tray_detect_runtime_settings.yaml` or `tray_teach_settings.yaml` | YAML file | Tray perception teach joints for the final teach-return move. |
 
 The active profile export is read from:
 
 ```text
-WORKSPACE_ROOT/config/bins/item_detect_selected_profile.txt
+WORKSPACE_ROOT/config/item_perception/item_detect_selected_profile.txt
 ```
 
-The old `bin_detect_selected_profile.txt` path is still accepted as a fallback
-so existing teach files do not break during migration.
+GUI runtime settings are saved to:
+
+```text
+WORKSPACE_ROOT/config/item_perception/item_pick_servo_runtime_settings.json
+```
+
+Tray teach/runtime state for the final teach-return move is read from:
+
+```text
+WORKSPACE_ROOT/config/tray_perception
+```
 
 ## Services
 
@@ -81,6 +100,8 @@ Main robot services used:
 - `Stop`
 - `MovL`
 - `MovLIO`
+- `ServoP`
+- `ServoJ`
 - `DO`
 
 ## Tool Teach Sidecars
@@ -92,7 +113,7 @@ and pickup-depth settling for the active item teach.
 Sidecar pattern:
 
 ```text
-WORKSPACE_ROOT/teach/items/<item_name>_tool.yaml
+WORKSPACE_ROOT/teach/item_teach/<item_name>_tool.yaml
 ```
 
 The GUI can:
@@ -110,14 +131,19 @@ On trigger, the node arms for a fresh `bin_seek_pose`. When the pose arrives, it
 2. Prefers the pose that keeps `calibrated_camera_link` inside the active bin
    teach footprint. If both are outside, it logs a warning and continues with
    the preferred pose anyway.
-3. Moves with `MovL` to the approach pose above the pick goal.
+3. Moves with `ServoP` to the approach pose above the pick goal, using
+   `t=item_approach_servo_p_t_sec` default `1.5`, `aheadtime=50`, and `gain=500`.
 4. Opens the gripper with suction off, then waits the configured pre-pick
    settling time.
 5. Uses `MovLIO` at 6% speed factor to move to pick depth while triggering
    suction at the start of the descent, waits for TCP reach, then waits the
    configured pick settling time at pickup depth.
-6. Closes the gripper, retracts to approach, waits for TCP reach, then moves to
-   final Z-up at 100% speed factor.
+6. Closes the gripper, retracts to approach with `MovL`, waits for TCP reach,
+   then moves to final Z-up with `ServoP` using
+   `t=item_final_z_up_servo_p_t_sec` default `1.0`.
+7. Reads the active tray perception teach profile and queues a final `ServoJ`
+   return to that tray teach joint pose using
+   `t=return_to_tray_teach_servo_j_t_sec` default `1.5`.
 
 Camera-bin pose preference can be disabled with `prefer_camera_inside_bin:=false`.
 The checked frames default to `Link6` and `calibrated_camera_link`.

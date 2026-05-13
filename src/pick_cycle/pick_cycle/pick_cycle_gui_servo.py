@@ -15,12 +15,10 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 
 
-ITEM_GO_TO_TEACH_SERVICE_DEFAULT = 'item_detect/go_to_teach'
 ITEM_ARM_SERVICE_DEFAULT = 'item_pick_servo/track'
 ITEM_ARM_STATUS_SERVICE_DEFAULT = 'item_pick_servo/track_status'
 ITEM_SEEK_SERVICE_DEFAULT = 'item_detect/seek'
 ITEM_SEEK_STATUS_SERVICE_DEFAULT = 'item_detect/seek_status'
-TRAY_GO_TO_TEACH_SERVICE_DEFAULT = 'tray_detect/go_to_teach'
 TRAY_ARM_SERVICE_DEFAULT = 'tray_intercept_servo/start_sequence'
 TRAY_ARM_STATUS_SERVICE_DEFAULT = 'tray_intercept_servo/track_status'
 TRAY_SEEK_SERVICE_DEFAULT = 'tray_detect/seek'
@@ -284,10 +282,6 @@ class BackgroundMovementTracker:
 class PickCycleNode(Node):
     def __init__(self) -> None:
         super().__init__('pick_cycle_gui_servo')
-        self.item_go_to_teach_service = self._declare_name_parameter(
-            'item_go_to_teach_service',
-            ITEM_GO_TO_TEACH_SERVICE_DEFAULT,
-        )
         self.item_arm_service = self._declare_name_parameter(
             'item_arm_service',
             ITEM_ARM_SERVICE_DEFAULT,
@@ -303,10 +297,6 @@ class PickCycleNode(Node):
         self.item_seek_status_service = self._declare_name_parameter(
             'item_seek_status_service',
             ITEM_SEEK_STATUS_SERVICE_DEFAULT,
-        )
-        self.tray_go_to_teach_service = self._declare_name_parameter(
-            'tray_go_to_teach_service',
-            TRAY_GO_TO_TEACH_SERVICE_DEFAULT,
         )
         self.tray_arm_service = self._declare_name_parameter(
             'tray_arm_service',
@@ -331,10 +321,6 @@ class PickCycleNode(Node):
         self._tray_arm_client = self.create_client(TrayInterceptStart, self.tray_arm_service)
 
         self._trigger_clients: dict[str, tuple[str, object]] = {
-            'item_go_to_teach': (
-                self.item_go_to_teach_service,
-                self.create_client(Trigger, self.item_go_to_teach_service),
-            ),
             'item_arm': (
                 self.item_arm_service,
                 self.create_client(Trigger, self.item_arm_service),
@@ -350,10 +336,6 @@ class PickCycleNode(Node):
             'item_seek_status': (
                 self.item_seek_status_service,
                 self.create_client(Trigger, self.item_seek_status_service),
-            ),
-            'tray_go_to_teach': (
-                self.tray_go_to_teach_service,
-                self.create_client(Trigger, self.tray_go_to_teach_service),
             ),
             'tray_arm_status': (
                 self.tray_arm_status_service,
@@ -387,12 +369,10 @@ class PickCycleNode(Node):
 
     def service_names(self) -> list[tuple[str, str]]:
         return [
-            ('Item Go Teach', self.item_go_to_teach_service),
             ('Item Pick Arm', self.item_arm_service),
             ('Item Pick Arm Status', self.item_arm_status_service),
             ('Item Seek', self.item_seek_service),
             ('Item Seek Status', self.item_seek_status_service),
-            ('Tray Go Teach', self.tray_go_to_teach_service),
             ('Tray Intercept Arm Start', self.tray_arm_service),
             ('Tray Intercept Arm Status', self.tray_arm_status_service),
             ('Tray Seek', self.tray_seek_service),
@@ -982,34 +962,28 @@ class PickCycleGui:
 
     def _run_one_cycle(self, config: CycleConfig, cycle_index: int) -> bool:
         self._set_robot_status(ROBOT_STATUS_PICKING)
-        if not (
-            self._go_to_teach_step(cycle_index, 'Go to item detect teach', 'item_go_to_teach')
-            and self._seek_step(
-                cycle_index,
-                'Arm item pick',
-                'item_arm',
-                'item_arm_status',
-                'Seek item detect',
-                'item_seek',
-                'item_seek_status',
-                config,
-            )
+        if not self._seek_step(
+            cycle_index,
+            'Arm item pick',
+            'item_arm',
+            'item_arm_status',
+            'Seek item detect',
+            'item_seek',
+            'item_seek_status',
+            config,
         ):
             return False
 
         self._set_robot_status(ROBOT_STATUS_PLACING)
-        return (
-            self._go_to_teach_step(cycle_index, 'Go to tray detect teach', 'tray_go_to_teach')
-            and self._seek_step(
-                cycle_index,
-                'Arm tray intercept',
-                'tray_arm',
-                'tray_arm_status',
-                'Seek tray detect',
-                'tray_seek',
-                'tray_seek_status',
-                config,
-            )
+        return self._seek_step(
+            cycle_index,
+            'Arm tray intercept',
+            'tray_arm',
+            'tray_arm_status',
+            'Seek tray detect',
+            'tray_seek',
+            'tray_seek_status',
+            config,
         )
 
     def _click_step(
@@ -1029,18 +1003,6 @@ class PickCycleGui:
         success_label = 'OK' if wait_response_sec is not None else 'SENT'
         self._log(f'[{cycle_index}] {label}: {success_label if result.success else "FAIL"} - {result.message}')
         return result.success and not self._stop_event.is_set()
-
-    def _go_to_teach_step(
-        self,
-        cycle_index: int,
-        label: str,
-        client_key: str,
-    ) -> bool:
-        if not self._click_step(cycle_index, label, client_key):
-            return False
-
-        self._log(f'[{cycle_index}] {label}: dispatched; next step will arm.')
-        return not self._stop_event.is_set()
 
     def _seek_step(
         self,

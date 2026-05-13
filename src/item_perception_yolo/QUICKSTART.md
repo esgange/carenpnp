@@ -1,7 +1,6 @@
 # item_perception_yolo Quickstart
 
-This quickstart covers the normal teach-then-detect flow. See
-`README.md` for the full profile contract and runtime behavior.
+This quickstart covers the YOLO/SAM2 teach-then-detect flow.
 
 ## 1. Build
 
@@ -12,7 +11,7 @@ colcon build --packages-select item_perception_yolo
 source install/setup.bash
 ```
 
-## 2. Teach an Item Profile
+## 2. Teach A Bin ROI
 
 If this robot setup does not already have a platform reference, create it once:
 
@@ -26,65 +25,44 @@ Then teach or update the bin:
 ros2 launch item_perception_yolo bin_teach.launch.py
 ```
 
-`bin_teach` auto-loads the one active platform calibration from
-`WORKSPACE_ROOT/teach/platform` and saves the bin pose in that platform
-frame.
+## 3. Teach A YOLO Item
 
 ```bash
-ros2 launch item_perception_yolo item_teach.launch.py
+ros2 launch item_perception_yolo item_teach_yolo.launch.py item_name:=paper_cutlery
 ```
-
-This opens the interactive teach UI.
 
 Teach flow:
 
-1. Load a saved `bin_teach` profile, or select the RGB ROI manually.
-2. Tune RGB thresholds and select `Focus White` or `Focus Black`.
-3. Use the loaded bin-teach reference depth plane, or manually select four depth-plane corners if no bin plane is available.
-4. Tune depth null fill, depth window, depth hole fill, and depth trim.
-5. Enter the pose stage.
-6. Teach either one single blob or a two-blob pair (`1/2` and `2/2`).
-7. Confirm the overlay, including ROI, depth plane, blob hulls, group hull, and pose axes.
-8. Save the item profile.
+1. Load the saved bin teach profile.
+2. Left-click positive SAM2 prompts on the item.
+3. Right-click negative prompts if the mask includes unwanted pixels.
+4. Save one or more samples.
+5. Train YOLO11.
 
-Saved profiles are written to:
+The YOLO profile is written to:
 
 ```text
-WORKSPACE_ROOT/teach/items/item_<name>_<ddmmyyyy>.yaml
-WORKSPACE_ROOT/teach/items/item_<name>_bin_<associated_bin>_<ddmmyyyy>.yaml
+WORKSPACE_ROOT/teach/bins_yolo/profiles/item_<item>[_bin_<bin>]_yolo_<date>.yaml
 ```
 
-The item name and bin name are independent. Loading `blue_bin` in `item_teach`
-associates the saved item profile with that bin, reuses/scales its ROI, and uses
-the same four corner points for the depth-normalize plane.
-
-New bin-teach profiles are saved as:
+The trained model bundle is written under:
 
 ```text
-WORKSPACE_ROOT/teach/bin_teach/<name>.yaml
+WORKSPACE_ROOT/teach/bins_yolo/models
 ```
 
-The bin-teach file stores both the ROI corners and the bin reference depth plane.
-`item_teach` inherits that plane so every item taught in the same bin uses the
-same depth baseline.
-
-In `item_teach`, use `Delete` beside the Bin Teach dropdown, then confirm with a
-second click, to remove the selected bin-teach file. Use `Back` to revisit
-earlier teach stages; inherited bin depth planes stay loaded when you step back
-to tune RGB settings.
-
-## 3. Run Detection
+## 4. Run YOLO Detection
 
 ```bash
-ros2 launch item_perception_yolo item_detect.launch.py
+ros2 launch item_perception_yolo item_detect_yolo.launch.py
 ```
 
 Default outputs:
 
 - `/bin_overlay`
 - `/bin_item_poses`
-- `/bin_pose`
+- `/bin_seek_pose`
 - `/bin_cube_marker`
 
-Use the top dropdown to select a profile. Use `Delete Item` to remove the
-selected dated profile from disk and refresh the dropdown.
+Use the top dropdown to select a YOLO profile. Use `Delete Item` to remove the
+selected YOLO profile and associated model bundle from disk.

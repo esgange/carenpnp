@@ -132,39 +132,55 @@ ros2 service call /compute_calibration std_srvs/srv/Trigger {}
 Default output path:
 
 ```text
-WORKSPACE_ROOT/calibration/axab_calibration.yaml
+WORKSPACE_ROOT/calibration/axab_calibration_<mode>_<ddmmyyyy>.yaml
 ```
 
-Saved YAML includes:
+Mode tokens are `eyeonhand` and `eyetohand`, for example
+`axab_calibration_eyeonhand_09052026.yaml`.
 
-- transform rotation and translation;
-- Euler angles for review;
-- calibration mode and frame names;
-- parent/child frame metadata;
-- sample count and timestamp.
+Saved AX=XB camera calibration YAML is intentionally minimal:
+
+```yaml
+transform:
+  translation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+  rotation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0
+```
+
+Mode comes from the filename. Camera calibration readers expect this `transform`
+schema.
 
 The output is compatible with `aruco_perception`, `tray_perception`,
 `item_perception`, and `obstacle_perception`.
 
-Only one active camera calibration YAML is kept in the calibration directory.
-Saving a new calibration deletes older `axab_calibration_*.yaml` files before
-writing `axab_calibration.yaml`.
+Only one active camera calibration YAML per mode is kept in the calibration
+directory. Saving a new eye-on-hand calibration deletes older eye-on-hand files;
+saving a new eye-to-hand calibration deletes older eye-to-hand files.
 
 ## Platform Reference
 
 `platform_teach.launch.py` reuses the same four-marker calibration board, but
-loads the current camera calibration first. It averages markers `1, 2, 3, 4`
-into `platform_board_observed`, then saves the board pose as:
+loads the current camera calibration first. `platform_teach` now averages marker
+TFs `1, 2, 3, 4` internally into `platform_board_observed`, then saves the board
+pose as:
 
 ```text
-WORKSPACE_ROOT/teach/platform/platform_calibration_<platform_name>.yaml
+WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>.yaml
 ```
 
-Only one platform calibration is kept in that directory. Saving again deletes
-older `platform_calibration_*.yaml` files and writes the new one. The YAML stores
-`base_link -> <platform_name>` as `calibration_transform`, with metadata such as
-`platform_name`, `transform_parent_frame`, `transform_child_frame`,
-`observed_board_frame`, marker IDs, and timestamp.
+Only one platform calibration is kept in the calibration directory. Saving again deletes
+older `platform_calibration_*.yaml` files and writes the new one. Save becomes
+available after the internal board pose stays within 1 mm and 1 degree for one
+second. The YAML stores `base_link -> <platform_name>` as
+top-level `transform`, with metadata such as `platform_name`,
+`transform_parent_frame`, `transform_child_frame`, `observed_board_frame`,
+marker IDs, and timestamp.
 
 `bin_teach` auto-loads this platform file by default and saves bin transforms in
 the platform frame, while ROI dots remain normal RGB image pixel points.

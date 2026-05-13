@@ -817,7 +817,7 @@ std::filesystem::path expandUserPath(const std::string &raw)
 
 std::filesystem::path defaultPlatformCalibrationDir()
 {
-  return dobot_common::paths::workspacePath({"teach", "platform"}, __FILE__);
+  return dobot_common::paths::workspacePath({"calibration"}, __FILE__);
 }
 
 std::string exceptionMessage(const std::exception_ptr &eptr)
@@ -863,7 +863,7 @@ public:
       "platform_calibration_dir",
       defaultPlatformCalibrationDir().string());
     platform_calibration_file_ = declare_parameter<std::string>("platform_calibration_file", "");
-    color_topic_ = declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
+    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
     const std::string default_output_dir =
       dobot_common::paths::workspacePath({"teach", "bin_teach"}, __FILE__).string();
     const std::string bin_teach_dir_alias = declare_parameter<std::string>("bin_teach_dir", "");
@@ -1703,10 +1703,10 @@ public:
       return false;
     }
 
-    const auto calib = root["calibration_transform"];
+    const auto calib = root["transform"] ? root["transform"] : root["calibration_transform"];
     if (!calib)
     {
-      reason = "Missing 'calibration_transform' key";
+      reason = "Missing 'transform' key";
       return false;
     }
     const auto rot = calib["rotation"];

@@ -61,10 +61,13 @@ def _find_latest_calibration(calibration_dir: str) -> str:
         base = Path(calibration_dir).expanduser()
         if not base.exists() or not base.is_dir():
             return ""
-        yaml_files = [
-            p for p in base.iterdir()
-            if p.is_file() and p.suffix == ".yaml" and p.stat().st_size > 0
-        ]
+        yaml_files = []
+        for path in base.iterdir():
+            if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
+                continue
+            name = path.name
+            if name.startswith("axab_calibration_eyeonhand_"):
+                yaml_files.append(path)
         if not yaml_files:
             return ""
         latest = max(yaml_files, key=lambda p: p.stat().st_mtime)
@@ -181,19 +184,19 @@ def generate_launch_description():
         _ros_domain_action(),
         DeclareLaunchArgument(
             "params_file",
-            default_value=_repo_path("config", "trays", "tray_teach_settings.yaml"),
+            default_value=_repo_path("config", "tray_perception", "tray_teach_settings.yaml"),
         ),
         DeclareLaunchArgument(
             "color_topic",
-            default_value="/camera/color/image_raw",
+            default_value="/robot_camera/color/image_raw",
         ),
         DeclareLaunchArgument(
             "depth_topic",
-            default_value="/camera/depth/image_raw",
+            default_value="/robot_camera/depth/image_raw",
         ),
         DeclareLaunchArgument(
             "camera_info_topic",
-            default_value="/camera/color/camera_info",
+            default_value="/robot_camera/color/camera_info",
         ),
         DeclareLaunchArgument(
             "tray_pose_topic",

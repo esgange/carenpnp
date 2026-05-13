@@ -14,6 +14,7 @@
   <depend>sensor_msgs</depend>
   <depend>std_srvs</depend>
   <depend>visualization_msgs</depend>
+  <depend>orbbec_camera_msgs</depend>
   <depend>dobot_msgs_v4</depend>
   <depend>aruco_perception</depend>
   <depend>cv_bridge</depend>
@@ -24,6 +25,7 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-tk</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

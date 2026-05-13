@@ -1,11 +1,11 @@
-# Set ROS_DOMAIN_ID and ROS_LOCALHOST_ONLY from
-# WORKSPACE_ROOT/config/dobot_bringup_v4/param.json.
+# Set ROS_LOCALHOST_ONLY from WORKSPACE_ROOT/config/robot_bringup/param.json.
+# If the config still includes legacy ros_domain_id, export ROS_DOMAIN_ID too.
 
 _dobot_ros_domain_find_config() {
   _dobot_search="$1"
   while [ -n "$_dobot_search" ] && [ "$_dobot_search" != "/" ]; do
-    if [ -f "$_dobot_search/config/dobot_bringup_v4/param.json" ]; then
-      printf '%s\n' "$_dobot_search/config/dobot_bringup_v4/param.json"
+    if [ -f "$_dobot_search/config/robot_bringup/param.json" ]; then
+      printf '%s\n' "$_dobot_search/config/robot_bringup/param.json"
       return 0
     fi
     _dobot_search="$(dirname "$_dobot_search")"
@@ -15,9 +15,9 @@ _dobot_ros_domain_find_config() {
 
 _dobot_ros_domain_config=""
 if [ -n "$DOBOT_PICKN_PLACE_ROOT" ]; then
-  _dobot_ros_domain_config="$DOBOT_PICKN_PLACE_ROOT/config/dobot_bringup_v4/param.json"
+  _dobot_ros_domain_config="$DOBOT_PICKN_PLACE_ROOT/config/robot_bringup/param.json"
 elif [ -n "$DOBOT_WORKSPACE_ROOT" ]; then
-  _dobot_ros_domain_config="$DOBOT_WORKSPACE_ROOT/config/dobot_bringup_v4/param.json"
+  _dobot_ros_domain_config="$DOBOT_WORKSPACE_ROOT/config/robot_bringup/param.json"
 elif [ -n "$AMENT_CURRENT_PREFIX" ]; then
   _dobot_ros_domain_config="$(_dobot_ros_domain_find_config "$AMENT_CURRENT_PREFIX")"
 elif [ -n "$COLCON_CURRENT_PREFIX" ]; then
@@ -38,9 +38,13 @@ path = sys.argv[1]
 with open(path, 'r', encoding='utf-8') as stream:
     data = json.load(stream)
 
-domain_id = int(data.get('ros_domain_id', 0))
-if domain_id < 0 or domain_id > 232:
-    raise SystemExit(f'ros_domain_id must be between 0 and 232, got {domain_id}')
+domain_value = data.get('ros_domain_id')
+if domain_value is None or (isinstance(domain_value, str) and not domain_value.strip()):
+    domain_id = ''
+else:
+    domain_id = int(domain_value)
+    if domain_id < 0 or domain_id > 232:
+        raise SystemExit(f'ros_domain_id must be between 0 and 232, got {domain_id}')
 
 localhost_value = data.get('ros_localhost_only', False)
 if isinstance(localhost_value, bool):

@@ -53,7 +53,7 @@ def _show_missing_calibration_dialog(message: str) -> None:
         messagebox.showerror("Calibration File Missing", message + "\n\nClick OK to close launch.")
         root.destroy()
     except Exception as exc:
-        print(f"[item_detect.launch] Could not open GUI dialog: {exc}")
+        print(f"[item_detect_yolo.launch] Could not open GUI dialog: {exc}")
         print(message)
 
 
@@ -62,16 +62,19 @@ def _find_latest_calibration(calibration_dir: str) -> str:
         base = Path(calibration_dir).expanduser()
         if not base.exists() or not base.is_dir():
             return ""
-        yaml_files = [
-            p for p in base.iterdir()
-            if p.is_file() and p.suffix == ".yaml" and p.stat().st_size > 0
-        ]
+        yaml_files = []
+        for path in base.iterdir():
+            if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
+                continue
+            name = path.name
+            if name.startswith("axab_calibration_eyeonhand_"):
+                yaml_files.append(path)
         if not yaml_files:
             return ""
         latest = max(yaml_files, key=lambda p: p.stat().st_mtime)
         return str(latest)
     except Exception as exc:
-        print(f"[item_detect.launch] Failed to search calibrations in {calibration_dir}: {exc}")
+        print(f"[item_detect_yolo.launch] Failed to search calibrations in {calibration_dir}: {exc}")
         return ""
 
 
@@ -123,7 +126,7 @@ def _launch_setup(context, *args, **kwargs):
             selected_file = calibration_file
             if not _calibration_file_is_usable(selected_file):
                 msg = (
-                    "[item_detect.launch] calibration_file is set but missing/empty: "
+                    "[item_detect_yolo.launch] calibration_file is set but missing/empty: "
                     f"{selected_file}"
                 )
                 _show_missing_calibration_dialog(msg)
@@ -132,12 +135,12 @@ def _launch_setup(context, *args, **kwargs):
             selected_file = _find_latest_calibration(calibration_dir)
             if not selected_file:
                 msg = (
-                    "[item_detect.launch] No non-empty calibration YAML found in "
+                    "[item_detect_yolo.launch] No non-empty calibration YAML found in "
                     f"{calibration_dir}. Provide one via calibration_file:=<path>."
                 )
                 _show_missing_calibration_dialog(msg)
                 raise RuntimeError(msg)
-        print(f"[item_detect.launch] Using calibration file: {selected_file}")
+        print(f"[item_detect_yolo.launch] Using calibration file: {selected_file}")
 
     bin_camera_frame = camera_frame_override
     if not bin_camera_frame and use_calibration:
@@ -231,15 +234,15 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "color_topic",
-            default_value="/camera/color/image_raw",
+            default_value="/robot_camera/color/image_raw",
         ),
         DeclareLaunchArgument(
             "depth_topic",
-            default_value="/camera/depth/image_raw",
+            default_value="/robot_camera/depth/image_raw",
         ),
         DeclareLaunchArgument(
             "camera_info_topic",
-            default_value="/camera/color/camera_info",
+            default_value="/robot_camera/color/camera_info",
         ),
         DeclareLaunchArgument(
             "bin_pose_topic",

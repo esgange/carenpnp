@@ -106,9 +106,9 @@ class ItemProfile:
     model_path: str = ""
     model_pt_path: str = ""
     model_dir: str = ""
-    color_topic: str = "/camera/color/image_raw"
-    depth_topic: str = "/camera/depth/image_raw"
-    camera_info_topic: str = "/camera/color/camera_info"
+    color_topic: str = "/robot_camera/color/image_raw"
+    depth_topic: str = "/robot_camera/depth/image_raw"
+    camera_info_topic: str = "/robot_camera/color/camera_info"
     overlay_topic: str = "bin_overlay"
     roi_points: List[Tuple[float, float]] = field(default_factory=list)
     depth_plane: DepthPlane = field(default_factory=DepthPlane)
@@ -245,9 +245,9 @@ class ItemDetectYoloNode(Node):
             self.declare_parameter(
                 "model_root", str(workspace_path("teach", "bins_yolo", "models"))
             ).value)
-        self.color_topic = self.declare_parameter("color_topic", "/camera/color/image_raw").value
-        self.depth_topic = self.declare_parameter("depth_topic", "/camera/depth/image_raw").value
-        self.camera_info_topic = self.declare_parameter("camera_info_topic", "/camera/color/camera_info").value
+        self.color_topic = self.declare_parameter("color_topic", "/robot_camera/color/image_raw").value
+        self.depth_topic = self.declare_parameter("depth_topic", "/robot_camera/depth/image_raw").value
+        self.camera_info_topic = self.declare_parameter("camera_info_topic", "/robot_camera/color/camera_info").value
         self.overlay_topic = self.declare_parameter("overlay_topic", "bin_overlay").value
         self.seek_pose_topic = self.declare_parameter("bin_pose_topic", "bin_seek_pose").value
         self.item_pose_array_topic = self.declare_parameter("bin_item_pose_array_topic", "bin_item_poses").value
@@ -490,7 +490,7 @@ class ItemDetectYoloNode(Node):
             return
         try:
             root = yaml.safe_load(resolve_path(self.calibration_file).read_text(encoding="utf-8")) or {}
-            transform = root.get("calibration_transform", {})
+            transform = root.get("transform", {})
             translation = transform.get("translation", {})
             rotation = transform.get("rotation", {})
             msg = TransformStamped()

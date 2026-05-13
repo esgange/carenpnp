@@ -42,6 +42,12 @@ ros2 run tray_intercept tray_intercept
 The GUI automatically calls `tray_detect/get_tray_dimensions` to keep the tray
 preview size synced when the service is available.
 
+GUI runtime settings are saved to:
+
+```text
+WORKSPACE_ROOT/config/tray_perception/tray_intercept_runtime_settings.json
+```
+
 ## Services
 
 Service exposed by this package:

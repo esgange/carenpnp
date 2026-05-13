@@ -2,7 +2,7 @@
 
 Mini GUI for automating the existing item-pick and tray-intercept cycle.
 
-Default sequence:
+Default non-servo sequence:
 
 Startup gate:
 
@@ -25,6 +25,23 @@ Startup gate:
 10. Monitor robot TCP feedback until it is stable
 11. `/tray_detect/seek`
 12. Wait for `/tray_detect/seek_status` to turn on, then off
+
+Servo GUI sequence:
+
+1. `/item_pick_servo/track`
+2. Verify `/item_pick_servo/track_status` reports armed
+3. Monitor robot TCP feedback until it is stable
+4. `/item_detect/seek`
+5. Wait for `/item_detect/seek_status` to turn on, then off
+6. `/tray_intercept_servo/start_sequence` with the mini GUI tray X/Y/RZ settings
+7. Verify `/tray_intercept_servo/track_status` reports armed
+8. Monitor robot TCP feedback until it is stable
+9. `/tray_detect/seek`
+10. Wait for `/tray_detect/seek_status` to turn on, then off
+
+For the servo GUI, teach-return motion lives inside the motion packages:
+`item_pick_servo` returns to the active tray teach pose after item pick, and
+`tray_intercept_servo` returns to the active item teach pose after tray intercept.
 
 Item services and seek services are sent as virtual clicks. Tray arm uses
 `dobot_msgs_v4/srv/TrayInterceptStart` so the mini GUI can pass tray intercept
@@ -93,9 +110,10 @@ ros2 run pick_cycle pick_cycle_gui_servo
 ```
 
 `pick_cycle_gui` arms `item_pick` and `tray_intercept`. `pick_cycle_gui_servo`
-uses the shared `item_detect` and `tray_detect` services, but arms
-`item_pick_servo` and `tray_intercept_servo`. Do not run both cycles actively at
-the same time against the same robot.
+uses the shared `item_detect` and `tray_detect` seek services, but no longer
+calls either perception Go To Teach service directly. It arms `item_pick_servo`
+and `tray_intercept_servo`; those motion packages handle the servo teach-return
+moves. Do not run both cycles actively at the same time against the same robot.
 
 ## Background movement timing
 
@@ -104,7 +122,7 @@ TCP feedback topic in the background and logs a timing line after each detected
 physical movement settles, for example:
 
 ```text
-Movement tracker: Cycle 1: Go to item detect teach -> Cycle 1: Arm item pick travel took 2.34s (TCP delta 185.6mm, 0.0deg)
+Movement tracker: Cycle 1: Arm item pick -> Cycle 1: Seek item detect travel took 2.34s (TCP delta 185.6mm, 0.0deg)
 ```
 
 This tracker does not send robot commands, add sleeps, or change the cycle

@@ -123,8 +123,8 @@ private:
         return {};
       }
 
-      std::filesystem::path latest_path;
-      std::filesystem::file_time_type latest_time;
+      std::filesystem::path preferred_path;
+      std::filesystem::file_time_type preferred_time;
       for (const auto &entry : std::filesystem::directory_iterator(calib_dir))
       {
         if (!entry.is_regular_file())
@@ -140,13 +140,18 @@ private:
         {
           continue;
         }
-        if (latest_path.empty() || entry.last_write_time() > latest_time)
+        const std::string filename = p.filename().string();
+        if (filename.rfind("axab_calibration_eyeonhand_", 0) != 0)
         {
-          latest_path = p;
-          latest_time = entry.last_write_time();
+          continue;
+        }
+        if (preferred_path.empty() || entry.last_write_time() > preferred_time)
+        {
+          preferred_path = p;
+          preferred_time = entry.last_write_time();
         }
       }
-      return latest_path.string();
+      return preferred_path.string();
     }
     catch (const std::exception &ex)
     {
@@ -188,10 +193,10 @@ private:
       return false;
     }
 
-    auto calib = root["calibration_transform"];
+    auto calib = root["transform"];
     if (!calib)
     {
-      reason = "Missing 'calibration_transform' key";
+      reason = "Missing 'transform' key";
       return false;
     }
     auto rot = calib["rotation"];

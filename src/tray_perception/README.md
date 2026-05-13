@@ -39,9 +39,9 @@ Camera topic overrides:
 
 ```bash
 ros2 launch tray_perception tray_detect.launch.py \
-  color_topic:=/camera/color/image_raw \
-  depth_topic:=/camera/depth/image_raw \
-  camera_info_topic:=/camera/color/camera_info
+  color_topic:=/robot_camera/color/image_raw \
+  depth_topic:=/robot_camera/depth/image_raw \
+  camera_info_topic:=/robot_camera/color/camera_info
 ```
 
 ## Teach Workflow
@@ -97,9 +97,9 @@ dialog and exits.
 
 | Topic | Type |
 | --- | --- |
-| `/camera/color/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/depth/image_raw` | `sensor_msgs/msg/Image` |
-| `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
+| `/robot_camera/color/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/depth/image_raw` | `sensor_msgs/msg/Image` |
+| `/robot_camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` |
 
 ## Outputs
 
@@ -117,7 +117,7 @@ dialog and exits.
 Profiles are stored in:
 
 ```text
-WORKSPACE_ROOT/teach/trays
+WORKSPACE_ROOT/teach/tray_teach
 ```
 
 Current dated profiles use:
@@ -126,7 +126,13 @@ Current dated profiles use:
 tray_<name>_<ddmmyyyy>.yaml
 ```
 
-The compatibility/latest file is:
+Runtime state and the latest-profile alias are stored under:
+
+```text
+WORKSPACE_ROOT/config/tray_perception
+```
+
+The latest-profile alias is:
 
 ```text
 tray_teach_settings.yaml

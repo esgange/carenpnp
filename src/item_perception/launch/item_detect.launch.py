@@ -41,6 +41,13 @@ def _to_bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _to_int(value: str, name: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"[item_detect.launch] {name} must be an integer, got: {value!r}") from exc
+
+
 def _show_missing_calibration_dialog(message: str) -> None:
     try:
         import tkinter as tk
@@ -61,10 +68,13 @@ def _find_latest_calibration(calibration_dir: str) -> str:
         base = Path(calibration_dir).expanduser()
         if not base.exists() or not base.is_dir():
             return ""
-        yaml_files = [
-            p for p in base.iterdir()
-            if p.is_file() and p.suffix == ".yaml" and p.stat().st_size > 0
-        ]
+        yaml_files = []
+        for path in base.iterdir():
+            if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
+                continue
+            name = path.name
+            if name.startswith("axab_calibration_eyeonhand_"):
+                yaml_files.append(path)
         if not yaml_files:
             return ""
         latest = max(yaml_files, key=lambda p: p.stat().st_mtime)
@@ -89,6 +99,23 @@ def _launch_setup(context, *args, **kwargs):
     camera_info_topic = LaunchConfiguration("camera_info_topic").perform(context)
     bin_pose_topic = LaunchConfiguration("bin_pose_topic").perform(context)
     bin_item_pose_array_topic = LaunchConfiguration("bin_item_pose_array_topic").perform(context)
+    camera_control_service_root = LaunchConfiguration("camera_control_service_root").perform(context)
+    color_exposure_min_us = _to_int(
+        LaunchConfiguration("color_exposure_min_us").perform(context),
+        "color_exposure_min_us",
+    )
+    color_exposure_max_us = _to_int(
+        LaunchConfiguration("color_exposure_max_us").perform(context),
+        "color_exposure_max_us",
+    )
+    depth_exposure_min_us = _to_int(
+        LaunchConfiguration("depth_exposure_min_us").perform(context),
+        "depth_exposure_min_us",
+    )
+    depth_exposure_max_us = _to_int(
+        LaunchConfiguration("depth_exposure_max_us").perform(context),
+        "depth_exposure_max_us",
+    )
 
     use_calibration = _to_bool(LaunchConfiguration("use_calibration").perform(context))
     parent_frame = LaunchConfiguration("parent_frame").perform(context)
@@ -132,6 +159,11 @@ def _launch_setup(context, *args, **kwargs):
             "color_topic": color_topic,
             "depth_topic": depth_topic,
             "camera_info_topic": camera_info_topic,
+            "camera_control_service_root": camera_control_service_root,
+            "color_exposure_min_us": color_exposure_min_us,
+            "color_exposure_max_us": color_exposure_max_us,
+            "depth_exposure_min_us": depth_exposure_min_us,
+            "depth_exposure_max_us": depth_exposure_max_us,
             "bin_pose_topic": bin_pose_topic,
             "bin_item_pose_array_topic": bin_item_pose_array_topic,
             "camera_frame": bin_camera_frame,
@@ -192,15 +224,35 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "color_topic",
-            default_value="/camera/color/image_raw",
+            default_value="/robot_camera/color/image_raw",
         ),
         DeclareLaunchArgument(
             "depth_topic",
-            default_value="/camera/depth/image_raw",
+            default_value="/robot_camera/depth/image_raw",
         ),
         DeclareLaunchArgument(
             "camera_info_topic",
-            default_value="/camera/color/camera_info",
+            default_value="/robot_camera/color/camera_info",
+        ),
+        DeclareLaunchArgument(
+            "camera_control_service_root",
+            default_value="/robot_camera",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_max_us",
+            default_value="32000",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_max_us",
+            default_value="32000",
         ),
         DeclareLaunchArgument(
             "bin_pose_topic",

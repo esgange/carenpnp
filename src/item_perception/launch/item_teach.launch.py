@@ -5,6 +5,13 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+BIN_CAMERA_COLOR_TOPIC = "/bin_camera/color/image_raw"
+BIN_CAMERA_DEPTH_TOPIC = "/bin_camera/depth/image_raw"
+BIN_CAMERA_INFO_TOPIC = "/bin_camera/color/camera_info"
+BIN_CAMERA_CONTROL_SERVICE_ROOT = "/bin_camera"
 
 
 def _workspace_root() -> Path:
@@ -65,19 +72,39 @@ def generate_launch_description():
     color_topic = LaunchConfiguration("color_topic")
     depth_topic = LaunchConfiguration("depth_topic")
     camera_info_topic = LaunchConfiguration("camera_info_topic")
-    use_calibration = LaunchConfiguration("use_calibration")
-    publish_static_calibration_tf = LaunchConfiguration("publish_static_calibration_tf")
+    use_calibration = ParameterValue(LaunchConfiguration("use_calibration"), value_type=bool)
+    publish_static_calibration_tf = ParameterValue(
+        LaunchConfiguration("publish_static_calibration_tf"),
+        value_type=bool,
+    )
     calibration_parent_frame = LaunchConfiguration("calibration_parent_frame")
     calibration_child_frame = LaunchConfiguration("calibration_child_frame")
     calibration_dir = LaunchConfiguration("calibration_dir")
     calibration_file = LaunchConfiguration("calibration_file")
-    auto_discover_calibration = LaunchConfiguration("auto_discover_calibration")
-    publish_item_pose_array = LaunchConfiguration("publish_item_pose_array")
+    auto_discover_calibration = ParameterValue(
+        LaunchConfiguration("auto_discover_calibration"),
+        value_type=bool,
+    )
+    publish_item_pose_array = ParameterValue(
+        LaunchConfiguration("publish_item_pose_array"),
+        value_type=bool,
+    )
     item_pose_array_topic = LaunchConfiguration("item_pose_array_topic")
-    align_item_z_axis_to_depth_plane = LaunchConfiguration("align_item_z_axis_to_depth_plane")
+    align_item_z_axis_to_depth_plane = ParameterValue(
+        LaunchConfiguration("align_item_z_axis_to_depth_plane"),
+        value_type=bool,
+    )
+    camera_control_service_root = LaunchConfiguration("camera_control_service_root")
+    color_exposure_min_us = ParameterValue(LaunchConfiguration("color_exposure_min_us"), value_type=int)
+    color_exposure_max_us = ParameterValue(LaunchConfiguration("color_exposure_max_us"), value_type=int)
+    depth_exposure_min_us = ParameterValue(LaunchConfiguration("depth_exposure_min_us"), value_type=int)
+    depth_exposure_max_us = ParameterValue(LaunchConfiguration("depth_exposure_max_us"), value_type=int)
     bin_teach_dir = LaunchConfiguration("bin_teach_dir")
     motion_service_root = LaunchConfiguration("motion_service_root")
-    bin_roi_move_speed_percent = LaunchConfiguration("bin_roi_move_speed_percent")
+    bin_roi_move_speed_percent = ParameterValue(
+        LaunchConfiguration("bin_roi_move_speed_percent"),
+        value_type=int,
+    )
 
     return LaunchDescription([
         _ros_domain_action(),
@@ -87,15 +114,15 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "color_topic",
-            default_value="/camera/color/image_raw",
+            default_value=BIN_CAMERA_COLOR_TOPIC,
         ),
         DeclareLaunchArgument(
             "depth_topic",
-            default_value="/camera/depth/image_raw",
+            default_value=BIN_CAMERA_DEPTH_TOPIC,
         ),
         DeclareLaunchArgument(
             "camera_info_topic",
-            default_value="/camera/color/camera_info",
+            default_value=BIN_CAMERA_INFO_TOPIC,
         ),
         DeclareLaunchArgument(
             "use_calibration",
@@ -138,6 +165,26 @@ def generate_launch_description():
             default_value="true",
         ),
         DeclareLaunchArgument(
+            "camera_control_service_root",
+            default_value=BIN_CAMERA_CONTROL_SERVICE_ROOT,
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_max_us",
+            default_value="100",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_max_us",
+            default_value="32000",
+        ),
+        DeclareLaunchArgument(
             "bin_teach_dir",
             default_value=_repo_path("teach", "bin_teach"),
         ),
@@ -170,6 +217,11 @@ def generate_launch_description():
                     "publish_item_pose_array": publish_item_pose_array,
                     "item_pose_array_topic": item_pose_array_topic,
                     "align_item_z_axis_to_depth_plane": align_item_z_axis_to_depth_plane,
+                    "camera_control_service_root": camera_control_service_root,
+                    "color_exposure_min_us": color_exposure_min_us,
+                    "color_exposure_max_us": color_exposure_max_us,
+                    "depth_exposure_min_us": depth_exposure_min_us,
+                    "depth_exposure_max_us": depth_exposure_max_us,
                     "bin_teach_dir": bin_teach_dir,
                     "motion_service_root": motion_service_root,
                     "bin_roi_move_speed_percent": bin_roi_move_speed_percent,

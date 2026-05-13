@@ -26,11 +26,11 @@ ObstaclePerceptionNode::ObstaclePerceptionNode(const rclcpp::NodeOptions & optio
   neighbor_radius_voxels_ = declare_parameter<int>("neighbor_radius_voxels", 1);
   min_neighbor_voxels_ = declare_parameter<int>("min_neighbor_voxels", 10);
   color_topic_ =
-    declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
+    declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
   depth_topic_ =
-    declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
+    declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
   camera_info_topic_ =
-    declare_parameter<std::string>("camera_info_topic", "/camera/color/camera_info");
+    declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
 
   if (voxel_size_ <= 0.0) {
     RCLCPP_WARN(get_logger(), "voxel_size must be positive, defaulting to 0.05 m");

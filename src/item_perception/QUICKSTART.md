@@ -27,7 +27,7 @@ ros2 launch item_perception bin_teach.launch.py
 ```
 
 `bin_teach` auto-loads the one active platform calibration from
-`WORKSPACE_ROOT/teach/platform` and saves the bin pose in that platform
+`WORKSPACE_ROOT/calibration` and saves the bin pose in that platform
 frame.
 
 ```bash
@@ -50,8 +50,8 @@ Teach flow:
 Saved profiles are written to:
 
 ```text
-WORKSPACE_ROOT/teach/items/item_<name>_<ddmmyyyy>.yaml
-WORKSPACE_ROOT/teach/items/item_<name>_bin_<associated_bin>_<ddmmyyyy>.yaml
+WORKSPACE_ROOT/teach/item_teach/item_<name>_<ddmmyyyy>.yaml
+WORKSPACE_ROOT/teach/item_teach/item_<name>_bin_<associated_bin>_<ddmmyyyy>.yaml
 ```
 
 The item name and bin name are independent. Loading `blue_bin` in `item_teach`

@@ -817,7 +817,7 @@ std::filesystem::path expandUserPath(const std::string &raw)
 
 std::filesystem::path defaultPlatformCalibrationDir()
 {
-  return dobot_common::paths::workspacePath({"teach", "platform"}, __FILE__);
+  return dobot_common::paths::workspacePath({"calibration"}, __FILE__);
 }
 
 std::string exceptionMessage(const std::exception_ptr &eptr)
@@ -863,7 +863,7 @@ public:
       "platform_calibration_dir",
       defaultPlatformCalibrationDir().string());
     platform_calibration_file_ = declare_parameter<std::string>("platform_calibration_file", "");
-    color_topic_ = declare_parameter<std::string>("color_topic", "/camera/color/image_raw");
+    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
     const std::string default_output_dir =
       dobot_common::paths::workspacePath({"teach", "bin_teach"}, __FILE__).string();
     const std::string bin_teach_dir_alias = declare_parameter<std::string>("bin_teach_dir", "");
@@ -1491,7 +1491,7 @@ public:
       text << "      detection_index: " << observation.detection_index << "\n";
       text << "      same_id_index: " << observation.same_id_index << "\n";
     }
-    text << "  notes: \"transform origin is the center of the configured marker position bounds; marker positions are not averaged. Orientation normal is averaged from marker poses. roi_points are saved in item_teach-compatible color-image pixel order: upper-left, upper-right, lower-right, lower-left. depth_plane_* is fitted from ArUco marker center depths in normalized image coordinates and is the reference plane item_teach should inherit.\"\n";
+    text << "  notes: \"transform origin is the center of the configured marker position bounds; marker positions are not averaged. Orientation normal is averaged from marker poses. roi_points are saved in teach-compatible color-image pixel order: upper-left, upper-right, lower-right, lower-left. depth_plane_* is fitted from ArUco marker center depths in normalized image coordinates and is the reference plane for item perception teach flows.\"\n";
 
     std::ofstream output(path);
     output << text.str();
@@ -1703,10 +1703,10 @@ public:
       return false;
     }
 
-    const auto calib = root["calibration_transform"];
+    const auto calib = root["transform"] ? root["transform"] : root["calibration_transform"];
     if (!calib)
     {
-      reason = "Missing 'calibration_transform' key";
+      reason = "Missing 'transform' key";
       return false;
     }
     const auto rot = calib["rotation"];

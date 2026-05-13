@@ -122,7 +122,7 @@ QUEUED_MOTION_SERVICES = {
     f'{SERVICE_ROOT}/MovJ',
     f'{SERVICE_ROOT}/MovL',
 }
-SCRIPT_DIR_NAME = 'motion_debug_scripts'
+SCRIPT_DIR_NAME = 'motion_calibrate'
 SCRIPT_FILE_SUFFIX = '.json'
 SCRIPT_NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$')
 SCRIPT_POINT_PATTERN = re.compile(
@@ -189,7 +189,7 @@ TCP_WORKSPACE_PROFILES = {
 
 def _load_robot_type_from_bringup_config() -> str:
     candidate_paths: list[Path] = []
-    candidate_paths.append(workspace_path('config', 'dobot_bringup_v4', 'param.json'))
+    candidate_paths.append(workspace_path('config', 'robot_bringup', 'param.json'))
     try:
         candidate_paths.append(Path(get_package_share_path('cr_robot_ros2')) / 'config' / 'param.json')
     except Exception:
@@ -3081,14 +3081,6 @@ class MotionDebugApp:
                 normalized_points.append(normalized_point)
 
         loaded_speed_profile = payload.get('speed_profile')
-        if not isinstance(loaded_speed_profile, dict):
-            legacy_cp = payload.get('cp')
-            legacy_speed_factor = payload.get('speed_factor')
-            if legacy_cp is not None or legacy_speed_factor is not None:
-                loaded_speed_profile = {
-                    'cp': legacy_cp,
-                    'speed_factor': legacy_speed_factor,
-                }
         speed_profile_from_script = isinstance(loaded_speed_profile, dict)
         if speed_profile_from_script:
             applied_speed_profile = self.node.apply_script_speed_profile_cache(loaded_speed_profile)

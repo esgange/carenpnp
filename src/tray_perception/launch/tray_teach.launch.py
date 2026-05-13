@@ -74,15 +74,15 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "color_topic",
-            default_value="/camera/color/image_raw",
+            default_value="/robot_camera/color/image_raw",
         ),
         DeclareLaunchArgument(
             "depth_topic",
-            default_value="/camera/depth/image_raw",
+            default_value="/robot_camera/depth/image_raw",
         ),
         DeclareLaunchArgument(
             "camera_info_topic",
-            default_value="/camera/color/camera_info",
+            default_value="/robot_camera/color/camera_info",
         ),
         Node(
             package="tray_perception",

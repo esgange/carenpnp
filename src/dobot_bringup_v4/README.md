@@ -28,7 +28,7 @@ source install/setup.bash
 Robot connection settings are stored in:
 
 ```text
-WORKSPACE_ROOT/config/dobot_bringup_v4/param.json
+WORKSPACE_ROOT/config/robot_bringup/param.json
 ```
 
 Installed launches prefer the workspace-level config and fall back to the
@@ -40,12 +40,15 @@ Important fields:
 | --- | --- |
 | `robot_number` | Number of robot entries in the file. |
 | `current_robot` | 1-based index of the active robot entry. |
-| `ros_domain_id` | DDS domain used by this workspace. Sourcing `install/setup.bash` exports `ROS_DOMAIN_ID` from this value, and repo launch files set it before starting nodes. |
 | `ros_localhost_only` | When true, sourcing `install/setup.bash` exports `ROS_LOCALHOST_ONLY=1`, so ROS 2 discovery/topics stay on this computer. |
 | `node_info[].ip_address` | Robot controller IP address. |
 | `node_info[].robot_type` | Robot model, such as `cr5`, `cr10`, `cr16`, `me6`, or `nova5`. |
 | `node_info[].trajectory_duration` | Default trajectory duration parameter. |
 | `node_info[].robot_node_name` | ROS node name for bringup. |
+
+`ROS_DOMAIN_ID` is normally provided by the shell environment. A custom config
+may still include an optional legacy `ros_domain_id` field, and launch files
+will honor it when present.
 
 After sourcing the workspace, verify the ROS environment with:
 

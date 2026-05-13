@@ -25,6 +25,14 @@ source install/setup.bash
 ros2 launch tray_intercept_servo tray_intercept_servo.launch.py
 ```
 
+ServoP point runtime can be adjusted from launch:
+
+```bash
+ros2 launch tray_intercept_servo tray_intercept_servo.launch.py \
+  tray_post_follow_z_up_servo_p_t_sec:=1.0 \
+  return_to_item_teach_servo_j_t_sec:=1.5
+```
+
 Direct run:
 
 ```bash
@@ -38,9 +46,22 @@ ros2 run tray_intercept_servo tray_intercept_servo
 | `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | `tray_detect` motion estimate. |
 | `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | Live 2D tray origin and X/Y axes for the GUI preview. |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | DOBOT bringup TCP feedback. |
+| `item_detect_selected_profile.txt` | text file | Active item profile exported by `item_detect` for the final teach-return move. |
 
 The GUI automatically calls `tray_detect/get_tray_dimensions` to keep the tray
 preview size synced when the service is available.
+
+GUI runtime settings are saved to:
+
+```text
+WORKSPACE_ROOT/config/tray_perception/tray_intercept_servo_runtime_settings.json
+```
+
+The active item profile export for the final teach-return move is read from:
+
+```text
+WORKSPACE_ROOT/config/item_perception/item_detect_selected_profile.txt
+```
 
 ## Services
 
@@ -59,6 +80,9 @@ Robot services called under `/dobot_bringup_ros2/srv`:
 - `Stop`
 - `MovL`
 - `MovLIO`
+- `ServoP`
+- `ServoJ`
+- `DO`
 
 Example:
 
@@ -76,7 +100,12 @@ When armed, the node:
 3. Computes an intercept goal in `base_link`.
 4. Queues `MovL` to the intercept pose.
 5. Queues `MovL` or `MovLIO` to follow in the tray motion direction.
-6. Queues a post-follow Z-up move with continuous tray-direction follow.
+6. Waits for the follow goal, then sends final post-follow Z-up with `ServoP`
+   using `t=tray_post_follow_z_up_servo_p_t_sec` default `1.0`,
+   `aheadtime=50`, and `gain=500`.
+7. Reads the active item perception teach profile and queues a final `ServoJ`
+   return to that item teach joint pose using
+   `t=return_to_item_teach_servo_j_t_sec` default `1.5`.
 
 Troubleshoot mode publishes goal TFs only and does not send robot motion.
 The tray intercept move uses a fixed `650 mm/s` EE speed; the
@@ -84,7 +113,7 @@ The tray intercept move uses a fixed `650 mm/s` EE speed; the
 angle control sets a manual `-90..90 deg` final EE pose angle: negative rotates
 CCW, positive rotates CW, and zero preserves the current TCP orientation instead
 of aligning the EE to the tray axes. The tray-direction follow move still uses
-detected tray speed, and post-follow Z-up uses the configured arm max speed.
+detected tray speed, and post-follow Z-up uses ServoP runtime control.
 The tray standoff Z offset is applied in robot/base +Z, so positive Z remains
 an upward standoff even if the detected tray frame has a downward natural Z.
 Tray X/Y offsets are projected into the robot base XY plane before motion.

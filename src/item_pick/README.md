@@ -43,11 +43,14 @@ ros2 run item_pick item_pick
 The active profile export is read from:
 
 ```text
-WORKSPACE_ROOT/config/bins/item_detect_selected_profile.txt
+WORKSPACE_ROOT/config/item_perception/item_detect_selected_profile.txt
 ```
 
-The old `bin_detect_selected_profile.txt` path is still accepted as a fallback
-so existing teach files do not break during migration.
+GUI runtime settings are saved to:
+
+```text
+WORKSPACE_ROOT/config/item_perception/item_pick_runtime_settings.json
+```
 
 ## Services
 
@@ -92,7 +95,7 @@ and pickup-depth settling for the active item teach.
 Sidecar pattern:
 
 ```text
-WORKSPACE_ROOT/teach/items/<item_name>_tool.yaml
+WORKSPACE_ROOT/teach/item_teach/<item_name>_tool.yaml
 ```
 
 The GUI can:

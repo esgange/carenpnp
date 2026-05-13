@@ -33,7 +33,7 @@ def _workspace_root() -> Path:
 
 
 def _bringup_config_path() -> Path:
-    workspace_config = _workspace_root() / 'config' / 'dobot_bringup_v4' / 'param.json'
+    workspace_config = _workspace_root() / 'config' / 'robot_bringup' / 'param.json'
     if workspace_config.exists():
         return workspace_config
     bringup_share = get_package_share_path('cr_robot_ros2')

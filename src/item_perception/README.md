@@ -11,6 +11,7 @@ estimation, and optional robot seek/go-to-teach behavior.
 | --- | --- |
 | `item_teach` | Interactive OpenCV UI for teaching ROI, RGB thresholds, depth plane, depth mask tuning, and item pose references. |
 | `item_detect` | Runtime detector that loads taught profiles, tracks the selected bin, publishes poses and overlays, and manages profile selection/deletion. |
+| `item_detect_eyetohand` | Eye-to-hand runtime detector variant that defaults to the `/bin_camera` RGB-D stream. |
 | `bin_teach` | ArUco-assisted bin-frame teaching utility. |
 
 ## Build
@@ -38,6 +39,21 @@ Run detection:
 ros2 launch item_perception item_detect.launch.py
 ```
 
+`item_teach` defaults to the bin camera stream under `/bin_camera`. Normal
+runtime `item_detect` defaults to the robot camera stream under `/robot_camera`.
+Pass `color_topic`, `depth_topic`, `camera_info_topic`, and
+`camera_control_service_root` when using a different camera namespace.
+
+Run eye-to-hand detection on the dual-camera item stream:
+
+```bash
+ros2 launch item_perception item_detect_eyetohand.launch.py
+```
+
+By default this launch file subscribes to `/bin_camera/color/image_raw`,
+`/bin_camera/depth/image_raw`, and `/bin_camera/color/camera_info`, with camera
+controls rooted at `/bin_camera`.
+
 Teach a bin frame from ArUco markers:
 
 ```bash
@@ -47,7 +63,7 @@ ros2 launch item_perception bin_teach.launch.py
 By default, `bin_teach` now auto-loads the current platform calibration from:
 
 ```text
-WORKSPACE_ROOT/teach/platform/platform_calibration_<platform_name>.yaml
+WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>.yaml
 ```
 
 Create or update that file first with:
@@ -56,8 +72,8 @@ Create or update that file first with:
 ros2 launch camera_calibration platform_teach.launch.py platform_name:=robot_platform_1
 ```
 
-Set `use_platform_calibration:=false` only for the legacy camera-relative
-bin-teach workflow.
+Set `use_platform_calibration:=false` only when you intentionally want a
+camera-relative bin-teach workflow.
 Set `platform_calibration_file:=/abs/path/to/file.yaml` only when you want to
 override auto-discovery.
 
@@ -84,6 +100,8 @@ Both nodes default to the current eye-on-hand calibration workflow.
 
 1. Load a saved `bin_teach` profile, or select the RGB region of interest manually.
 2. Tune RGB thresholds and choose `Focus White` or `Focus Black`.
+   RGB exposure uses the `RGB Exposure us` slider: `0` keeps auto exposure and
+   `1-100` sends that value directly as microseconds. Depth exposure stays auto.
 3. Use the bin-teach reference depth plane, or manually select four depth-plane corners when no bin plane is available.
 4. Tune depth null fill, depth window, depth hole fill, and depth trim.
 5. Enter the pose stage.
@@ -132,7 +150,7 @@ it no longer clamps the scan to only pixels above the plane.
 Item profiles are saved in:
 
 ```text
-WORKSPACE_ROOT/teach/items
+WORKSPACE_ROOT/teach/item_teach
 ```
 
 Each saved profile uses this name pattern:
@@ -143,9 +161,8 @@ item_<name>_bin_<associated_bin>_<ddmmyyyy>.yaml
 ```
 
 The detector only lists real profile YAML files from the profiles directory.
-Legacy aggregate files such as `item_teach_settings.yaml` and
+Aggregate settings files such as `item_teach_settings.yaml` and
 `bin_teach_settings.yaml` are ignored and should not appear in the dropdown.
-Existing legacy `bin_<name>_<ddmmyyyy>.yaml` profiles remain loadable.
 
 Bin-teach profiles are saved in:
 
@@ -166,7 +183,11 @@ and records the platform calibration file under `platform_reference`. The saved
 Each file also saves the bin reference depth plane as `depth_plane_*` fields
 using the same `a*x_norm + b*y_norm + c` model consumed by item profiles.
 
-Older `bin_<name>_teach.yaml` bin-teach files remain loadable by `item_teach`.
+Runtime state files are stored under:
+
+```text
+WORKSPACE_ROOT/config/item_perception
+```
 
 Runtime state files:
 
@@ -186,6 +207,10 @@ refreshes the dropdown from disk.
 - ROI points and RGB threshold settings.
 - Focus mode and RGB cleanup parameters.
 - Depth mask parameters.
+- RGB/depth exposure settings:
+  - `color_exposure_us`
+  - `depth_exposure_us` is saved as `0` because depth exposure remains auto.
+  - legacy percent fields are still written for older profiles.
 - Normalized depth plane fields:
   - `depth_plane_enabled`
   - `depth_plane_a`
@@ -216,8 +241,7 @@ blob `2/2` independently, not only predict it from blob `1/2`:
 - `member_centers_norm`
 - `anchor_center_norm`
 
-Legacy pose keys may still be loaded for compatibility, but newly saved profiles
-use the explicit fields above.
+Saved profiles use the explicit pose fields above.
 
 ## Pose Orientation
 
@@ -254,8 +278,6 @@ source install/setup.bash
 ```
 
 - Restart `item_detect` after manually editing or deleting profile YAML files.
-- Prefer creating new dated teach profiles instead of editing old legacy
-  profiles by hand.
-- Old single-blob profiles remain supported. Old pair profiles without complete
-  companion hull or depth-plane data should be retaught so the detector has the
-  same assumptions used by current teach mode.
+- Prefer creating new dated teach profiles instead of editing profiles by hand.
+- Pair profiles without complete companion hull or depth-plane data should be
+  retaught so the detector has the same assumptions used by current teach mode.

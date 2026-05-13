@@ -15,9 +15,9 @@ source install/setup.bash
 
 Required camera inputs:
 
-- `/camera/color/image_raw`
-- `/camera/depth/image_raw`
-- `/camera/color/camera_info`
+- `/robot_camera/color/image_raw`
+- `/robot_camera/depth/image_raw`
+- `/robot_camera/color/camera_info`
 
 ## 2. Teach a Tray Profile
 
@@ -47,13 +47,13 @@ Teach flow:
 Saved profiles are written to:
 
 ```text
-WORKSPACE_ROOT/teach/trays/tray_<name>_<ddmmyyyy>.yaml
+WORKSPACE_ROOT/teach/tray_teach/tray_<name>_<ddmmyyyy>.yaml
 ```
 
 The compatibility/latest profile is also written as:
 
 ```text
-WORKSPACE_ROOT/config/trays/tray_teach_settings.yaml
+WORKSPACE_ROOT/config/tray_perception/tray_teach_settings.yaml
 ```
 
 ## 3. Run Detection
@@ -73,7 +73,7 @@ ros2 launch tray_perception tray_detect.launch.py \
 
 Detect mode:
 
-- loads valid tray profiles from `WORKSPACE_ROOT/teach/trays`;
+- loads valid tray profiles from `WORKSPACE_ROOT/teach/tray_teach`;
 - supports RGB or depth detection based on the selected profile;
 - publishes `tray_pose` after the seek confidence threshold is met;
 - publishes `tray_vector` with timing and velocity metadata;

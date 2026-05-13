@@ -51,7 +51,7 @@ ros2 run movement_calibration movement_calibration_gui
 Create calibration scripts with `motion_debug` in:
 
 ```text
-WORKSPACE_ROOT/config/motion_debug_scripts
+WORKSPACE_ROOT/config/motion_calibrate
 ```
 
 Default script names:
@@ -81,7 +81,7 @@ Services used:
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `scripts_dir` | `WORKSPACE_ROOT/config/motion_debug_scripts` | Folder containing calibration scripts. |
+| `scripts_dir` | `WORKSPACE_ROOT/config/motion_calibrate` | Folder containing calibration scripts. |
 | `script_names_csv` | `x_calibrate,y_calibrate,z_calibrate` | Scripts executed in order. |
 | `startup_cp` | `100` | Applied before calibration. |
 | `startup_speed_factor` | `50` | Applied before calibration. |

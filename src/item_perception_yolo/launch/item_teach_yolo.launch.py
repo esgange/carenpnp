@@ -8,6 +8,11 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+BIN_CAMERA_COLOR_TOPIC = "/bin_camera/color/image_raw"
+BIN_CAMERA_DEPTH_TOPIC = "/bin_camera/depth/image_raw"
+BIN_CAMERA_INFO_TOPIC = "/bin_camera/color/camera_info"
+
+
 def _workspace_root() -> Path:
     def looks_like_root(path: Path) -> bool:
         return (
@@ -90,15 +95,15 @@ def generate_launch_description():
             "params_file",
             default_value=_repo_path("src", "item_perception_yolo", "config", "item_teach_yolo.yaml"),
         ),
-        DeclareLaunchArgument("color_topic", default_value="/camera/color/image_raw"),
+        DeclareLaunchArgument("color_topic", default_value=BIN_CAMERA_COLOR_TOPIC),
         DeclareLaunchArgument("joint_states_topic", default_value="/joint_states_robot"),
         DeclareLaunchArgument("item_name", default_value="item"),
         DeclareLaunchArgument("bin_teach_dir", default_value=_repo_path("teach", "bin_teach")),
         DeclareLaunchArgument("runtime_root", default_value=_repo_path("teach", "bins_yolo", "runtime")),
         DeclareLaunchArgument("profile_dir", default_value=_repo_path("teach", "bins_yolo", "profiles")),
         DeclareLaunchArgument("model_root", default_value=_repo_path("teach", "bins_yolo", "models")),
-        DeclareLaunchArgument("depth_topic", default_value="/camera/depth/image_raw"),
-        DeclareLaunchArgument("camera_info_topic", default_value="/camera/color/camera_info"),
+        DeclareLaunchArgument("depth_topic", default_value=BIN_CAMERA_DEPTH_TOPIC),
+        DeclareLaunchArgument("camera_info_topic", default_value=BIN_CAMERA_INFO_TOPIC),
         DeclareLaunchArgument("overlay_topic", default_value="bin_overlay"),
         DeclareLaunchArgument(
             "sam2_checkpoint",
