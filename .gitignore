@@ -6,17 +6,31 @@ devel/
 
 # Local Python/SAM2 workspace
 .venv/
+third_party/.venv/
+third_party/.apt-cache/
+third_party/.apt-state/
 third_party/sam2/
 third_party/yolo/
+third_party/debs/*.deb
+third_party/debs/partial/
+!third_party/debs/.gitkeep
+!third_party/debs/SHA256SUMS
+!third_party/debs/apt-downloaded.lock
+third_party/wheels/*
+!third_party/wheels/.gitkeep
+!third_party/wheels/SHA256SUMS
 config/bins_yolo/runtime/
 runs/
 
 # Workspace runtime/generated data
 Log/
+runtime/
 debug files/
 teach/
-config/bins/
-config/trays/
+config/item_perception/
+config/item_perception_yolo/
+config/tray_perception/
+config/camera_bringup/
 calibration/*.yaml
 calibration/*.json
 calibration/*.csv
@@ -24,10 +38,11 @@ calibration/*.csv
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Calibration outputs
 src/camera_calibration/calib/axab_calibration_*.yaml
-!src/camera_calibration/calib/axab_calibration_01011970.yaml
+!src/camera_calibration/calib/axab_calibration_eyeonhand_01011970.yaml
 
 # Editor/system files
 .codex

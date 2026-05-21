@@ -18,7 +18,6 @@ inline bool isWorkspaceRoot(const std::filesystem::path &path)
   std::error_code ec;
   return std::filesystem::exists(path / "src", ec) &&
          (std::filesystem::exists(path / "README.md", ec) ||
-          std::filesystem::exists(path / "docker-compose.yml", ec) ||
           std::filesystem::exists(path / "src" / "dobot_msgs_v4", ec));
 }
 

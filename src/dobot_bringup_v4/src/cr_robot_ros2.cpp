@@ -126,8 +126,6 @@ void CRRobotRos2::init()
     std::string serviceRelMovLUser = kRobotName + "/dobot_bringup_ros2/srv/RelMovLUser";
     std::string serviceRelJointMovJ = kRobotName + "/dobot_bringup_ros2/srv/RelJointMovJ";
     std::string serviceGetCurrentCommandId = kRobotName + "/dobot_bringup_ros2/srv/GetCurrentCommandId";
-    std::string serviceServoJ = kRobotName + "/dobot_bringup_ros2/srv/ServoJ";
-    std::string serviceServoP = kRobotName + "/dobot_bringup_ros2/srv/ServoP";
     std::string topicFeedInfo = kRobotName + "/dobot_bringup_ros2/msg/FeedInfo";
 
     kServiceEnableRobot = this->create_service<dobot_msgs_v4::srv::EnableRobot>(serviceEnableRobot, std::bind(&CRRobotRos2::EnableRobot, this, std::placeholders::_1, std::placeholders::_2));
@@ -218,8 +216,6 @@ void CRRobotRos2::init()
     kServiceRelMovLUser = this->create_service<dobot_msgs_v4::srv::RelMovLUser>(serviceRelMovLUser, std::bind(&CRRobotRos2::RelMovLUser, this, std::placeholders::_1, std::placeholders::_2));
     kServiceRelJointMovJ = this->create_service<dobot_msgs_v4::srv::RelJointMovJ>(serviceRelJointMovJ, std::bind(&CRRobotRos2::RelJointMovJ, this, std::placeholders::_1, std::placeholders::_2));
     kServiceGetCurrentCommandId = this->create_service<dobot_msgs_v4::srv::GetCurrentCommandId>(serviceGetCurrentCommandId, std::bind(&CRRobotRos2::GetCurrentCommandId, this, std::placeholders::_1, std::placeholders::_2));
-    kServiceServoJ = this->create_service<dobot_msgs_v4::srv::ServoJ>(serviceServoJ, std::bind(&CRRobotRos2::ServoJ, this, std::placeholders::_1, std::placeholders::_2));
-    kServiceServoP = this->create_service<dobot_msgs_v4::srv::ServoP>(serviceServoP, std::bind(&CRRobotRos2::ServoP, this, std::placeholders::_1, std::placeholders::_2));
 
     //kTimer = this->create_wall_timer(std::chrono::seconds(2), std::bind(&CRRobotRos2::backendTask, this));
     commander_ = std::make_shared<CRCommanderRos2>(robotIp);
@@ -1085,14 +1081,3 @@ bool CRRobotRos2::GetCurrentCommandId(const std::shared_ptr<dobot_msgs_v4::srv::
 {
     return commander_->callRosService_f(parseTool::parserGetCurrentCommandIdRequest2String(request), response->res,response->robot_return);
 }
-
-bool CRRobotRos2::ServoJ(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Response> response)
-{
-    return commander_->callRosService(parseTool::parserServoJRequest2String(request), response->res);
-}
-
-bool CRRobotRos2::ServoP(const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Response> response)
-{
-    return commander_->callRosService(parseTool::parserServoPRequest2String(request), response->res);
-}
-

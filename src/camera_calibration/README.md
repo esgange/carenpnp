@@ -43,7 +43,17 @@ Mode override:
 ros2 launch camera_calibration camera_calibration.launch.py calibration_mode:=eye_to_hand
 ```
 
-Camera topic overrides:
+Camera calibration chooses topics from `camera_prefix`. With
+`camera_prefix:=auto`, `eye_on_hand` uses `robot_camera` and `eye_to_hand` uses
+`bin_camera`:
+
+```bash
+ros2 launch camera_calibration camera_calibration.launch.py \
+  calibration_mode:=eye_to_hand \
+  camera_prefix:=bin_camera
+```
+
+Explicit camera topic overrides:
 
 ```bash
 ros2 launch orbbec_camera gemini_330_series.launch.py \
@@ -141,6 +151,16 @@ Mode tokens are `eyeonhand` and `eyetohand`, for example
 Saved AX=XB camera calibration YAML is intentionally minimal:
 
 ```yaml
+parameters:
+  name: cr10_orbbec335
+  calibration_type: eye_in_hand
+  robot_base_frame: base_link
+  robot_effector_frame: Link6
+  tracking_base_frame: camera_color_optical_frame
+  tracking_marker_frame: charuco_target
+  freehand_robot_movement: true
+  move_group_namespace: /
+  move_group: manipulator
 transform:
   translation:
     x: 0.0
@@ -165,14 +185,19 @@ saving a new eye-to-hand calibration deletes older eye-to-hand files.
 
 ## Platform Reference
 
-`platform_teach.launch.py` reuses the same four-marker calibration board, but
-loads the current camera calibration first. `platform_teach` now averages marker
-TFs `1, 2, 3, 4` internally into `platform_board_observed`, then saves the board
-pose as:
+`platform_teach.launch.py` reuses the same four-marker calibration board with
+the fixed bin camera. It loads the latest eye-to-hand calibration
+(`axab_calibration_eyetohand_*.yaml`) and publishes ArUco detections in
+`bin_calibrated_link`. `platform_teach` uses marker detections `1, 2, 3, 4`
+from `/aruco_detections`, averages them internally into
+`platform_board_observed`, then saves the board pose as:
 
 ```text
 WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>.yaml
 ```
+
+The default UI name is `Platform teach`, which saves as the frame/file token
+`platform_teach`.
 
 Only one platform calibration is kept in the calibration directory. Saving again deletes
 older `platform_calibration_*.yaml` files and writes the new one. Save becomes
@@ -190,7 +215,7 @@ the platform frame, while ROI dots remain normal RGB image pixel points.
 ```bash
 ros2 topic echo /aruco_overlay --once
 ros2 run tf2_ros tf2_echo camera_link tag_frame
-ros2 run tf2_ros tf2_echo Link6 calibrated_camera_link
+ros2 run tf2_ros tf2_echo base_link bin_calibrated_link
 ```
 
 ## Notes

@@ -16,11 +16,13 @@
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <orbbec_camera_msgs/srv/set_int32.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <dobot_common/workspace_paths.hpp>
@@ -30,8 +32,11 @@ namespace
 using ImageMsg = sensor_msgs::msg::Image;
 using CameraInfoMsg = sensor_msgs::msg::CameraInfo;
 using JointStateMsg = sensor_msgs::msg::JointState;
+using SetBoolSrv = std_srvs::srv::SetBool;
+using SetInt32Srv = orbbec_camera_msgs::srv::SetInt32;
 
 constexpr char kWindowName[] = "tray_rgb_tuner";
+constexpr char kColorExposureTrackbar[] = "RGB Exposure us";
 constexpr char kRedTrackbar[] = "R Threshold";
 constexpr char kGreenTrackbar[] = "G Threshold";
 constexpr char kBlueTrackbar[] = "B Threshold";
@@ -59,11 +64,118 @@ constexpr int kHorizontalRayCountMax = 60;
 constexpr int kDepthEdgeOffsetMinPx = 1;
 constexpr int kDepthEdgeOffsetMaxPx = 20;
 constexpr std::size_t kTeachRoiPointCount = 4;
+constexpr int kExposurePercentMin = 0;
+constexpr int kExposurePercentMax = 100;
+constexpr int kDefaultExposureMinUs = 1;
+constexpr int kDefaultExposureMaxUs = 32000;
+constexpr int kTeachColorExposureMaxUs = 100;
+
+bool isOpenCvWindowClosed(const std::string &window_name)
+{
+  static bool window_was_visible = false;
+  static const auto first_check_time = std::chrono::steady_clock::now();
+
+  double visible = -1.0;
+  try
+  {
+    visible = cv::getWindowProperty(window_name, cv::WND_PROP_VISIBLE);
+  }
+  catch (const cv::Exception &)
+  {
+    return window_was_visible;
+  }
+
+  if (visible >= 1.0)
+  {
+    window_was_visible = true;
+    return false;
+  }
+
+  const double age_sec = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - first_check_time).count();
+
+  // Some OpenCV HighGUI backends briefly report WND_PROP_VISIBLE == 0 while
+  // the window is still being mapped. Do not treat that startup state as a
+  // user close. Once the window was visible, visible < 1 means it was closed.
+  if (!window_was_visible && age_sec < 2.0)
+  {
+    return false;
+  }
+
+  return window_was_visible && visible < 1.0;
+}
+
+void destroyOpenCvWindowQuietly(const std::string &window_name)
+{
+  try
+  {
+    cv::destroyWindow(window_name);
+  }
+  catch (const cv::Exception &)
+  {
+  }
+}
 
 double remapOutlierSensitivityToFitRange(int outlier_sensitivity)
 {
   const int clamped = std::clamp(outlier_sensitivity, 1, 100);
   return 50.0 + (static_cast<double>(clamped - 1) * 100.0 / 99.0);
+}
+
+int clampExposurePercent(int percent)
+{
+  return std::clamp(percent, kExposurePercentMin, kExposurePercentMax);
+}
+
+int clampExposureUsec(int value)
+{
+  return std::max(1, value);
+}
+
+int exposurePercentToUsec(int percent, int min_us, int max_us)
+{
+  const int clamped_percent = clampExposurePercent(percent);
+  if (clamped_percent <= 0)
+  {
+    return 0;
+  }
+  const int clamped_min = clampExposureUsec(min_us);
+  const int clamped_max = std::max(clamped_min, clampExposureUsec(max_us));
+  const double t = static_cast<double>(clamped_percent) / 100.0;
+  return std::clamp(
+    static_cast<int>(std::lround(static_cast<double>(clamped_min) + t * static_cast<double>(clamped_max - clamped_min))),
+    clamped_min,
+    clamped_max);
+}
+
+int clampExposureUsecOrAuto(int value, int min_us, int max_us)
+{
+  if (value <= 0)
+  {
+    return 0;
+  }
+  const int clamped_min = clampExposureUsec(min_us);
+  const int clamped_max = std::max(clamped_min, clampExposureUsec(max_us));
+  return std::clamp(value, clamped_min, clamped_max);
+}
+
+int exposureUsecToPercent(int exposure_us, int min_us, int max_us)
+{
+  if (exposure_us <= 0)
+  {
+    return 0;
+  }
+  const int clamped_min = clampExposureUsec(min_us);
+  const int clamped_max = std::max(clamped_min, clampExposureUsec(max_us));
+  if (clamped_max == clamped_min)
+  {
+    return 100;
+  }
+  const int clamped_exposure = std::clamp(exposure_us, clamped_min, clamped_max);
+  const double t =
+    static_cast<double>(clamped_exposure - clamped_min) /
+    static_cast<double>(clamped_max - clamped_min);
+  return clampExposurePercent(static_cast<int>(std::lround(t * 100.0)));
 }
 
 struct LineModel
@@ -144,7 +256,7 @@ std::string makeFilenameSafeTrayName(const std::string &tray_name)
     safe_name.pop_back();
   }
 
-  return safe_name.empty() ? "tray" : safe_name;
+  return safe_name;
 }
 
 std::string normalizeDetectionModeToken(const std::string &mode_text)
@@ -3060,14 +3172,47 @@ public:
   TrayDetectorNode()
   : Node("tray_teach")
   {
-    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
-    depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
-    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
-    joint_states_topic_ = declare_parameter<std::string>("joint_states_topic", "/joint_states_robot");
-    overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
-    profiles_dir_ = declare_parameter<std::string>(
-      "profiles_dir",
-      dobot_common::paths::workspacePath({"teach", "tray_teach"}, __FILE__).string());
+      color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
+      depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
+      camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
+      joint_states_topic_ = declare_parameter<std::string>("joint_states_topic", "/joint_states_robot");
+      overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
+      camera_control_service_root_ = declare_parameter<std::string>(
+        "camera_control_service_root",
+        "/robot_camera");
+      normalizeCameraControlServiceRoot();
+      const int color_exposure_percent = clampExposurePercent(
+        declare_parameter<int>("color_exposure_percent", 0));
+      const int depth_exposure_percent = clampExposurePercent(
+        declare_parameter<int>("depth_exposure_percent", 0));
+      color_exposure_min_us_ = clampExposureUsec(
+        declare_parameter<int>("color_exposure_min_us", kDefaultExposureMinUs));
+      color_exposure_max_us_ = std::max(
+        color_exposure_min_us_,
+        clampExposureUsec(declare_parameter<int>("color_exposure_max_us", kDefaultExposureMaxUs)));
+      color_exposure_min_us_ = std::clamp(color_exposure_min_us_, 1, kTeachColorExposureMaxUs);
+      color_exposure_max_us_ = kTeachColorExposureMaxUs;
+      depth_exposure_min_us_ = clampExposureUsec(
+        declare_parameter<int>("depth_exposure_min_us", kDefaultExposureMinUs));
+      depth_exposure_max_us_ = std::max(
+        depth_exposure_min_us_,
+        clampExposureUsec(declare_parameter<int>("depth_exposure_max_us", kDefaultExposureMaxUs)));
+      color_exposure_us_ = clampExposureUsecOrAuto(
+        declare_parameter<int>(
+          "color_exposure_us",
+          exposurePercentToUsec(color_exposure_percent, color_exposure_min_us_, color_exposure_max_us_)),
+        color_exposure_min_us_,
+        color_exposure_max_us_);
+      depth_exposure_us_ = clampExposureUsecOrAuto(
+        declare_parameter<int>(
+          "depth_exposure_us",
+          exposurePercentToUsec(depth_exposure_percent, depth_exposure_min_us_, depth_exposure_max_us_)),
+        depth_exposure_min_us_,
+        depth_exposure_max_us_);
+      depth_exposure_us_ = 0;
+      profiles_dir_ = declare_parameter<std::string>(
+        "profiles_dir",
+        dobot_common::paths::workspacePath({"teach", "tray_teach"}, __FILE__).string());
     settings_path_ = declare_parameter<std::string>(
       "settings_path",
       dobot_common::paths::workspacePath(
@@ -3112,11 +3257,15 @@ public:
       joint_states_topic_, rclcpp::SensorDataQoS(),
       std::bind(&TrayDetectorNode::jointStateCallback, this, std::placeholders::_1));
 
-    createUi();
-    cv::setMouseCallback(kWindowName, &TrayDetectorNode::onMouseThunk, this);
+      createUi();
+      cv::setMouseCallback(kWindowName, &TrayDetectorNode::onMouseThunk, this);
+      createCameraExposureClients();
+      camera_exposure_timer_ = create_wall_timer(
+        std::chrono::milliseconds(250),
+        std::bind(&TrayDetectorNode::applyPendingCameraExposureSettings, this));
 
-    render_timer_ = create_wall_timer(
-      std::chrono::milliseconds(33),
+      render_timer_ = create_wall_timer(
+        std::chrono::milliseconds(33),
       std::bind(&TrayDetectorNode::renderFrame, this));
 
     RCLCPP_INFO(
@@ -3126,14 +3275,20 @@ public:
       depth_topic_.c_str(),
       camera_info_topic_.c_str(),
       joint_states_topic_.c_str(),
-      overlay_topic_.c_str(),
-      settings_path_.c_str());
-  }
+        overlay_topic_.c_str(),
+        settings_path_.c_str());
+      RCLCPP_INFO(
+        get_logger(),
+        "Tray teach camera exposure controls. service_root=%s color=%s depth=%s",
+        camera_control_service_root_.c_str(),
+        exposureModeText(color_exposure_us_).c_str(),
+        exposureModeText(depth_exposure_us_).c_str());
+    }
 
   ~TrayDetectorNode() override
   {
     saveRuntimeSettingsToFile(true);
-    cv::destroyWindow(kWindowName);
+    destroyOpenCvWindowQuietly(kWindowName);
   }
 
 private:
@@ -3197,7 +3352,8 @@ private:
     const int track_w = kLeftPanelWidth - 40;
     const int track_h = 12;
     const int gap = 52;
-    sliders_.push_back({kRedTrackbar, cv::Rect(track_x, y, track_w, track_h), &red_threshold_, 0, 255}); y += gap;
+      sliders_.push_back({kColorExposureTrackbar, cv::Rect(track_x, y, track_w, track_h), &color_exposure_us_, 0, kTeachColorExposureMaxUs}); y += gap;
+      sliders_.push_back({kRedTrackbar, cv::Rect(track_x, y, track_w, track_h), &red_threshold_, 0, 255}); y += gap;
     sliders_.push_back({kGreenTrackbar, cv::Rect(track_x, y, track_w, track_h), &green_threshold_, 0, 255}); y += gap;
     sliders_.push_back({kBlueTrackbar, cv::Rect(track_x, y, track_w, track_h), &blue_threshold_, 0, 255}); y += gap;
     sliders_.push_back(
@@ -3212,12 +3368,44 @@ private:
         &horizontal_ray_count_,
         kHorizontalRayCountMin,
         kHorizontalRayCountMax}); y += gap;
-    sliders_.push_back({kVerticalRayCountTrackbar, cv::Rect(track_x, y, track_w, track_h), &vertical_ray_count_, 50, 150}); y += gap;
-    sliders_.push_back({kOutlierTrackbar, cv::Rect(track_x, y, track_w, track_h), &outlier_sensitivity_, 1, 100});
+	    sliders_.push_back({kVerticalRayCountTrackbar, cv::Rect(track_x, y, track_w, track_h), &vertical_ray_count_, 50, 150}); y += gap;
+	    sliders_.push_back({kOutlierTrackbar, cv::Rect(track_x, y, track_w, track_h), &outlier_sensitivity_, 1, 100});
+	  }
+
+  void processWindowEvents(int key)
+  {
+    handleKeypress(key);
+    if (isOpenCvWindowClosed(kWindowName))
+    {
+      requestShutdownFromWindowClose();
+    }
   }
 
-  void advanceViewMode()
+  void requestShutdownFromWindowClose()
   {
+    if (window_close_requested_)
+    {
+      return;
+    }
+    window_close_requested_ = true;
+    RCLCPP_INFO(get_logger(), "tray_teach window closed; shutting down.");
+    saveRuntimeSettingsToFile(true);
+    if (render_timer_)
+    {
+      render_timer_->cancel();
+    }
+    if (camera_exposure_timer_)
+    {
+      camera_exposure_timer_->cancel();
+    }
+    if (rclcpp::ok())
+    {
+      rclcpp::shutdown();
+    }
+  }
+
+	  void advanceViewMode()
+	  {
     switch (view_mode_)
     {
       case ViewMode::kBinarized:
@@ -3252,13 +3440,18 @@ private:
     return label == kRedTrackbar || label == kGreenTrackbar || label == kBlueTrackbar;
   }
 
-  bool isDepthThresholdSliderLabel(const std::string &label) const
-  {
-    return label == kDepthThresholdTrackbar;
-  }
+    bool isDepthThresholdSliderLabel(const std::string &label) const
+    {
+      return label == kDepthThresholdTrackbar;
+    }
 
-  bool isSliderEnabled(const UiSlider &slider) const
-  {
+    bool isExposureSliderLabel(const std::string &label) const
+    {
+      return label == kColorExposureTrackbar;
+    }
+
+    bool isSliderEnabled(const UiSlider &slider) const
+    {
     if (isDepthThresholdSliderLabel(slider.label))
     {
       return detection_use_depth_;
@@ -3443,12 +3636,16 @@ private:
     const int clamped_x = std::clamp(raw_point.x, slider.track_rect.x, slider.track_rect.x + slider.track_rect.width);
     const double t = static_cast<double>(clamped_x - slider.track_rect.x) / std::max(1, slider.track_rect.width);
     const int new_value = static_cast<int>(std::round(slider.min_value + t * (slider.max_value - slider.min_value)));
-    if (*slider.value != new_value)
-    {
-      *slider.value = new_value;
-      markRuntimeSettingsDirty();
+      if (*slider.value != new_value)
+      {
+        *slider.value = new_value;
+        if (isExposureSliderLabel(slider.label))
+        {
+          markCameraExposureDirty();
+        }
+        markRuntimeSettingsDirty();
+      }
     }
-  }
 
   void rebuildMergedRoiPolygon()
   {
@@ -3462,13 +3659,174 @@ private:
     latest_tray_edge_lengths_cm_.reset();
   }
 
-  void markRuntimeSettingsDirty()
-  {
-    runtime_settings_dirty_ = true;
-  }
+    void markRuntimeSettingsDirty()
+    {
+      runtime_settings_dirty_ = true;
+    }
 
-  bool saveRuntimeSettingsToFile(bool force)
-  {
+    void markCameraExposureDirty()
+    {
+      camera_exposure_dirty_ = true;
+    }
+
+    void normalizeCameraControlServiceRoot()
+    {
+      if (camera_control_service_root_.empty())
+      {
+        camera_control_service_root_ = "/robot_camera";
+      }
+      while (camera_control_service_root_.size() > 1 && camera_control_service_root_.back() == '/')
+      {
+        camera_control_service_root_.pop_back();
+      }
+      if (camera_control_service_root_.front() != '/')
+      {
+        camera_control_service_root_ = "/" + camera_control_service_root_;
+      }
+    }
+
+    std::string cameraControlServiceName(const std::string &leaf) const
+    {
+      return camera_control_service_root_ + "/" + leaf;
+    }
+
+    void createCameraExposureClients()
+    {
+      color_auto_exposure_client_ =
+        create_client<SetBoolSrv>(cameraControlServiceName("set_color_auto_exposure"));
+      color_exposure_client_ =
+        create_client<SetInt32Srv>(cameraControlServiceName("set_color_exposure"));
+      depth_auto_exposure_client_ =
+        create_client<SetBoolSrv>(cameraControlServiceName("set_depth_auto_exposure"));
+      depth_exposure_client_ =
+        create_client<SetInt32Srv>(cameraControlServiceName("set_depth_exposure"));
+      markCameraExposureDirty();
+    }
+
+    std::string exposureModeText(int exposure_us) const
+    {
+      if (exposure_us <= 0)
+      {
+        return "auto";
+      }
+      return std::to_string(exposure_us) + "us";
+    }
+
+    bool applyCameraExposureSetting(
+      const std::string &label,
+      int exposure_us,
+      const rclcpp::Client<SetBoolSrv>::SharedPtr &auto_client,
+      const rclcpp::Client<SetInt32Srv>::SharedPtr &exposure_client,
+      int &last_applied_exposure_us)
+    {
+      if (last_applied_exposure_us == exposure_us)
+      {
+        return true;
+      }
+      if (!auto_client || !auto_client->service_is_ready())
+      {
+        return false;
+      }
+      if (exposure_us > 0 && (!exposure_client || !exposure_client->service_is_ready()))
+      {
+        return false;
+      }
+
+      auto auto_request = std::make_shared<SetBoolSrv::Request>();
+      auto_request->data = exposure_us <= 0;
+      auto_client->async_send_request(
+        auto_request,
+        [this, label](rclcpp::Client<SetBoolSrv>::SharedFuture future)
+        {
+          try
+          {
+            const auto response = future.get();
+            if (!response || !response->success)
+            {
+              RCLCPP_WARN(
+                get_logger(),
+                "%s auto exposure request failed: %s",
+                label.c_str(),
+                response ? response->message.c_str() : "no response");
+            }
+          }
+          catch (const std::exception &ex)
+          {
+            RCLCPP_WARN(get_logger(), "%s auto exposure request error: %s", label.c_str(), ex.what());
+          }
+        });
+
+      if (exposure_us > 0)
+      {
+        auto exposure_request = std::make_shared<SetInt32Srv::Request>();
+        exposure_request->data = exposure_us;
+        exposure_client->async_send_request(
+          exposure_request,
+          [this, label, exposure_us](rclcpp::Client<SetInt32Srv>::SharedFuture future)
+          {
+            try
+            {
+              const auto response = future.get();
+              if (!response || !response->success)
+              {
+                RCLCPP_WARN(
+                  get_logger(),
+                  "%s exposure %dus request failed: %s",
+                  label.c_str(),
+                  exposure_us,
+                  response ? response->message.c_str() : "no response");
+              }
+            }
+            catch (const std::exception &ex)
+            {
+              RCLCPP_WARN(get_logger(), "%s exposure request error: %s", label.c_str(), ex.what());
+            }
+          });
+      }
+
+      last_applied_exposure_us = exposure_us;
+      RCLCPP_INFO(
+        get_logger(),
+        "%s exposure set to %s",
+        label.c_str(),
+        exposureModeText(exposure_us).c_str());
+      return true;
+    }
+
+    void applyPendingCameraExposureSettings()
+    {
+      if (!camera_exposure_dirty_)
+      {
+        return;
+      }
+
+      const rclcpp::Time now = this->now();
+      if (last_camera_exposure_attempt_time_.nanoseconds() != 0 &&
+          (now - last_camera_exposure_attempt_time_).seconds() < 0.5)
+      {
+        return;
+      }
+      last_camera_exposure_attempt_time_ = now;
+
+      const bool color_ok = applyCameraExposureSetting(
+        "RGB",
+        color_exposure_us_,
+        color_auto_exposure_client_,
+        color_exposure_client_,
+        last_applied_color_exposure_us_);
+      depth_exposure_us_ = 0;
+      const bool depth_ok = applyCameraExposureSetting(
+        "Depth",
+        depth_exposure_us_,
+        depth_auto_exposure_client_,
+        depth_exposure_client_,
+        last_applied_depth_exposure_us_);
+
+      camera_exposure_dirty_ = !(color_ok && depth_ok);
+    }
+
+    bool saveRuntimeSettingsToFile(bool force)
+    {
     if (runtime_settings_path_.empty())
     {
       return false;
@@ -3488,17 +3846,26 @@ private:
       }
     }
 
-    YAML::Emitter out;
-    out << YAML::BeginMap;
-    out << YAML::Key << "tray_teach_runtime";
-    out << YAML::Value << YAML::BeginMap;
+      YAML::Emitter out;
+      depth_exposure_us_ = 0;
+      out << YAML::BeginMap;
+      out << YAML::Key << "tray_teach_runtime";
+      out << YAML::Value << YAML::BeginMap;
     out << YAML::Key << "ros__parameters";
     out << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "tray_name" << YAML::Value << sanitizeTrayName();
-    out << YAML::Key << "red_threshold" << YAML::Value << red_threshold_;
-    out << YAML::Key << "green_threshold" << YAML::Value << green_threshold_;
-    out << YAML::Key << "blue_threshold" << YAML::Value << blue_threshold_;
-    out << YAML::Key << "depth_threshold_mm" << YAML::Value << depth_threshold_mm_;
+      out << YAML::Key << "red_threshold" << YAML::Value << red_threshold_;
+      out << YAML::Key << "green_threshold" << YAML::Value << green_threshold_;
+      out << YAML::Key << "blue_threshold" << YAML::Value << blue_threshold_;
+      out << YAML::Key << "color_exposure_us" << YAML::Value << color_exposure_us_;
+      out << YAML::Key << "depth_exposure_us" << YAML::Value << 0;
+      out << YAML::Key << "color_exposure_percent" << YAML::Value
+          << exposureUsecToPercent(color_exposure_us_, color_exposure_min_us_, color_exposure_max_us_);
+      out << YAML::Key << "depth_exposure_percent" << YAML::Value << 0;
+      out << YAML::Key << "color_exposure_min_us" << YAML::Value << color_exposure_min_us_;
+      out << YAML::Key << "color_exposure_max_us" << YAML::Value << color_exposure_max_us_;
+      out << YAML::Key << "depth_exposure_min_us" << YAML::Value << depth_exposure_min_us_;
+      out << YAML::Key << "depth_exposure_max_us" << YAML::Value << depth_exposure_max_us_;
+      out << YAML::Key << "depth_threshold_mm" << YAML::Value << depth_threshold_mm_;
     out << YAML::Key << "detection_mode" << YAML::Value << detectionModeToString(detection_use_depth_);
     out << YAML::Key << "ray_step_px" << YAML::Value << ray_step_px_;
     out << YAML::Key << "depth_edge_offset_px" << YAML::Value << depth_edge_offset_px_;
@@ -3615,15 +3982,36 @@ private:
         return;
       }
 
-      if (params["tray_name"])
-      {
-        tray_name_ = params["tray_name"].as<std::string>();
-      }
-      red_threshold_ = params["red_threshold"] ? std::clamp(params["red_threshold"].as<int>(), 0, 255) : red_threshold_;
-      green_threshold_ = params["green_threshold"] ? std::clamp(params["green_threshold"].as<int>(), 0, 255) : green_threshold_;
-      blue_threshold_ = params["blue_threshold"] ? std::clamp(params["blue_threshold"].as<int>(), 0, 255) : blue_threshold_;
-      depth_threshold_mm_ = params["depth_threshold_mm"]
-        ? std::clamp(params["depth_threshold_mm"].as<int>(), kDepthThresholdMinMm, kDepthThresholdMaxMm)
+        red_threshold_ = params["red_threshold"] ? std::clamp(params["red_threshold"].as<int>(), 0, 255) : red_threshold_;
+        green_threshold_ = params["green_threshold"] ? std::clamp(params["green_threshold"].as<int>(), 0, 255) : green_threshold_;
+        blue_threshold_ = params["blue_threshold"] ? std::clamp(params["blue_threshold"].as<int>(), 0, 255) : blue_threshold_;
+        color_exposure_min_us_ = params["color_exposure_min_us"]
+          ? clampExposureUsec(params["color_exposure_min_us"].as<int>())
+          : color_exposure_min_us_;
+        color_exposure_max_us_ = params["color_exposure_max_us"]
+          ? std::max(color_exposure_min_us_, clampExposureUsec(params["color_exposure_max_us"].as<int>()))
+          : color_exposure_max_us_;
+        color_exposure_min_us_ = std::clamp(color_exposure_min_us_, 1, kTeachColorExposureMaxUs);
+        color_exposure_max_us_ = kTeachColorExposureMaxUs;
+        depth_exposure_min_us_ = params["depth_exposure_min_us"]
+          ? clampExposureUsec(params["depth_exposure_min_us"].as<int>())
+          : depth_exposure_min_us_;
+        depth_exposure_max_us_ = params["depth_exposure_max_us"]
+          ? std::max(depth_exposure_min_us_, clampExposureUsec(params["depth_exposure_max_us"].as<int>()))
+          : depth_exposure_max_us_;
+        color_exposure_us_ = params["color_exposure_us"]
+          ? clampExposureUsecOrAuto(params["color_exposure_us"].as<int>(), color_exposure_min_us_, color_exposure_max_us_)
+          : (
+              params["color_exposure_percent"]
+              ? exposurePercentToUsec(
+                  clampExposurePercent(params["color_exposure_percent"].as<int>()),
+                  color_exposure_min_us_,
+                  color_exposure_max_us_)
+              : color_exposure_us_);
+        depth_exposure_us_ = 0;
+        markCameraExposureDirty();
+        depth_threshold_mm_ = params["depth_threshold_mm"]
+          ? std::clamp(params["depth_threshold_mm"].as<int>(), kDepthThresholdMinMm, kDepthThresholdMaxMm)
         : depth_threshold_mm_;
       if (params["detection_mode"])
       {
@@ -3771,6 +4159,19 @@ private:
 
   void saveSettingsToFile()
   {
+    const std::string tray_name = sanitizeTrayName();
+    if (tray_name.empty())
+    {
+      save_status_message_ = "Enter tray name";
+      save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
+      return;
+    }
+    if (makeFilenameSafeTrayName(tray_name).empty())
+    {
+      save_status_message_ = "Tray name needs letters or numbers";
+      save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
+      return;
+    }
     if (!hasValidRoiPoints(roi_points_))
     {
       save_status_message_ = "ROI required";
@@ -3799,7 +4200,6 @@ private:
       has_joint_snapshot = has_joint_positions_;
     }
 
-    const std::string tray_name = sanitizeTrayName();
     const DateStamp date_stamp = currentDateStamp();
 
     YAML::Emitter out;
@@ -3812,10 +4212,20 @@ private:
     out << YAML::Key << "depth_topic" << YAML::Value << depth_topic_;
     out << YAML::Key << "camera_info_topic" << YAML::Value << camera_info_topic_;
     out << YAML::Key << "overlay_topic" << YAML::Value << overlay_topic_;
-    out << YAML::Key << "red_threshold" << YAML::Value << red_threshold_;
-    out << YAML::Key << "green_threshold" << YAML::Value << green_threshold_;
-    out << YAML::Key << "blue_threshold" << YAML::Value << blue_threshold_;
-    out << YAML::Key << "depth_threshold_mm" << YAML::Value << depth_threshold_mm_;
+      out << YAML::Key << "red_threshold" << YAML::Value << red_threshold_;
+      out << YAML::Key << "green_threshold" << YAML::Value << green_threshold_;
+      out << YAML::Key << "blue_threshold" << YAML::Value << blue_threshold_;
+      depth_exposure_us_ = 0;
+      out << YAML::Key << "color_exposure_us" << YAML::Value << color_exposure_us_;
+      out << YAML::Key << "depth_exposure_us" << YAML::Value << 0;
+      out << YAML::Key << "color_exposure_percent" << YAML::Value
+          << exposureUsecToPercent(color_exposure_us_, color_exposure_min_us_, color_exposure_max_us_);
+      out << YAML::Key << "depth_exposure_percent" << YAML::Value << 0;
+      out << YAML::Key << "color_exposure_min_us" << YAML::Value << color_exposure_min_us_;
+      out << YAML::Key << "color_exposure_max_us" << YAML::Value << color_exposure_max_us_;
+      out << YAML::Key << "depth_exposure_min_us" << YAML::Value << depth_exposure_min_us_;
+      out << YAML::Key << "depth_exposure_max_us" << YAML::Value << depth_exposure_max_us_;
+      out << YAML::Key << "depth_threshold_mm" << YAML::Value << depth_threshold_mm_;
     out << YAML::Key << "detection_mode" << YAML::Value << detectionModeToString(detection_use_depth_);
     out << YAML::Key << "ray_step_px" << YAML::Value << ray_step_px_;
     out << YAML::Key << "depth_edge_offset_px" << YAML::Value << depth_edge_offset_px_;
@@ -4150,7 +4560,13 @@ private:
     {
       trimmed.pop_back();
     }
-    return trimmed.empty() ? "tray" : trimmed;
+    return trimmed;
+  }
+
+  bool hasValidTrayName() const
+  {
+    const std::string tray_name = sanitizeTrayName();
+    return !tray_name.empty() && !makeFilenameSafeTrayName(tray_name).empty();
   }
 
   std::string buttonDisplayText(const UiButton &button) const
@@ -4447,13 +4863,16 @@ private:
       name_edit_active_ ? cv::Scalar(134, 205, 236) : cv::Scalar(91, 98, 108),
       2);
     const std::string tray_name_text = sanitizeTrayName();
+    const bool show_name_placeholder = tray_name_text.empty() && !name_edit_active_;
+    const std::string tray_name_display_text =
+      show_name_placeholder ? "Enter tray name" : tray_name_text;
     cv::putText(
       panel,
-      fit_text(tray_name_text, name_box_rect_.width - 20, 0.60, 1),
+      fit_text(tray_name_display_text, name_box_rect_.width - 20, 0.60, 1),
       cv::Point(name_box_rect_.x + 10, name_box_rect_.y + 27),
       cv::FONT_HERSHEY_DUPLEX,
       0.60,
-      cv::Scalar(240, 242, 246),
+      show_name_placeholder ? cv::Scalar(150, 156, 164) : cv::Scalar(240, 242, 246),
       1,
       cv::LINE_AA);
     if (name_edit_active_)
@@ -4473,7 +4892,8 @@ private:
         2);
     }
 
-    const bool save_ready = hasValidRoiPoints(roi_points_) &&
+    const bool save_ready = hasValidTrayName() &&
+      hasValidRoiPoints(roi_points_) &&
       latest_tray_edge_lengths_cm_.has_value() &&
       (!detection_use_depth_ || hasDepthPlaneReference());
     const cv::Scalar save_fill = save_ready ? cv::Scalar(70, 132, 82) : cv::Scalar(66, 70, 76);
@@ -4745,7 +5165,7 @@ private:
       rendered_window_size_ = window_size;
     }
     cv::imshow(kWindowName, combined);
-    handleKeypress(cv::waitKey(1));
+    processWindowEvents(cv::waitKey(1));
     saveRuntimeSettingsToFile(false);
 
     if (publish_overlay_)
@@ -4973,7 +5393,7 @@ private:
       rendered_window_size_ = window_size;
     }
     cv::imshow(kWindowName, combined);
-    handleKeypress(cv::waitKey(1));
+    processWindowEvents(cv::waitKey(1));
     saveRuntimeSettingsToFile(false);
 
     if (publish_overlay_)
@@ -4990,22 +5410,29 @@ private:
   std::string depth_topic_;
   std::string camera_info_topic_;
   std::string joint_states_topic_;
-  std::string overlay_topic_;
-  std::string profiles_dir_;
+    std::string overlay_topic_;
+    std::string camera_control_service_root_ {"/robot_camera"};
+    std::string profiles_dir_;
   std::string settings_path_;
   std::string runtime_settings_path_;
   std::string latest_saved_profile_path_;
   std::string save_status_message_ {"Saved"};
-  std::string tray_name_ {"tray"};
+  std::string tray_name_;
   rclcpp::Time save_status_deadline_ {0, 0, RCL_ROS_TIME};
   bool publish_overlay_ {true};
   double display_scale_ {1.0};
   cv::Size rendered_window_size_ {};
 
-  int red_threshold_ {120};
-  int green_threshold_ {120};
-  int blue_threshold_ {120};
-  int depth_threshold_mm_ {10};
+    int red_threshold_ {120};
+    int green_threshold_ {120};
+    int blue_threshold_ {120};
+    int color_exposure_us_ {0};
+    int depth_exposure_us_ {0};
+    int color_exposure_min_us_ {kDefaultExposureMinUs};
+    int color_exposure_max_us_ {kDefaultExposureMaxUs};
+    int depth_exposure_min_us_ {kDefaultExposureMinUs};
+    int depth_exposure_max_us_ {kDefaultExposureMaxUs};
+    int depth_threshold_mm_ {10};
   int ray_step_px_ {3};
   int depth_edge_offset_px_ {4};
   int previous_color_percent_ {kDefaultPreviousColorPercent};
@@ -5025,8 +5452,13 @@ private:
   bool name_edit_active_ {false};
   std::optional<double> latest_tray_area_cm2_;
   std::optional<std::array<double, 4>> latest_tray_edge_lengths_cm_;
-  bool runtime_settings_dirty_ {false};
-  rclcpp::Time last_runtime_settings_save_time_ {0, 0, RCL_ROS_TIME};
+	    bool runtime_settings_dirty_ {false};
+	    bool camera_exposure_dirty_ {true};
+	    bool window_close_requested_ {false};
+	    rclcpp::Time last_runtime_settings_save_time_ {0, 0, RCL_ROS_TIME};
+    rclcpp::Time last_camera_exposure_attempt_time_ {0, 0, RCL_ROS_TIME};
+    int last_applied_color_exposure_us_ {-1};
+    int last_applied_depth_exposure_us_ {-1};
   std::vector<UiButton> buttons_;
   std::vector<UiSlider> sliders_;
   std::vector<AxisAlignedRoiBounds> roi_regions_;
@@ -5042,9 +5474,14 @@ private:
   rclcpp::Publisher<ImageMsg>::SharedPtr overlay_pub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
-  rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;
-  rclcpp::Subscription<JointStateMsg>::SharedPtr joint_state_sub_;
-  rclcpp::TimerBase::SharedPtr render_timer_;
+    rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;
+    rclcpp::Subscription<JointStateMsg>::SharedPtr joint_state_sub_;
+    rclcpp::TimerBase::SharedPtr render_timer_;
+    rclcpp::TimerBase::SharedPtr camera_exposure_timer_;
+    rclcpp::Client<SetBoolSrv>::SharedPtr color_auto_exposure_client_;
+    rclcpp::Client<SetInt32Srv>::SharedPtr color_exposure_client_;
+    rclcpp::Client<SetBoolSrv>::SharedPtr depth_auto_exposure_client_;
+    rclcpp::Client<SetInt32Srv>::SharedPtr depth_exposure_client_;
 
   std::mutex frame_mutex_;
   std::mutex joint_state_mutex_;

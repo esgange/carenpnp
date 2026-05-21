@@ -25,6 +25,20 @@ source install/setup.bash
 ros2 launch tray_intercept tray_intercept.launch.py
 ```
 
+Headless service mode, with no Tkinter window:
+
+```bash
+ros2 launch tray_intercept tray_intercept.launch.py headless:=true
+```
+
+Important launch arguments are `runtime_settings_file`,
+`motion_service_root`, `tray_vector_topic`, `tray_axis_overlay_topic`,
+`track_service`, `track_status_service`, `tray_dimensions_service`, and
+`tray_seek_complete_service`. When `load_runtime_settings:=true`, the JSON
+runtime settings are loaded at startup. In headless mode the JSON file must
+exist and include the complete runtime key set; launch arguments are treated as
+overrides, not the normal place to keep motion settings.
+
 Direct run:
 
 ```bash

@@ -39,10 +39,14 @@ Teach flow:
 1. Enter a tray name.
 2. Choose RGB or depth view.
 3. Add the tray ROI.
-4. Tune thresholds and edge/ray controls until the tray outline is stable.
+4. Tune thresholds, RGB exposure, and edge/ray controls until the tray outline is stable.
 5. If using depth mode, select the depth-plane ROI when prompted.
 6. Verify the overlay.
 7. Save the tray profile.
+
+The `RGB Exposure us` slider uses `0` for auto exposure and `1-100` as direct
+microseconds. Depth exposure stays auto. Detection applies the saved RGB exposure
+from the selected tray profile.
 
 Saved profiles are written to:
 
@@ -90,7 +94,8 @@ ros2 service call /tray_detect/get_tray_dimensions dobot_msgs_v4/srv/GetTrayDime
 
 ## Common Issues
 
-- No profile in the dropdown: teach and save a profile, then restart detect.
+- No profile selected: use `Open Teach` to choose a tray teach YAML, or teach
+  and save a profile first.
 - Missing calibration: pass `calibration_file:=/abs/path/to/file.yaml` or add a
   valid YAML to `WORKSPACE_ROOT/calibration`.
 - Overlay appears but no `tray_pose`: loosen area/depth tolerance or retune the

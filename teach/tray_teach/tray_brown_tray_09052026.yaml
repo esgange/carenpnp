@@ -1,12 +1,20 @@
 tray_detect:
   ros__parameters:
-    color_topic: /camera/color/image_raw
-    depth_topic: /camera/depth/image_raw
-    camera_info_topic: /camera/color/camera_info
+    color_topic: /robot_camera/color/image_raw
+    depth_topic: /robot_camera/depth/image_raw
+    camera_info_topic: /robot_camera/color/camera_info
     overlay_topic: tray_overlay
     red_threshold: 64
     green_threshold: 110
     blue_threshold: 135
+    color_exposure_us: 0
+    depth_exposure_us: 0
+    color_exposure_percent: 0
+    depth_exposure_percent: 0
+    color_exposure_min_us: 1
+    color_exposure_max_us: 100
+    depth_exposure_min_us: 1
+    depth_exposure_max_us: 32000
     depth_threshold_mm: 10
     detection_mode: rgb
     ray_step_px: 26

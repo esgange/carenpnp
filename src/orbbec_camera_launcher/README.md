@@ -4,11 +4,12 @@
 launching two Orbbec cameras by serial number.
 
 When the GUI starts, it reads the saved camera slots and automatically scans for
-connected Orbbec devices. Any configured slot whose serial number is detected is
-launched automatically. If only one configured camera is connected, that camera
-still starts and the GUI warns which slot is missing. If a launch process exits
-during startup, the GUI reports the failed slot and keeps any successfully
-started camera running.
+connected Orbbec devices. Each configured slot is checked by serial number. If
+only one configured camera is connected, the GUI warns that only one camera is
+connected and still launches the connected camera. If no configured cameras are
+connected, the GUI warns the operator and does not launch any camera nodes.
+Detected cameras are launched one at a time: the second camera starts only after
+the first camera is verified by its ROS image topics.
 
 ## Run
 
@@ -16,12 +17,34 @@ started camera running.
 ros2 launch orbbec_camera_launcher camera_launcher.launch.py
 ```
 
+Headless camera launch using the saved YAML mapping:
+
+```bash
+ros2 launch orbbec_camera_launcher camera_headless.launch.py
+```
+
+The headless launch scans connected Orbbec devices before starting camera
+drivers. It starts only configured serial numbers that are currently detected;
+if none of the selected configured cameras are connected, the launch exits
+without creating camera nodes or empty topics. Limit the launch to specific
+slots, names, or serial numbers with `enabled_cameras:=1,robot_camera`, and
+override Orbbec launch arguments directly, for example:
+
+```bash
+ros2 launch orbbec_camera_launcher camera_headless.launch.py enabled_cameras:=robot_camera color_fps:=15
+```
+
+Set `require_connected:=false` only when you intentionally want the old behavior
+of starting the Orbbec driver without a preflight serial scan.
+
 ## Dependencies
 
 This package has no pip-only runtime dependencies. It uses:
 
 - `ros-humble-orbbec-camera` for `gemini_330_series.launch.py`
 - `ros2launch` to spawn one Orbbec launch process per configured camera
+- A terminal emulator (`gnome-terminal`, `xterm`, `xfce4-terminal`, `konsole`,
+  or `mate-terminal`) so launched camera drivers are visible and not hidden
 - `python3-tk` for the operator GUI
 - `python3-yaml` for reading and writing camera config
 
@@ -80,9 +103,25 @@ On startup and on manual `Launch Cameras`, the GUI:
 
 1. Scans connected Orbbec devices with `ros2 run orbbec_camera list_devices_node`.
 2. Compares detected serial numbers with configured slots.
-3. Launches every configured slot that is currently detected.
-4. Warns for unconfigured slots or configured serial numbers that are not
-   detected.
-5. Warns if a launched camera process exits during the startup grace period.
+3. If no configured cameras are connected, warns the operator and launches
+   nothing.
+4. If only one configured camera is connected, warns the operator which camera
+   is missing and launches only the connected camera.
+5. Launches detected configured slots sequentially, one terminal per camera.
+   The terminal title and banner identify the exact camera node running in that
+   terminal.
+6. Waits for `/CAMERA_NAME/color/image_raw` and
+   `/CAMERA_NAME/depth/image_raw` before marking that camera as running and
+   before starting the next camera.
+7. Warns and stops that launch if the process exits or the required topics do
+   not appear within the readiness timeout, then continues with any remaining
+   detected configured camera.
 
-The running status shows whether one or two camera launch processes are active.
+The running status shows which camera is starting and which cameras are verified.
+`Launch Cameras` is disabled while any tracked camera node is running or while a
+launch sequence is in progress. `Stop Cameras` stays available; if no camera is
+running, it reports that there are no camera nodes to stop. Window close sends
+shutdown signals to the tracked process groups, so child camera driver nodes are
+cleaned up with their launch terminal. If no supported terminal emulator is
+available, the GUI refuses to launch camera drivers instead of creating hidden
+background nodes.

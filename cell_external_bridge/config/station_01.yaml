@@ -1,0 +1,26 @@
+# Per-bridge configuration. Loaded by Config.from_env() when
+# CELL_BRIDGE_CONFIG_PATH points to this file. Values from the root
+# station_config file still override these values, so this file is the safe
+# default and per-PC station_config can layer on top.
+#
+# Distributed-deployment note:
+#   In production the broker lives on the conveyor PC, not on this arm
+#   PC. The RABBITMQ_URL value below is intentionally a non-routable
+#   placeholder so that a misconfigured boot fails fast. The real URL
+#   should be provided by the per-PC station_config file (RABBITMQ_URL) or
+#   exported in the shell before starting the bridge.
+
+belt_id: belt-a
+# edge_node_id stays as the external message envelope key for compatibility.
+edge_node_id: cell_bridge_01
+robot_arm_id: arm_01
+arm_number: 1
+
+rabbitmq_url: amqp://catarm-server:set-via-env@conveyor-host.invalid:5672/%2Fcatarm
+exchange_name: catarm.events
+
+runtime_dir: /workspaces/DOBOT_pickn_place/runtime
+robot_cell_orchestrator_validate_service: robot_cell_orchestrator/validate_online_program
+robot_cell_orchestrator_start_service: robot_cell_orchestrator/start_online
+robot_cell_orchestrator_place_service: robot_cell_orchestrator/place_online
+robot_cell_orchestrator_events_topic: robot_cell_orchestrator/events

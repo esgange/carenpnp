@@ -28,8 +28,32 @@ namespace
 {
 constexpr int OVERLAY_INIT_WIDTH = 960;
 constexpr int OVERLAY_INIT_HEIGHT = 540;
+constexpr char kOverlayWindowName[] = "aruco_overlay";
 constexpr double DEFAULT_AXIS_SCALE = 0.45;
 constexpr double DEFAULT_AXIS_MIN_LEN = 0.015;  // meters
+
+bool isOpenCvWindowClosed(const std::string &window_name)
+{
+  try
+  {
+    return cv::getWindowProperty(window_name, cv::WND_PROP_VISIBLE) < 1.0;
+  }
+  catch (const cv::Exception &)
+  {
+    return true;
+  }
+}
+
+void destroyOpenCvWindowQuietly(const std::string &window_name)
+{
+  try
+  {
+    cv::destroyWindow(window_name);
+  }
+  catch (const cv::Exception &)
+  {
+  }
+}
 
 double stampDiffSec(const rclcpp::Time &a, const rclcpp::Time &b)
 {
@@ -117,9 +141,9 @@ ArucoDetectorNode::ArucoDetectorNode()
 
   if (show_overlay_window_)
   {
-    cv::namedWindow("aruco_overlay", cv::WINDOW_NORMAL);
-    cv::resizeWindow("aruco_overlay", OVERLAY_INIT_WIDTH, OVERLAY_INIT_HEIGHT);
-    cv::setMouseCallback("aruco_overlay", &ArucoDetectorNode::onMouseThunk, this);
+    cv::namedWindow(kOverlayWindowName, cv::WINDOW_NORMAL);
+    cv::resizeWindow(kOverlayWindowName, OVERLAY_INIT_WIDTH, OVERLAY_INIT_HEIGHT);
+    cv::setMouseCallback(kOverlayWindowName, &ArucoDetectorNode::onMouseThunk, this);
   }
 
   pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("marker_pose", rclcpp::QoS(10));
@@ -131,15 +155,9 @@ ArucoDetectorNode::ArucoDetectorNode()
     overlay_pub_ = this->create_publisher<sensor_msgs::msg::Image>(overlay_topic_, rclcpp::QoS(5));
   }
 
-  color_sub_ = this->create_subscription<ImageMsg>(
-    color_topic_, rclcpp::SensorDataQoS(),
-    std::bind(&ArucoDetectorNode::colorCallback, this, std::placeholders::_1));
-  depth_sub_ = this->create_subscription<ImageMsg>(
-    depth_topic_, rclcpp::SensorDataQoS(),
-    std::bind(&ArucoDetectorNode::depthCallback, this, std::placeholders::_1));
-  info_sub_ = this->create_subscription<CameraInfoMsg>(
-    camera_info_topic_, rclcpp::QoS(10).best_effort(),
-    std::bind(&ArucoDetectorNode::cameraInfoCallback, this, std::placeholders::_1));
+  configureCameraSubscriptions();
+  parameter_callback_handle_ = this->add_on_set_parameters_callback(
+    std::bind(&ArucoDetectorNode::handleParameterUpdate, this, std::placeholders::_1));
 
   if (publish_viz_)
   {
@@ -172,6 +190,119 @@ ArucoDetectorNode::ArucoDetectorNode()
       "Calibration disabled. Marker poses will be published in frame: %s",
       camera_frame_id_.c_str());
   }
+}
+
+ArucoDetectorNode::~ArucoDetectorNode()
+{
+  if (show_overlay_window_)
+  {
+    destroyOpenCvWindowQuietly(kOverlayWindowName);
+  }
+}
+
+void ArucoDetectorNode::configureCameraSubscriptions()
+{
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    last_color_.reset();
+    last_depth_.reset();
+    last_info_.reset();
+    has_info_ = false;
+  }
+
+  color_sub_ = this->create_subscription<ImageMsg>(
+    color_topic_, rclcpp::SensorDataQoS(),
+    std::bind(&ArucoDetectorNode::colorCallback, this, std::placeholders::_1));
+  depth_sub_ = this->create_subscription<ImageMsg>(
+    depth_topic_, rclcpp::SensorDataQoS(),
+    std::bind(&ArucoDetectorNode::depthCallback, this, std::placeholders::_1));
+  info_sub_ = this->create_subscription<CameraInfoMsg>(
+    camera_info_topic_, rclcpp::QoS(10).best_effort(),
+    std::bind(&ArucoDetectorNode::cameraInfoCallback, this, std::placeholders::_1));
+}
+
+rcl_interfaces::msg::SetParametersResult ArucoDetectorNode::handleParameterUpdate(
+  const std::vector<rclcpp::Parameter> &parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  std::string new_color_topic = color_topic_;
+  std::string new_depth_topic = depth_topic_;
+  std::string new_camera_info_topic = camera_info_topic_;
+  std::string new_camera_frame = camera_frame_id_;
+
+  for (const auto &parameter : parameters)
+  {
+    const auto &name = parameter.get_name();
+    if (name != "color_topic" && name != "depth_topic" && name != "camera_info_topic" &&
+        name != "camera_frame")
+    {
+      continue;
+    }
+    if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING)
+    {
+      result.successful = false;
+      result.reason = name + " must be a string.";
+      return result;
+    }
+    const std::string value = parameter.as_string();
+    if (name == "camera_frame")
+    {
+      if (value.empty())
+      {
+        result.successful = false;
+        result.reason = name + " must be non-empty.";
+        return result;
+      }
+      new_camera_frame = value.front() == '/' ? value.substr(1) : value;
+      continue;
+    }
+    if (value.empty() || value.front() != '/')
+    {
+      result.successful = false;
+      result.reason = name + " must be non-empty and an absolute ROS topic.";
+      return result;
+    }
+    if (name == "color_topic")
+    {
+      new_color_topic = value;
+    }
+    else if (name == "depth_topic")
+    {
+      new_depth_topic = value;
+    }
+    else if (name == "camera_info_topic")
+    {
+      new_camera_info_topic = value;
+    }
+  }
+
+  const bool topics_changed =
+    new_color_topic != color_topic_ ||
+    new_depth_topic != depth_topic_ ||
+    new_camera_info_topic != camera_info_topic_;
+  if (!topics_changed)
+  {
+    if (new_camera_frame != camera_frame_id_)
+    {
+      camera_frame_id_ = new_camera_frame;
+      RCLCPP_INFO(get_logger(), "Camera frame updated: %s", camera_frame_id_.c_str());
+    }
+    return result;
+  }
+
+  color_topic_ = new_color_topic;
+  depth_topic_ = new_depth_topic;
+  camera_info_topic_ = new_camera_info_topic;
+  camera_frame_id_ = new_camera_frame;
+  configureCameraSubscriptions();
+  RCLCPP_INFO(
+    get_logger(),
+    "Camera topics updated. Color: %s Depth: %s Info: %s Frame: %s",
+    color_topic_.c_str(), depth_topic_.c_str(), camera_info_topic_.c_str(),
+    camera_frame_id_.c_str());
+  return result;
 }
 
 void ArucoDetectorNode::colorCallback(const ImageMsg::ConstSharedPtr msg)
@@ -614,8 +745,8 @@ void ArucoDetectorNode::publishOverlay(const rclcpp::Time &stamp, const cv::Mat 
   }
   if (show_overlay_window_)
   {
-    cv::imshow("aruco_overlay", stacked);
-    cv::waitKey(1);
+    cv::imshow(kOverlayWindowName, stacked);
+    processOverlayWindowEvents();
   }
   last_overlay_render_time_ = std::chrono::steady_clock::now();
 }
@@ -702,8 +833,8 @@ void ArucoDetectorNode::renderNoCameraTopicsOverlay()
   }
   if (show_overlay_window_)
   {
-    cv::imshow("aruco_overlay", placeholder);
-    cv::waitKey(1);
+    cv::imshow(kOverlayWindowName, placeholder);
+    processOverlayWindowEvents();
   }
   last_overlay_render_time_ = now;
 }
@@ -732,6 +863,33 @@ void ArucoDetectorNode::onMouse(int event, int x, int y, int flags)
   if (event == cv::EVENT_LBUTTONUP)
   {
     reset_button_pressed_ = false;
+  }
+}
+
+void ArucoDetectorNode::processOverlayWindowEvents()
+{
+  cv::waitKey(1);
+  if (isOpenCvWindowClosed(kOverlayWindowName))
+  {
+    requestShutdownFromWindowClose();
+  }
+}
+
+void ArucoDetectorNode::requestShutdownFromWindowClose()
+{
+  if (overlay_window_close_requested_)
+  {
+    return;
+  }
+  overlay_window_close_requested_ = true;
+  RCLCPP_INFO(get_logger(), "aruco_overlay window closed; shutting down.");
+  if (camera_status_timer_)
+  {
+    camera_status_timer_->cancel();
+  }
+  if (rclcpp::ok())
+  {
+    rclcpp::shutdown();
   }
 }
 

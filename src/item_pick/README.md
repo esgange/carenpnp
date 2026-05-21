@@ -26,6 +26,20 @@ source install/setup.bash
 ros2 launch item_pick item_pick.launch.py
 ```
 
+Headless service mode, with no Tkinter window:
+
+```bash
+ros2 launch item_pick item_pick.launch.py headless:=true
+```
+
+Important launch arguments are `runtime_settings_file`,
+`item_profile_state_file`, `motion_service_root`, `item_pose_topic`,
+`track_service`, `track_status_service`, and `item_seek_complete_service`.
+When `load_runtime_settings:=true`, the JSON runtime settings are loaded at
+startup. In headless mode the JSON file must exist and include the complete
+runtime key set; launch arguments are treated as overrides, not the normal place
+to keep motion settings.
+
 Direct run:
 
 ```bash
@@ -86,24 +100,28 @@ Main robot services used:
 - `MovLIO`
 - `DO`
 
-## Tool Teach Sidecars
+## Tool Teach
 
-Each item-detect profile requires a saved tool teach sidecar before arming. The
-sidecar stores the Link6/tool offset, operator pick heights, pre-pick settling,
-and pickup-depth settling for the active item teach.
+Each item-detect profile requires saved tool teach data before arming. The
+`tool_teach` block inside the item profile stores the Link6/tool offset,
+operator pick heights, pre-pick settling, and pickup-depth settling for that
+active item teach.
 
-Sidecar pattern:
+Embedded profile block:
 
 ```text
-WORKSPACE_ROOT/teach/item_teach/<item_name>_tool.yaml
+WORKSPACE_ROOT/teach/item_teach/item_<item_name>[_bin_<bin_name>]_<ddmmyyyy>.yaml
 ```
 
 The GUI can:
 
-- load the sidecar for the active `item_detect` profile;
+- load embedded tool teach data for the active `item_detect` profile;
 - preview the tool offset TF in RViz;
 - save updated tool teach values with `Save Tool Teach`;
 - block arming when the active item profile has no saved tool teach.
+
+Legacy `<item_name>_tool.yaml` sidecars are still readable for older profiles,
+but new saves update the item profile directly.
 
 ## Motion Sequence
 
@@ -140,6 +158,6 @@ preview frames including:
 
 - Run `item_detect` first so `bin_seek_pose` and the active profile export are
   available.
-- Save a tool teach sidecar for each new item profile before running a real pick.
+- Save tool teach for each new item profile before running a real pick.
 - Use troubleshoot/TF-only mode to validate target frames before enabling robot
   motion.

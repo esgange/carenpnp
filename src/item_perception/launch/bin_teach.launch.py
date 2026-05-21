@@ -16,7 +16,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -73,6 +72,7 @@ def generate_launch_description():
     calibration_child_frame = LaunchConfiguration("calibration_child_frame")
     calibration_dir = LaunchConfiguration("calibration_dir")
     calibration_file = LaunchConfiguration("calibration_file")
+    calibration_file_prefix = LaunchConfiguration("calibration_file_prefix")
     target_frame = LaunchConfiguration("target_frame")
     marker_parent_frame = LaunchConfiguration("marker_parent_frame")
     base_frame = LaunchConfiguration("base_frame")
@@ -132,6 +132,7 @@ def generate_launch_description():
             "child_frame": calibration_child_frame,
             "calibration_dir": calibration_dir,
             "calibration_file": calibration_file,
+            "calibration_file_prefix": calibration_file_prefix,
             "show_overlay_window": show_aruco_overlay,
             "publish_overlay": publish_aruco_overlay,
             "overlay_rate_hz": aruco_overlay_rate_hz,
@@ -183,19 +184,20 @@ def generate_launch_description():
 
     return LaunchDescription([
         _ros_domain_action(),
-        DeclareLaunchArgument("color_topic", default_value="/robot_camera/color/image_raw"),
-        DeclareLaunchArgument("depth_topic", default_value="/robot_camera/depth/image_raw"),
-        DeclareLaunchArgument("camera_info_topic", default_value="/robot_camera/color/camera_info"),
+        DeclareLaunchArgument("color_topic", default_value="/bin_camera/color/image_raw"),
+        DeclareLaunchArgument("depth_topic", default_value="/bin_camera/depth/image_raw"),
+        DeclareLaunchArgument("camera_info_topic", default_value="/bin_camera/color/camera_info"),
         DeclareLaunchArgument("use_calibration", default_value="true"),
-        DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
-        DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("calibration_parent_frame", default_value="base_link"),
+        DeclareLaunchArgument("calibration_child_frame", default_value="bin_calibrated_link"),
         DeclareLaunchArgument("calibration_dir", default_value=_repo_path("calibration")),
         DeclareLaunchArgument("calibration_file", default_value=""),
+        DeclareLaunchArgument("calibration_file_prefix", default_value="axab_calibration_eyetohand_"),
         DeclareLaunchArgument("target_frame", default_value="bin_teach_target"),
-        DeclareLaunchArgument("marker_parent_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("marker_parent_frame", default_value="bin_calibrated_link"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("gripper_frame", default_value="Link6"),
-        DeclareLaunchArgument("camera_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("camera_frame", default_value="bin_calibrated_link"),
         DeclareLaunchArgument("use_platform_calibration", default_value="true"),
         DeclareLaunchArgument("auto_discover_platform_calibration", default_value="true"),
         DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("calibration")),
@@ -211,7 +213,7 @@ def generate_launch_description():
             "output_dir",
             default_value=bin_teach_dir,
         ),
-        DeclareLaunchArgument("bin_name", default_value="bin"),
+        DeclareLaunchArgument("bin_name", default_value=""),
         DeclareLaunchArgument("show_aruco_overlay", default_value="false"),
         DeclareLaunchArgument("publish_aruco_overlay", default_value="true"),
         DeclareLaunchArgument("aruco_overlay_rate_hz", default_value="10.0"),

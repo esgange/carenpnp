@@ -1,8 +1,8 @@
 item_detect:
   ros__parameters:
-    color_topic: /camera/color/image_raw
-    depth_topic: /camera/depth/image_raw
-    camera_info_topic: /camera/color/camera_info
+    color_topic: /bin_camera/color/image_raw
+    depth_topic: /bin_camera/depth/image_raw
+    camera_info_topic: /bin_camera/color/camera_info
     overlay_topic: bin_overlay
     red_threshold: 206
     green_threshold: 212
@@ -18,7 +18,7 @@ item_detect:
     focus_black_mask: false
     detection_mode: depth
     associated_bin_name: blue_bin
-    bin_teach_file: /home/erds/DOBOT_pickn_place/teach/bin_teach/blue_bin.yaml
+    bin_teach_file: /home/erds/DOBOT_pickn_place/teach/bin_teach/bin_blue_bin_08052026.yaml
     depth_plane_source: bin_teach
     depth_plane_enabled: true
     depth_plane_a: -0.051844945668999998
@@ -27,7 +27,7 @@ item_detect:
     depth_plane_reference_depth_m: 0.67562002658800002
     align_item_z_axis_to_depth_plane: true
     depth_plane_roi: [212, 34, 677, 448]
-    roi_points: [212, 51, 671, 34, 677, 448, 219, 448]
+    roi_points: [290, 42, 692, 43, 690, 398, 288, 398]
     pose_template_mode: pair
     pose_blob_reference_area_px: 4157
     pose_blob_reference_aspect_ratio: 2.0138061046600342
@@ -192,4 +192,18 @@ item_detect:
     pose_z_length_px: 45.30572509765625
     item_name: paper_cutlery
     teach_date: 2026-05-08
-    teach_joints_deg: [20.665969496109373, 22.75782164853657, -102.91803565895833, -8.8150366233133255, 92.986158692147427, 19.891374248702427]
+    teach_joints_deg: [-25.09, 16.07, -135.21, 26.3, 91.51, -1.39]
+tool_teach:
+  tool_teach_version: 3
+  item_teach_name: paper_cutlery
+  item_standoff_z_mm: 90
+  approach_z_up_mm: 50
+  final_z_up_mm: 100
+  pre_pick_settling_time_sec: 1
+  pick_settling_time_sec: 0.2
+  tool_offset_x_mm: 0
+  tool_offset_y_mm: 0
+  tool_offset_z_mm: 0
+  tool_offset_rx_deg: 0
+  tool_offset_ry_deg: 0
+  tool_offset_rz_deg: 0

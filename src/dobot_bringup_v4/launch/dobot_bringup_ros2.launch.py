@@ -30,7 +30,6 @@ def _workspace_root() -> Path:
         return (
             (path / 'config' / 'robot_bringup' / 'param.json').exists()
             or (path / 'src' / 'dobot_msgs_v4').exists()
-            or (path / 'docker-compose.yml').exists()
         )
 
     for name in ('DOBOT_PICKN_PLACE_ROOT', 'DOBOT_WORKSPACE_ROOT'):
@@ -55,13 +54,81 @@ def _default_config_path() -> str:
     return str(get_package_share_path('cr_robot_ros2') / 'config' / 'param.json')
 
 
-def _launch_setup(context, *args, **kwargs):
-    config_path = Path(LaunchConfiguration('config').perform(context)).expanduser()
-    if not config_path.exists():
-        raise FileNotFoundError(f"[cr_robot_ros2] param.json not found at: {config_path}")
+def _default_station_config_path() -> str:
+    return str(_workspace_root() / 'station_config')
 
-    with open(config_path, 'r') as f:
-        cfg = json.load(f)
+
+def _load_station_config(path: Path) -> dict[str, str]:
+    settings: dict[str, str] = {}
+    with open(path, 'r', encoding='utf-8') as stream:
+        for raw_line in stream:
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('export '):
+                line = line[len('export '):].strip()
+            if '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            settings[key.strip()] = value
+    return settings
+
+
+def _station_value(settings: dict[str, str], *names: str, default=None):
+    for name in names:
+        value = settings.get(name)
+        if value not in (None, ''):
+            return value
+    return default
+
+
+def _station_has_robot_bringup(settings: dict[str, str]) -> bool:
+    return any(
+        key in settings
+        for key in ('ROBOT_IP_ADDRESS', 'ROBOT_TYPE', 'ROBOT_NUMBER', 'ROS_LOCALHOST_ONLY')
+    )
+
+
+def _station_config_to_bringup_config(settings: dict[str, str]) -> dict:
+    robot_ip = _station_value(settings, 'ROBOT_IP_ADDRESS', 'ip_address')
+    if not robot_ip:
+        raise KeyError("[cr_robot_ros2] Missing required station_config key `ROBOT_IP_ADDRESS`.")
+
+    return {
+        'robot_number': int(_station_value(settings, 'ROBOT_NUMBER', 'robot_number', default=1)),
+        'ros_localhost_only': _station_value(
+            settings,
+            'ROS_LOCALHOST_ONLY',
+            'ros_localhost_only',
+            default=False,
+        ),
+        'node_info': [
+            {
+                'ip_address': robot_ip,
+                'robot_type': _station_value(settings, 'ROBOT_TYPE', 'robot_type', default='cr5'),
+            }
+        ],
+    }
+
+
+def _launch_setup(context, *args, **kwargs):
+    station_config_path = Path(LaunchConfiguration('station_config').perform(context)).expanduser()
+    cfg = None
+    if station_config_path.exists():
+        station_settings = _load_station_config(station_config_path)
+        if _station_has_robot_bringup(station_settings):
+            cfg = _station_config_to_bringup_config(station_settings)
+
+    if cfg is None:
+        config_path = Path(LaunchConfiguration('config').perform(context)).expanduser()
+        if not config_path.exists():
+            raise FileNotFoundError(f"[cr_robot_ros2] param.json not found at: {config_path}")
+
+        with open(config_path, 'r') as f:
+            cfg = json.load(f)
 
     # Read high-level config
     robot_number = int(cfg.get('robot_number', 1))
@@ -146,6 +213,11 @@ def generate_launch_description():
             'config',
             default_value=_default_config_path(),
             description='Path to the param.json containing robot connection info.'
+        ),
+        DeclareLaunchArgument(
+            'station_config',
+            default_value=_default_station_config_path(),
+            description='Path to station_config containing robot connection info.'
         ),
         OpaqueFunction(function=_launch_setup),
     ])

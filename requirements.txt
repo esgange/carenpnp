@@ -1,22 +1,26 @@
-# Python dependencies for optional workspace-local perception tooling.
-#
+# Frozen direct Python dependencies for workspace-local runtime, bridge,
+# AI/perception, and test tooling.
 # ROS 2 packages such as rclpy, cv_bridge, python_qt_binding, launch, and
-# message packages are installed with apt/rosdep from the package.xml files.
-#
-# This file follows the current CPU PyTorch setup documented in README.md. On a
-# CUDA machine, replace the PyTorch wheel source and torch/torchvision pins with
-# the matching CUDA wheels before installing.
+# message packages are installed from the frozen apt/ROS package bundle.
+# Transitive wheel closure is locked in requirements.lock.txt.
 
---extra-index-url https://download.pytorch.org/whl/cpu
-
-numpy>=1.24.4,<2.0
-opencv-python>=4.8
-PyYAML>=6.0
-onnxruntime>=1.17
+aio-pika==9.6.2
+numpy==1.26.4
+opencv-python==4.10.0.84
+PyYAML==6.0.3
+pillow==12.1.1
+tqdm==4.67.3
+onnx==1.21.0
+onnxruntime==1.23.2
 torch==2.5.1+cpu
 torchvision==0.20.1+cpu
-ultralytics>=8.3,<9.0
+ultralytics==8.4.48
+ultralytics-thop==2.0.19
+hydra-core==1.3.2
+iopath==0.1.10
+omegaconf==2.3.0
+pytest==9.0.3
+pytest-asyncio==1.3.0
 
-# SAM2 is used by item_perception_yolo/item_teach_yolo_node.py.
-# The commit matches the workspace-local checkout currently used in third_party/sam2.
-SAM-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f
+# SAM2 itself is installed from the vendored checkout at third_party/sam2 by
+# tools/deps/install_offline_deps.sh. Do not use a live git URL here.

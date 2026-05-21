@@ -11,7 +11,6 @@ estimation, and optional robot seek/go-to-teach behavior.
 | --- | --- |
 | `item_teach` | Interactive OpenCV UI for teaching ROI, RGB thresholds, depth plane, depth mask tuning, and item pose references. |
 | `item_detect` | Runtime detector that loads taught profiles, tracks the selected bin, publishes poses and overlays, and manages profile selection/deletion. |
-| `item_detect_eyetohand` | Eye-to-hand runtime detector variant that defaults to the `/bin_camera` RGB-D stream. |
 | `bin_teach` | ArUco-assisted bin-frame teaching utility. |
 
 ## Build
@@ -39,20 +38,10 @@ Run detection:
 ros2 launch item_perception item_detect.launch.py
 ```
 
-`item_teach` defaults to the bin camera stream under `/bin_camera`. Normal
-runtime `item_detect` defaults to the robot camera stream under `/robot_camera`.
+`item_teach` and runtime `item_detect` default to the bin camera stream under
+`/bin_camera`.
 Pass `color_topic`, `depth_topic`, `camera_info_topic`, and
 `camera_control_service_root` when using a different camera namespace.
-
-Run eye-to-hand detection on the dual-camera item stream:
-
-```bash
-ros2 launch item_perception item_detect_eyetohand.launch.py
-```
-
-By default this launch file subscribes to `/bin_camera/color/image_raw`,
-`/bin_camera/depth/image_raw`, and `/bin_camera/color/camera_info`, with camera
-controls rooted at `/bin_camera`.
 
 Teach a bin frame from ArUco markers:
 
@@ -69,7 +58,7 @@ WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>.yaml
 Create or update that file first with:
 
 ```bash
-ros2 launch camera_calibration platform_teach.launch.py platform_name:=robot_platform_1
+ros2 launch camera_calibration platform_teach.launch.py
 ```
 
 Set `use_platform_calibration:=false` only when you intentionally want a
@@ -82,7 +71,18 @@ Common launch overrides:
 ```bash
 ros2 launch item_perception item_teach.launch.py calibration_file:=/abs/path/to/calibration.yaml
 ros2 launch item_perception item_detect.launch.py align_item_z_axis_to_depth_plane:=true
+ros2 launch item_perception item_detect.launch.py profiles_dir:=/abs/path/to/profiles
+ros2 launch item_perception item_detect.launch.py selected_profile_path:=/abs/path/to/item.yaml
+ros2 launch item_perception item_detect.launch.py headless:=true start_visualization:=false
 ```
+
+`item_teach` and `item_detect` expose `profiles_dir`. Detect launches also
+expose `selected_profile_path`, `runtime_settings_file`, and
+`selected_profile_export_file`, which lets Robot Cell Orchestrator point offline launches at
+the selected teach file and online launches at the root `runtime/` handoff
+folder.
+Use `headless:=true` for production/service mode; it keeps topics and services
+active without creating the OpenCV operator window.
 
 ## Calibration
 
@@ -160,9 +160,13 @@ item_<name>_<ddmmyyyy>.yaml
 item_<name>_bin_<associated_bin>_<ddmmyyyy>.yaml
 ```
 
-The detector only lists real profile YAML files from the profiles directory.
+The detector opens real profile YAML files from the profiles directory.
 Aggregate settings files such as `item_teach_settings.yaml` and
-`bin_teach_settings.yaml` are ignored and should not appear in the dropdown.
+`bin_teach_settings.yaml` are ignored.
+
+The item and bin teach windows start with blank item/bin names. Enter the name
+in the teach UI before saving so dated profiles are never written as generic
+`item` or `bin` files.
 
 Bin-teach profiles are saved in:
 
@@ -170,18 +174,19 @@ Bin-teach profiles are saved in:
 WORKSPACE_ROOT/teach/bin_teach
 ```
 
-New bin-teach files use the name you enter:
+New bin-teach files use the same dated naming convention as other teach files:
 
 ```text
-<name>.yaml
+bin_<name>_<ddmmyyyy>.yaml
 ```
 
 With platform calibration enabled, each bin-teach YAML saves the bin transform in
-the loaded platform frame, for example `robot_platform_1 -> bin_blue_bin_frame`,
+the loaded platform frame, for example `platform_teach -> bin_blue_bin_frame`,
 and records the platform calibration file under `platform_reference`. The saved
 `roi_points` are still the four image-space corner dots used by `item_teach`.
 Each file also saves the bin reference depth plane as `depth_plane_*` fields
 using the same `a*x_norm + b*y_norm + c` model consumed by item profiles.
+Existing legacy files such as `<name>.yaml` are still loaded by the teach UIs.
 
 Runtime state files are stored under:
 
@@ -194,11 +199,14 @@ Runtime state files:
 | File | Owner | Purpose |
 | --- | --- | --- |
 | `item_teach_runtime.yaml` | `item_teach` | Stores teach UI/runtime preferences. |
-| `item_detect_runtime_settings.yaml` | `item_detect` | Stores detect UI/runtime preferences, including the selected profile path. |
-| `item_detect_selected_profile.txt` | `item_detect` | Exports the current selected profile path for other nodes. |
+| `item_detect_runtime_settings.yaml` | `item_detect` | Stores detect UI/runtime preferences such as view mode, overlay, tolerance, and seek timing. |
+| `item_detect_selected_profile.txt` | `item_detect` | Exports the current selected profile path for other nodes. Teach selection is provided at launch with `selected_profile_path:=...`. |
 
-Deleting a profile from `item_detect` removes the selected dated YAML file and
-refreshes the dropdown from disk.
+Use `Open Teach` in `item_detect` to browse for a teach YAML file. Deleting a
+profile from `item_detect` removes the selected dated YAML file from disk.
+`Debug Img` is intentionally off by default and is not saved to runtime settings.
+This is a production/headless safety exception: persisting it can flood the repo
+with debug images on unattended runs.
 
 ## Saved Profile Contract
 
@@ -221,6 +229,8 @@ refreshes the dropdown from disk.
 - Z-axis alignment policy:
   - `align_item_z_axis_to_depth_plane`
 - Pose template data for single or pair references.
+- Optional embedded `tool_teach` data used by `item_pick`. `item_teach`
+  preserves this block when re-saving an existing profile.
 
 Teach preview tolerance is intentionally excluded from saved profiles. Runtime
 detect tolerance is controlled by `item_detect` and its runtime settings.

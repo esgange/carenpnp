@@ -13,7 +13,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -39,6 +38,13 @@ def _repo_path(*parts: str) -> str:
 
 def _to_bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _to_int(value: str, name: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got: {value!r}") from exc
 
 
 def _show_missing_calibration_dialog(message: str) -> None:
@@ -87,10 +93,37 @@ def _calibration_file_is_usable(path: str) -> bool:
 
 def _launch_setup(context, *args, **kwargs):
     params_file = LaunchConfiguration("params_file").perform(context)
+    profiles_dir = os.path.expanduser(LaunchConfiguration("profiles_dir").perform(context).strip())
+    selected_profile_path = os.path.expanduser(
+        LaunchConfiguration("selected_profile_path").perform(context).strip()
+    )
+    runtime_settings_file = os.path.expanduser(
+        LaunchConfiguration("runtime_settings_file").perform(context).strip()
+    )
     color_topic = LaunchConfiguration("color_topic").perform(context)
     depth_topic = LaunchConfiguration("depth_topic").perform(context)
     camera_info_topic = LaunchConfiguration("camera_info_topic").perform(context)
+    overlay_topic = LaunchConfiguration("overlay_topic").perform(context)
+    publish_overlay = _to_bool(LaunchConfiguration("publish_overlay").perform(context))
+    camera_control_service_root = LaunchConfiguration("camera_control_service_root").perform(context)
+    color_exposure_min_us = _to_int(
+        LaunchConfiguration("color_exposure_min_us").perform(context),
+        "color_exposure_min_us",
+    )
+    color_exposure_max_us = _to_int(
+        LaunchConfiguration("color_exposure_max_us").perform(context),
+        "color_exposure_max_us",
+    )
+    depth_exposure_min_us = _to_int(
+        LaunchConfiguration("depth_exposure_min_us").perform(context),
+        "depth_exposure_min_us",
+    )
+    depth_exposure_max_us = _to_int(
+        LaunchConfiguration("depth_exposure_max_us").perform(context),
+        "depth_exposure_max_us",
+    )
     tray_pose_topic = LaunchConfiguration("tray_pose_topic").perform(context)
+    tray_axis_overlay_topic = LaunchConfiguration("tray_axis_overlay_topic").perform(context)
     tray_vector_topic = LaunchConfiguration("tray_vector_topic").perform(context)
 
     use_calibration = _to_bool(LaunchConfiguration("use_calibration").perform(context))
@@ -100,6 +133,7 @@ def _launch_setup(context, *args, **kwargs):
     calibration_file = os.path.expanduser(LaunchConfiguration("calibration_file").perform(context))
     camera_frame_override = LaunchConfiguration("camera_frame").perform(context).strip()
     start_visualization = _to_bool(LaunchConfiguration("start_visualization").perform(context))
+    headless = _to_bool(LaunchConfiguration("headless").perform(context))
 
     selected_file = ""
     if use_calibration:
@@ -139,10 +173,22 @@ def _launch_setup(context, *args, **kwargs):
                     "color_topic": color_topic,
                     "depth_topic": depth_topic,
                     "camera_info_topic": camera_info_topic,
+                    "overlay_topic": overlay_topic,
+                    "publish_overlay": publish_overlay,
+                    "camera_control_service_root": camera_control_service_root,
+                    "color_exposure_min_us": color_exposure_min_us,
+                    "color_exposure_max_us": color_exposure_max_us,
+                    "depth_exposure_min_us": depth_exposure_min_us,
+                    "depth_exposure_max_us": depth_exposure_max_us,
                     "tray_pose_topic": tray_pose_topic,
+                    "tray_axis_overlay_topic": tray_axis_overlay_topic,
                     "tray_vector_topic": tray_vector_topic,
+                    "profiles_dir": profiles_dir,
+                    "selected_profile_path": selected_profile_path,
+                    "runtime_settings_file": runtime_settings_file,
                     "camera_frame": tray_camera_frame,
                     "start_visualization": start_visualization,
+                    "headless": headless,
                     "use_calibration": use_calibration,
                     "publish_static_calibration_tf": use_calibration,
                     "calibration_parent_frame": parent_frame,
@@ -187,6 +233,18 @@ def generate_launch_description():
             default_value=_repo_path("config", "tray_perception", "tray_teach_settings.yaml"),
         ),
         DeclareLaunchArgument(
+            "profiles_dir",
+            default_value=_repo_path("teach", "tray_teach"),
+        ),
+        DeclareLaunchArgument(
+            "selected_profile_path",
+            default_value="",
+        ),
+        DeclareLaunchArgument(
+            "runtime_settings_file",
+            default_value=_repo_path("config", "tray_perception", "tray_detect_runtime_settings.yaml"),
+        ),
+        DeclareLaunchArgument(
             "color_topic",
             default_value="/robot_camera/color/image_raw",
         ),
@@ -199,8 +257,40 @@ def generate_launch_description():
             default_value="/robot_camera/color/camera_info",
         ),
         DeclareLaunchArgument(
+            "overlay_topic",
+            default_value="tray_overlay",
+        ),
+        DeclareLaunchArgument(
+            "publish_overlay",
+            default_value="true",
+        ),
+        DeclareLaunchArgument(
+            "camera_control_service_root",
+            default_value="/robot_camera",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_max_us",
+            default_value="100",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_max_us",
+            default_value="32000",
+        ),
+        DeclareLaunchArgument(
             "tray_pose_topic",
             default_value="tray_pose",
+        ),
+        DeclareLaunchArgument(
+            "tray_axis_overlay_topic",
+            default_value="tray_axis_overlay",
         ),
         DeclareLaunchArgument(
             "tray_vector_topic",
@@ -233,6 +323,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "start_visualization",
             default_value="true",
+        ),
+        DeclareLaunchArgument(
+            "headless",
+            default_value="false",
         ),
         OpaqueFunction(function=_launch_setup),
     ])

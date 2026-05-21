@@ -36,7 +36,7 @@ The package contains the DOBOT command service definitions used by
 | Family | Examples |
 | --- | --- |
 | Robot state and safety | `EnableRobot`, `DisableRobot`, `ClearError`, `RobotMode`, `EmergencyStop` |
-| Motion | `MovJ`, `MovL`, `MovJIO`, `MovLIO`, `Arc`, `Circle`, `MoveJog`, `ServoJ`, `ServoP` |
+| Motion | `MovJ`, `MovL`, `MovJIO`, `MovLIO`, `Arc`, `Circle`, `MoveJog` |
 | Relative motion | `RelMovJTool`, `RelMovLTool`, `RelMovJUser`, `RelMovLUser`, `RelJointMovJ` |
 | Speed and acceleration | `SpeedFactor`, `VelJ`, `VelL`, `AccJ`, `AccL`, `CP` |
 | IO and Modbus | `DI`, `DO`, `AI`, `AO`, `GetCoils`, `SetCoils`, `GetHoldRegs`, `SetHoldRegs` |

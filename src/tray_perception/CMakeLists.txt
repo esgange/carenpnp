@@ -15,6 +15,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(dobot_msgs_v4 REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(orbbec_camera_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
@@ -27,6 +28,8 @@ target_include_directories(tray_teach_node PUBLIC
 ament_target_dependencies(tray_teach_node
   rclcpp
   sensor_msgs
+  std_srvs
+  orbbec_camera_msgs
   cv_bridge
   OpenCV
 )
@@ -42,6 +45,7 @@ ament_target_dependencies(tray_detect_node
   nav_msgs
   sensor_msgs
   std_srvs
+  orbbec_camera_msgs
   visualization_msgs
   dobot_msgs_v4
   cv_bridge

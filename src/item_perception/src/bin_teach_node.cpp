@@ -269,7 +269,15 @@ std::string sanitizeName(const std::string &text)
   {
     token.pop_back();
   }
-  return token.empty() ? "bin" : token;
+  return token;
+}
+
+std::string binTeachFilenameStem(const std::string &safe_bin_name, const std::string &compact_date)
+{
+  const bool already_bin_prefixed =
+    safe_bin_name == "bin" || safe_bin_name.rfind("bin_", 0) == 0;
+  const std::string base_name = already_bin_prefixed ? safe_bin_name : "bin_" + safe_bin_name;
+  return base_name + "_" + compact_date;
 }
 
 std::string formatMarkerIds(const std::vector<int> &marker_ids, const std::string &conjunction = "and")
@@ -851,7 +859,7 @@ public:
     static_platform_tf_broadcaster_(std::make_shared<tf2_ros::StaticTransformBroadcaster>(this))
   {
     marker_prefix_ = declare_parameter<std::string>("marker_prefix", "aruco_marker");
-    parent_frame_ = declare_parameter<std::string>("parent_frame", "calibrated_camera_link");
+    parent_frame_ = declare_parameter<std::string>("parent_frame", "bin_calibrated_link");
     target_frame_ = declare_parameter<std::string>("target_frame", "bin_teach_target");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     gripper_frame_ = declare_parameter<std::string>("gripper_frame", "Link6");
@@ -863,7 +871,7 @@ public:
       "platform_calibration_dir",
       defaultPlatformCalibrationDir().string());
     platform_calibration_file_ = declare_parameter<std::string>("platform_calibration_file", "");
-    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
+    color_topic_ = declare_parameter<std::string>("color_topic", "/bin_camera/color/image_raw");
     const std::string default_output_dir =
       dobot_common::paths::workspacePath({"teach", "bin_teach"}, __FILE__).string();
     const std::string bin_teach_dir_alias = declare_parameter<std::string>("bin_teach_dir", "");
@@ -871,7 +879,7 @@ public:
       "output_dir",
       bin_teach_dir_alias.empty() ? default_output_dir : bin_teach_dir_alias);
     output_dir_ = expandUserPath(output_dir_param);
-    default_bin_name_ = declare_parameter<std::string>("bin_name", "bin");
+    default_bin_name_ = declare_parameter<std::string>("bin_name", "");
     bin_frame_prefix_ = declare_parameter<std::string>("bin_frame_prefix", "bin");
     overlay_topic_ = declare_parameter<std::string>("overlay_topic", "/aruco_overlay");
     use_aruco_overlay_ = declare_parameter<bool>("use_aruco_overlay", false);
@@ -1218,6 +1226,10 @@ public:
   {
     const CentroidPose pose = markerCentroidPose(markers);
     const std::string safe_name = sanitizeName(bin_name);
+    if (safe_name.empty())
+    {
+      throw std::runtime_error("Enter a bin name before aligning or saving.");
+    }
     Solution solution;
     solution.bin_name = safe_name;
     solution.frame_id = bin_frame_prefix_ + "_" + safe_name + "_frame";
@@ -1335,7 +1347,6 @@ public:
   std::filesystem::path saveSolution(const Solution &solution)
   {
     std::filesystem::create_directories(output_dir_);
-    const std::filesystem::path path = output_dir_ / (solution.bin_name + ".yaml");
     const std::time_t now_time = std::time(nullptr);
     std::tm tm{};
 #ifdef _WIN32
@@ -1345,6 +1356,14 @@ public:
 #endif
     std::ostringstream stamp_stream;
     stamp_stream << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    std::ostringstream teach_date_stream;
+    teach_date_stream << std::put_time(&tm, "%Y-%m-%d");
+    std::ostringstream compact_date_stream;
+    compact_date_stream << std::put_time(&tm, "%d%m%Y");
+    const std::string teach_date = teach_date_stream.str();
+    const std::string compact_date = compact_date_stream.str();
+    const std::filesystem::path path =
+      output_dir_ / (binTeachFilenameStem(solution.bin_name, compact_date) + ".yaml");
 
     auto vec_line = [](const std::string &name, const Vec3 &value, const std::string &indent = "    ") {
       std::ostringstream stream;
@@ -1358,6 +1377,8 @@ public:
     std::ostringstream text;
     text << "bin_teach:\n";
     text << "  bin_name: " << solution.bin_name << "\n";
+    text << "  teach_date: \"" << teach_date << "\"\n";
+    text << "  teach_date_compact: \"" << compact_date << "\"\n";
     text << "  created_at: \"" << stamp_stream.str() << "\"\n";
     text << "  parent_frame: " << solution.parent_frame << "\n";
     text << "  bin_frame: " << solution.frame_id << "\n";
@@ -2650,6 +2671,7 @@ public:
     setMinimumSize(1180, 720);
 
     bin_name_ = new QLineEdit(QString::fromStdString(node_->defaultBinName()), this);
+    bin_name_->setPlaceholderText("Enter bin name");
 
     auto *form = new QFormLayout();
     form->addRow("Bin name", bin_name_);
@@ -2800,6 +2822,15 @@ private:
     const std::vector<int> marker_ids = ids();
     const std::string requirement = node_->markerRequirementText();
     std::vector<std::string> lines;
+    if (!hasValidBinName())
+    {
+      lines.push_back("Enter a bin name before aligning or saving.");
+      align_button_->setEnabled(false);
+      save_button_->setEnabled(false);
+      status_->setPlainText(QString::fromStdString(joinLines(lines)));
+      return;
+    }
+    align_button_->setEnabled(true);
     try
     {
       const auto visible_result = node_->markersVisibleRecent(marker_ids);
@@ -2884,6 +2915,13 @@ private:
 
   void planAndSendFullOrientationPose()
   {
+    if (!hasValidBinName())
+    {
+      finishAlign();
+      align_button_->setEnabled(false);
+      log("[align] Enter a bin name before aligning.", 3.0);
+      return;
+    }
     AlignPlan plan;
     try
     {
@@ -3312,6 +3350,10 @@ private:
   {
     try
     {
+      if (!hasValidBinName())
+      {
+        throw std::runtime_error("Enter a bin name before saving.");
+      }
       const Solution solution = node_->computeSolution(bin_name_->text().toStdString());
       const std::filesystem::path path = node_->saveSolution(solution);
       status_->setPlainText(status_->toPlainText() + QString::fromStdString("\n\nSaved bin_teach:\n" + path.string()));
@@ -3325,6 +3367,12 @@ private:
   }
 
   std::shared_ptr<BinTeachNode> node_;
+
+  bool hasValidBinName() const
+  {
+    return !sanitizeName(bin_name_->text().toStdString()).empty();
+  }
+
   bool align_in_flight_{false};
   std::string align_state_{"idle"};
   std::optional<GoalPose> align_goal_;

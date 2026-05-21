@@ -1,5 +1,0 @@
-path: /home/erds/DOBOT_pickn_place/teach/bins_yolo/runtime/item_20260513_151027/dataset
-train: images/train
-val: images/train
-names:
-  0: item

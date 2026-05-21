@@ -33,7 +33,6 @@ def workspace_root() -> Path:
             (path / 'src').exists() and
             (
                 (path / 'README.md').exists()
-                or (path / 'docker-compose.yml').exists()
                 or (path / 'src' / 'dobot_msgs_v4').exists()
             )
         )
@@ -121,7 +120,7 @@ COMMAND_HYSTERESIS_MAX_SEC = 1.0
 COMMAND_HYSTERESIS_DEFAULT_SEC = 0.1
 LOCKED_MAX_SPEED_MM_S = POST_STOP_MOVL_SPEED_MAX
 TCP_GOAL_REACHED_TOLERANCE_MM = 5.0
-MANUAL_RELEASE_PULSE_MS = 300
+MANUAL_RELEASE_PULSE_MS = 500
 GOAL_TF_LOOKUP_TIMEOUT_SEC_DEFAULT = 0.2
 CAMERA_BIN_SAFE_MARGIN_MM_DEFAULT = 0.0
 START_SEQUENCE_SERVICE_DEFAULT = 'item_pick/start_sequence'
@@ -135,6 +134,7 @@ TOOL_OFFSET_PREVIEW_AXIS_Y_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_ax
 TOOL_OFFSET_PREVIEW_AXIS_Z_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_z_tip'
 RUNTIME_SETTINGS_PATH = workspace_path('config', 'item_perception', 'item_pick_runtime_settings.json')
 ITEM_PROFILE_STATE_PATH = workspace_path('config', 'item_perception', 'item_detect_selected_profile.txt')
+TOOL_TEACH_ROOT_KEY = 'tool_teach'
 TOOL_TEACH_FILE_SUFFIX = '_tool.yaml'
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
 GOAL_TF_DIAG_AXIS_LENGTH_MM = 60.0
@@ -143,6 +143,19 @@ GRIPPER_DO_OPEN_INDEX = 2
 GRIPPER_DO_SUCTION_INDEX = 3
 MOVLIO_DO_MODE_PERCENT = 0
 MOVLIO_PICKUP_START_DISTANCE_PERCENT = 0
+ITEM_PICK_RUNTIME_REQUIRED_KEYS = (
+    'schema_version',
+    'tf_only_mode',
+    'item_pose_wait_timeout_sec',
+    'ee_intercept_speed_mm_s',
+    'tray_intercept_x_offset_mm',
+    'tray_intercept_y_offset_mm',
+    'item_standoff_z_mm',
+    'approach_z_up_mm',
+    'final_z_up_mm',
+    'pre_pick_settling_time_sec',
+    'pick_settling_time_sec',
+)
 
 
 def _safe_tool_teach_name(raw_name: object) -> str:
@@ -211,7 +224,7 @@ def display_name_for_tool_teach_profile(profile_key: str | None) -> str:
     if not profile_key:
         return 'No active tool teach'
     try:
-        return tool_teach_path_for_profile(profile_key).name
+        return f'{display_name_for_item_teach_profile(profile_key)} tool teach'
     except Exception:
         return display_name_for_item_teach_profile(profile_key)
 
@@ -250,6 +263,99 @@ def read_simple_yaml_mapping(path: Path) -> dict[str, object] | None:
     return payload
 
 
+def embedded_tool_teach_payload_from_profile(profile_key: str | Path) -> dict[str, object] | None:
+    if yaml is None:
+        return None
+    profile_path = Path(profile_key).expanduser()
+    if not profile_path.exists():
+        return None
+    try:
+        with profile_path.open('r', encoding='utf-8') as infile:
+            root = yaml.safe_load(infile)
+    except Exception:
+        return None
+    if not isinstance(root, dict):
+        return None
+    payload = root.get(TOOL_TEACH_ROOT_KEY)
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def item_profile_has_embedded_tool_teach(profile_key: str | Path) -> bool:
+    return embedded_tool_teach_payload_from_profile(profile_key) is not None
+
+
+def yaml_top_level_keys(path: Path) -> set[str]:
+    if yaml is not None:
+        try:
+            with path.open('r', encoding='utf-8') as infile:
+                payload = yaml.safe_load(infile)
+            if isinstance(payload, dict):
+                return {str(key) for key in payload.keys()}
+        except Exception:
+            pass
+
+    keys: set[str] = set()
+    try:
+        with path.open('r', encoding='utf-8') as infile:
+            for raw_line in infile:
+                if not raw_line.strip() or raw_line.lstrip().startswith('#'):
+                    continue
+                if raw_line.startswith((' ', '\t', '-')):
+                    continue
+                if ':' not in raw_line:
+                    continue
+                keys.add(raw_line.split(':', 1)[0].strip())
+    except Exception:
+        return set()
+    return keys
+
+
+def single_yaml_with_root_key(directory: Path, root_key: str) -> Path | None:
+    if not directory.exists() or not directory.is_dir():
+        return None
+    matches = sorted(
+        [
+            candidate for candidate in directory.iterdir()
+            if candidate.is_file()
+            and candidate.suffix in ('.yaml', '.yml')
+            and root_key in yaml_top_level_keys(candidate)
+        ],
+        key=lambda path: path.name.lower(),
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_runtime_profile_path(profile_path: Path) -> bool:
+    try:
+        return profile_path.expanduser().resolve().parent == workspace_path('runtime').resolve()
+    except Exception:
+        return profile_path.expanduser().parent == workspace_path('runtime')
+
+
+def companion_yaml_path_for_profile(
+    profile_key: str | Path,
+    configured_path: str | Path | None,
+    root_key: str,
+    fallback_path: Path | None = None,
+) -> Path:
+    profile_path = Path(profile_key).expanduser()
+    configured_text = '' if configured_path is None else str(configured_path).strip()
+    configured = Path(configured_text).expanduser() if configured_text else None
+    same_dir = single_yaml_with_root_key(profile_path.parent, root_key)
+
+    if _is_runtime_profile_path(profile_path) and same_dir is not None:
+        return same_dir
+    if configured is not None and configured.exists():
+        return configured
+    if same_dir is not None:
+        return same_dir
+    if fallback_path is not None:
+        return fallback_path
+    if configured is not None:
+        return configured
+    return profile_path.parent / f'missing_{root_key}.yaml'
+
+
 def _yaml_scalar_text(value: object) -> str:
     if isinstance(value, bool):
         return 'true' if value else 'false'
@@ -263,9 +369,38 @@ def _yaml_scalar_text(value: object) -> str:
 def write_simple_yaml_mapping(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('w', encoding='utf-8') as outfile:
-        outfile.write('# item_pick tool teach sidecar\n')
+        outfile.write('# legacy item_pick tool teach sidecar\n')
         for key, value in payload.items():
             outfile.write(f'{key}: {_yaml_scalar_text(value)}\n')
+
+
+def write_embedded_tool_teach_mapping(profile_key: str | Path, payload: dict[str, object]) -> None:
+    profile_path = Path(profile_key).expanduser()
+    lines = profile_path.read_text(encoding='utf-8').splitlines()
+    block = [f'{TOOL_TEACH_ROOT_KEY}:']
+    block.extend(f'  {key}: {_yaml_scalar_text(value)}' for key, value in payload.items())
+
+    start_index: int | None = None
+    end_index = len(lines)
+    for index, line in enumerate(lines):
+        if line.startswith(f'{TOOL_TEACH_ROOT_KEY}:'):
+            start_index = index
+            break
+    if start_index is not None:
+        end_index = len(lines)
+        for index in range(start_index + 1, len(lines)):
+            line = lines[index]
+            if line and not line.startswith((' ', '\t', '-')) and ':' in line:
+                end_index = index
+                break
+        new_lines = lines[:start_index] + block + lines[end_index:]
+    else:
+        new_lines = list(lines)
+        if new_lines and new_lines[-1].strip():
+            new_lines.append('')
+        new_lines.extend(block)
+
+    profile_path.write_text('\n'.join(new_lines) + '\n', encoding='utf-8')
 
 
 @dataclass
@@ -328,24 +463,74 @@ class ItemPickNode(Node):
         super().__init__('item_pick')
         self._lock = threading.Lock()
         self._snapshot = ItemPickSnapshot()
+        self._headless = bool(self.declare_parameter('headless', False).value)
+        self._runtime_settings_path = Path(
+            str(self.declare_parameter('runtime_settings_file', str(RUNTIME_SETTINGS_PATH)).value)
+        ).expanduser()
+        self._load_runtime_settings_on_start = bool(
+            self.declare_parameter('load_runtime_settings', True).value
+        )
+        self._item_profile_state_path = Path(
+            str(self.declare_parameter('item_profile_state_file', str(ITEM_PROFILE_STATE_PATH)).value)
+        ).expanduser()
+        self._motion_service_root = str(
+            self.declare_parameter('motion_service_root', SERVICE_ROOT_DEFAULT).value
+        ).strip().rstrip('/') or SERVICE_ROOT_DEFAULT
+        self._item_pose_topic = str(
+            self.declare_parameter('item_pose_topic', ITEM_POSE_TOPIC).value
+        ).strip() or ITEM_POSE_TOPIC
         self._item_pose_seq = 0
         self._item_pose_watch_armed = False
         self._item_pose_watch_seq_floor = 0
         self._item_pose_watch_deadline_monotonic = 0.0
         self._item_pose_watch_stop_dispatched = False
         self._item_pose_watch_generation = 0
-        self._item_pose_watch_tf_only_mode = True
-        self._item_pose_watch_timeout_sec = ITEM_POSE_WATCH_TIMEOUT_SEC
+        self._item_pose_watch_tf_only_mode = bool(
+            self.declare_parameter('tf_only_mode', True).value
+        )
+        self._item_pose_watch_timeout_sec = max(
+            ITEM_POSE_WATCH_TIMEOUT_MIN,
+            min(
+                ITEM_POSE_WATCH_TIMEOUT_MAX,
+                float(
+                    self.declare_parameter(
+                        'item_pose_wait_timeout_sec',
+                        ITEM_POSE_WATCH_TIMEOUT_SEC,
+                    ).value
+                ),
+            ),
+        )
         self._cancel_requested = False
         self._manual_stop_inflight = False
         self._manual_release_inflight = False
         self._goal_tf_diagnose_inflight = False
-        self._post_stop_movel_speed_mm_s = LOCKED_MAX_SPEED_MM_S
-        self._post_stop_x_offset_mm = 0.0
-        self._post_stop_y_offset_mm = 0.0
-        self._post_stop_z_offset_mm = 100.0
-        self._approach_z_up_mm = APPROACH_Z_UP_DEFAULT
-        self._final_z_up_mm = FINAL_Z_UP_DEFAULT
+        self._post_stop_movel_speed_mm_s = max(
+            POST_STOP_MOVL_SPEED_MIN,
+            min(
+                POST_STOP_MOVL_SPEED_MAX,
+                float(self.declare_parameter('ee_intercept_speed_mm_s', LOCKED_MAX_SPEED_MM_S).value),
+            ),
+        )
+        self._post_stop_x_offset_mm = max(
+            POST_STOP_X_OFFSET_MIN,
+            min(POST_STOP_X_OFFSET_MAX, float(self.declare_parameter('item_x_offset_mm', 0.0).value)),
+        )
+        self._post_stop_y_offset_mm = max(
+            POST_STOP_Y_OFFSET_MIN,
+            min(POST_STOP_Y_OFFSET_MAX, float(self.declare_parameter('item_y_offset_mm', 0.0).value)),
+        )
+        self._post_stop_z_offset_mm = max(
+            POST_STOP_Z_OFFSET_MIN,
+            min(POST_STOP_Z_OFFSET_MAX, float(self.declare_parameter('item_standoff_z_mm', 100.0).value)),
+        )
+        self._approach_z_up_mm = max(
+            APPROACH_Z_UP_MIN,
+            min(APPROACH_Z_UP_MAX, float(self.declare_parameter('approach_z_up_mm', APPROACH_Z_UP_DEFAULT).value)),
+        )
+        self._final_z_up_mm = max(
+            FINAL_Z_UP_MIN,
+            min(FINAL_Z_UP_MAX, float(self.declare_parameter('final_z_up_mm', FINAL_Z_UP_DEFAULT).value)),
+        )
         self._tool_offset_x_mm = 0.0
         self._tool_offset_y_mm = 0.0
         self._tool_offset_z_mm = 0.0
@@ -531,23 +716,23 @@ class ItemPickNode(Node):
         self._gripper_do_service_name = str(
             self.declare_parameter(
                 'gripper_do_service',
-                GRIPPER_DO_SERVICE_DEFAULT,
+                '',
             ).value
-        ).strip() or GRIPPER_DO_SERVICE_DEFAULT
+        ).strip() or f'{self._motion_service_root}/DO'
 
-        self._mov_l_client = self.create_client(MovL, f'{SERVICE_ROOT_DEFAULT}/MovL')
-        self._mov_lio_client = self.create_client(MovLIO, f'{SERVICE_ROOT_DEFAULT}/MovLIO')
+        self._mov_l_client = self.create_client(MovL, f'{self._motion_service_root}/MovL')
+        self._mov_lio_client = self.create_client(MovLIO, f'{self._motion_service_root}/MovLIO')
         self._set_tool_client = self.create_client(
             SetTool,
-            f'{SERVICE_ROOT_DEFAULT}/SetTool',
+            f'{self._motion_service_root}/SetTool',
             callback_group=self._tool_service_callback_group,
         )
         self._tool_client = self.create_client(
             Tool,
-            f'{SERVICE_ROOT_DEFAULT}/Tool',
+            f'{self._motion_service_root}/Tool',
             callback_group=self._tool_service_callback_group,
         )
-        self._stop_client = self.create_client(Stop, f'{SERVICE_ROOT_DEFAULT}/Stop')
+        self._stop_client = self.create_client(Stop, f'{self._motion_service_root}/Stop')
         self._do_client = self.create_client(DO, self._gripper_do_service_name)
         self._item_seek_complete_client = self.create_client(
             Trigger,
@@ -557,14 +742,13 @@ class ItemPickNode(Node):
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._goal_tf_static_broadcaster = StaticTransformBroadcaster(self)
         self._goal_static_tf_by_child: dict[str, TransformStamped] = {}
-        self._item_profile_state_path = ITEM_PROFILE_STATE_PATH
         self._active_item_profile_key: str | None = None
         self._profile_state_mtime_ns: int | None = None
         self._active_profile_saved_tool_offsets: dict[str, float] | None = None
         self._track_trigger_handler = None
         self._last_item_target: ItemPoseTarget | None = None
         self.create_subscription(ToolVectorActual, 'dobot_msgs_v4/msg/ToolVectorActual', self._tcp_callback, 10)
-        self.create_subscription(PoseStamped, ITEM_POSE_TOPIC, self._item_pose_callback, 10)
+        self.create_subscription(PoseStamped, self._item_pose_topic, self._item_pose_callback, 10)
         self._start_sequence_service = self.create_service(
             TrayInterceptStart,
             self._start_sequence_service_name,
@@ -580,6 +764,15 @@ class ItemPickNode(Node):
             self._track_status_service_name,
             self._track_status_service_callback,
         )
+        runtime_loaded = False
+        if self._load_runtime_settings_on_start:
+            runtime_loaded = self.load_runtime_settings(require_complete=self._headless)
+        if self._headless and self._load_runtime_settings_on_start and not runtime_loaded:
+            raise RuntimeError(
+                f'Item pick headless mode requires a complete runtime settings file: '
+                f'{self._runtime_settings_path}'
+            )
+        self._sync_profile_tool_offsets_from_state(force=True)
         self.get_logger().info(
             'Item pick mode configured: MovL approach/descent/retract/final with explicit DO, '
             'open-only pre-pick settle, suction-on descent, and pickup-depth settle.'
@@ -588,9 +781,11 @@ class ItemPickNode(Node):
         self.get_logger().info(f'Track virtual-click service: {self._track_service_name}')
         self.get_logger().info(f'Track armed status service: {self._track_status_service_name}')
         self.get_logger().info(f'Item detect seek-complete service: {self._item_seek_complete_service_name}')
+        self.get_logger().info(f'Item pose topic: {self._item_pose_topic}')
+        self.get_logger().info(f'Motion service root: {self._motion_service_root}')
         self.get_logger().info(f'Gripper DO service: {self._gripper_do_service_name}')
         self.get_logger().info(
-            'Startup defaults: '
+            'Startup settings: '
             f'wait={self._item_pose_watch_timeout_sec:.0f}s, '
             f'speed={self._post_stop_movel_speed_mm_s:.0f} mm/s, '
             f'offsets(x={self._post_stop_x_offset_mm:.0f},'
@@ -607,7 +802,6 @@ class ItemPickNode(Node):
             f'pre_pick_settle={self._pre_pick_settling_time_sec:.1f}s, '
             f'pick_settle={self._pick_settling_time_sec:.1f}s'
         )
-        self._sync_profile_tool_offsets_from_state(force=True)
 
     def _reset_runtime_state_locked(self, reason: str) -> None:
         self._item_pose_watch_generation += 1
@@ -950,7 +1144,7 @@ class ItemPickNode(Node):
         if not bin_teach_text:
             return None, f'active profile "{profile_path.name}" has no bin_teach_file'
 
-        bin_teach_path = Path(bin_teach_text).expanduser()
+        bin_teach_path = companion_yaml_path_for_profile(profile_path, bin_teach_text, 'bin_teach')
         bin_root = self._safe_yaml_load(bin_teach_path)
         bin_data = self._yaml_map(bin_root, 'bin_teach')
         if not bin_data:
@@ -1037,7 +1231,17 @@ class ItemPickNode(Node):
         ), f'camera-bin preference loaded from "{bin_teach_path.name}"'
 
     def _read_tool_teach_sidecar_payload(self, active_profile_key: str) -> dict[str, object] | None:
-        sidecar_path = tool_teach_path_for_profile(active_profile_key)
+        embedded_payload = embedded_tool_teach_payload_from_profile(active_profile_key)
+        if embedded_payload is not None:
+            return embedded_payload
+
+        default_sidecar_path = tool_teach_path_for_profile(active_profile_key)
+        sidecar_path = companion_yaml_path_for_profile(
+            active_profile_key,
+            default_sidecar_path,
+            'tool_teach_version',
+            default_sidecar_path,
+        )
         try:
             payload = read_simple_yaml_mapping(sidecar_path)
         except Exception as exc:
@@ -1230,6 +1434,13 @@ class ItemPickNode(Node):
         worker.start()
 
     def _sync_profile_tool_offsets_from_state(self, force: bool = False) -> tuple[str | None, dict[str, float] | None]:
+        if not self.has_item_pose_publisher():
+            self._profile_state_mtime_ns = None
+            with self._lock:
+                self._active_item_profile_key = None
+                self._active_profile_saved_tool_offsets = None
+            return None, None
+
         profile_state_path = self._item_profile_state_path
         try:
             current_mtime_ns = profile_state_path.stat().st_mtime_ns
@@ -1265,6 +1476,114 @@ class ItemPickNode(Node):
 
     def get_active_profile_tool_offset_state(self, force: bool = False) -> tuple[str | None, dict[str, float] | None]:
         return self._sync_profile_tool_offsets_from_state(force=force)
+
+    @staticmethod
+    def _clamp_float(value: object, lower: float, upper: float, default: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(default)
+        return max(float(lower), min(float(upper), numeric))
+
+    def is_headless(self) -> bool:
+        return bool(self._headless)
+
+    def runtime_settings_path(self) -> Path:
+        return self._runtime_settings_path
+
+    def has_item_pose_publisher(self) -> bool:
+        return self.count_publishers(self._item_pose_topic) > 0
+
+    def item_pose_topic(self) -> str:
+        return self._item_pose_topic
+
+    def load_runtime_settings(self, path: str | Path | None = None, *, require_complete: bool = False) -> bool:
+        settings_path = Path(path).expanduser() if path is not None else self._runtime_settings_path
+        if not settings_path.exists():
+            self.get_logger().info(f'Item pick runtime settings not found: {settings_path}')
+            return False
+        try:
+            with settings_path.open('r', encoding='utf-8') as infile:
+                payload = json.load(infile)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to read item pick runtime settings "{settings_path}": {exc}')
+            return False
+        if not isinstance(payload, dict):
+            self.get_logger().warn(f'Item pick runtime settings "{settings_path}" is not a JSON object.')
+            return False
+        if require_complete:
+            missing_keys = [
+                key for key in ITEM_PICK_RUNTIME_REQUIRED_KEYS
+                if key not in payload or payload.get(key) is None
+            ]
+            if missing_keys:
+                self.get_logger().error(
+                    f'Item pick runtime settings "{settings_path}" missing required key(s): '
+                    f'{", ".join(missing_keys)}'
+                )
+                return False
+
+        with self._lock:
+            self._item_pose_watch_tf_only_mode = bool(payload.get('tf_only_mode', self._item_pose_watch_tf_only_mode))
+            self._item_pose_watch_timeout_sec = self._clamp_float(
+                payload.get(
+                    'item_pose_wait_timeout_sec',
+                    payload.get('tray_vector_wait_timeout_sec', self._item_pose_watch_timeout_sec),
+                ),
+                ITEM_POSE_WATCH_TIMEOUT_MIN,
+                ITEM_POSE_WATCH_TIMEOUT_MAX,
+                self._item_pose_watch_timeout_sec,
+            )
+            self._post_stop_movel_speed_mm_s = self._clamp_float(
+                payload.get('ee_intercept_speed_mm_s', self._post_stop_movel_speed_mm_s),
+                POST_STOP_MOVL_SPEED_MIN,
+                POST_STOP_MOVL_SPEED_MAX,
+                self._post_stop_movel_speed_mm_s,
+            )
+            self._post_stop_x_offset_mm = self._clamp_float(
+                payload.get('tray_intercept_x_offset_mm', self._post_stop_x_offset_mm),
+                POST_STOP_X_OFFSET_MIN,
+                POST_STOP_X_OFFSET_MAX,
+                self._post_stop_x_offset_mm,
+            )
+            self._post_stop_y_offset_mm = self._clamp_float(
+                payload.get('tray_intercept_y_offset_mm', self._post_stop_y_offset_mm),
+                POST_STOP_Y_OFFSET_MIN,
+                POST_STOP_Y_OFFSET_MAX,
+                self._post_stop_y_offset_mm,
+            )
+            self._post_stop_z_offset_mm = self._clamp_float(
+                payload.get('item_standoff_z_mm', payload.get('tray_standoff_z_mm', self._post_stop_z_offset_mm)),
+                POST_STOP_Z_OFFSET_MIN,
+                POST_STOP_Z_OFFSET_MAX,
+                self._post_stop_z_offset_mm,
+            )
+            self._approach_z_up_mm = self._clamp_float(
+                payload.get('approach_z_up_mm', self._approach_z_up_mm),
+                APPROACH_Z_UP_MIN,
+                APPROACH_Z_UP_MAX,
+                self._approach_z_up_mm,
+            )
+            self._final_z_up_mm = self._clamp_float(
+                payload.get('final_z_up_mm', self._final_z_up_mm),
+                FINAL_Z_UP_MIN,
+                FINAL_Z_UP_MAX,
+                self._final_z_up_mm,
+            )
+            self._pre_pick_settling_time_sec = self._clamp_float(
+                payload.get('pre_pick_settling_time_sec', self._pre_pick_settling_time_sec),
+                SETTLING_TIME_MIN_SEC,
+                SETTLING_TIME_MAX_SEC,
+                self._pre_pick_settling_time_sec,
+            )
+            self._pick_settling_time_sec = self._clamp_float(
+                payload.get('pick_settling_time_sec', self._pick_settling_time_sec),
+                SETTLING_TIME_MIN_SEC,
+                SETTLING_TIME_MAX_SEC,
+                self._pick_settling_time_sec,
+            )
+        self.get_logger().info(f'Loaded item pick runtime settings: {settings_path}')
+        return True
 
     @staticmethod
     def _solve_intercept_time_sec(
@@ -2152,9 +2471,9 @@ class ItemPickNode(Node):
 
     def _item_pose_watchdog_worker(self, generation: int) -> None:
         while rclpy.ok():
-            if self.count_publishers(ITEM_POSE_TOPIC) <= 0:
+            if self.count_publishers(self._item_pose_topic) <= 0:
                 self._reset_runtime_state(
-                    f'No item pose publisher on "{ITEM_POSE_TOPIC}". Node reset.'
+                    f'No item pose publisher on "{self._item_pose_topic}". Node reset.'
                 )
                 return
             with self._lock:
@@ -2470,7 +2789,7 @@ class ItemPickNode(Node):
 
         response.success = armed
         if armed:
-            response.message = f'Track armed: waiting for "{ITEM_POSE_TOPIC}". {action_text}'
+            response.message = f'Track armed: waiting for "{self._item_pose_topic}". {action_text}'
         elif busy:
             response.message = f'Track busy but not armed. {action_text}'
         else:
@@ -2480,6 +2799,9 @@ class ItemPickNode(Node):
     def run_track_from_current_settings(self) -> bool:
         with self._lock:
             item_pose_watch_timeout_sec = float(self._item_pose_watch_timeout_sec)
+            post_stop_movel_speed_mm_s = float(self._post_stop_movel_speed_mm_s)
+            post_stop_x_offset_mm = float(self._post_stop_x_offset_mm)
+            post_stop_y_offset_mm = float(self._post_stop_y_offset_mm)
             post_stop_z_offset_mm = float(self._post_stop_z_offset_mm)
             approach_z_up_mm = float(self._approach_z_up_mm)
             pre_pick_settling_time_sec = float(self._pre_pick_settling_time_sec)
@@ -2494,9 +2816,9 @@ class ItemPickNode(Node):
 
         return self.run_item_sequence(
             item_pose_watch_timeout_sec,
-            LOCKED_MAX_SPEED_MM_S,
-            0.0,
-            0.0,
+            post_stop_movel_speed_mm_s,
+            post_stop_x_offset_mm,
+            post_stop_y_offset_mm,
             post_stop_z_offset_mm,
             0.0,
             approach_z_up_mm,
@@ -2834,6 +3156,12 @@ class ItemPickNode(Node):
             pre_pick_settling_time_sec,
             pick_settling_time_sec,
         )
+        if not self.has_item_pose_publisher():
+            self._reset_runtime_state(
+                f'No item_detect pose publisher on "{self._item_pose_topic}". Load an item teach in item_detect first.'
+            )
+            return False
+
         active_profile_key, saved_offsets = self._sync_profile_tool_offsets_from_state(force=False)
         if active_profile_key is None:
             self._set_action_text(
@@ -2857,12 +3185,6 @@ class ItemPickNode(Node):
         saved_tool_offset_rx_deg = float(saved_offsets['tool_offset_rx_deg'])
         saved_tool_offset_ry_deg = float(saved_offsets['tool_offset_ry_deg'])
         saved_tool_offset_rz_deg = float(saved_offsets['tool_offset_rz_deg'])
-        if self.count_publishers(ITEM_POSE_TOPIC) <= 0:
-            self._reset_runtime_state(
-                f'No item pose publisher on "{ITEM_POSE_TOPIC}". Node reset.'
-            )
-            return False
-
         tool1_synced = self.apply_tool1_from_profile_offsets(saved_offsets, 'arm')
         tool1_sync_warning = ''
         if not tool1_synced:
@@ -2916,12 +3238,12 @@ class ItemPickNode(Node):
             )
             if tf_only_mode:
                 self._snapshot.action_text = (
-                    f'Troubleshoot mode armed... waiting for "{ITEM_POSE_TOPIC}" '
+                    f'Troubleshoot mode armed... waiting for "{self._item_pose_topic}" '
                     f'for {watch_timeout_sec:.0f}s (TF preview only).{tool1_sync_warning}'
                 )
             else:
                 self._snapshot.action_text = (
-                    f'Item pick sequence armed... waiting for fresh "{ITEM_POSE_TOPIC}" '
+                    f'Item pick sequence armed... waiting for fresh "{self._item_pose_topic}" '
                     f'for {watch_timeout_sec:.0f}s.'
                 )
 
@@ -2991,7 +3313,7 @@ class ItemPickGui:
         self.root.maxsize(fixed_width, fixed_height)
         self.root.resizable(False, False)
         self._closed = False
-        self._runtime_settings_path = RUNTIME_SETTINGS_PATH
+        self._runtime_settings_path = self.node.runtime_settings_path()
         self._runtime_settings_save_after_id: str | None = None
         self._suspend_runtime_settings_events = False
         self._active_item_profile_key: str | None = None
@@ -3011,7 +3333,7 @@ class ItemPickGui:
 
         self.run_button = tk.Button(
             modes_frame,
-            text='Arm Track Item',
+            text='Arm Item Pick',
             command=self._run_clicked,
             width=20,
         )
@@ -3070,7 +3392,7 @@ class ItemPickGui:
         self.item_pose_watch_timeout_scale.grid(row=5, column=0, sticky='ew')
 
         mode_hint = (
-            'Press Arm Track Item, then wait for item pose. '
+            'Press Arm Item Pick, then wait for item pose. '
             'Normal mode uses separate pre-pick and pickup-depth settling before retract/final Z-up.'
         )
         tk.Label(
@@ -3528,6 +3850,11 @@ class ItemPickGui:
         return self._current_tool_offset_signature() != self._saved_tool_teach_values
 
     def _arm_block_reason(self) -> str:
+        if not self.node.has_item_pose_publisher():
+            return (
+                f'No item_detect pose publisher on "{self.node.item_pose_topic()}". '
+                'Start item_detect and load an item teach first.'
+            )
         if self._active_item_profile_key is None:
             return 'No active item teach selected in item_detect. Load an item teach profile first.'
         if not self._active_profile_has_saved_tool_teach or self._saved_tool_teach_values is None:
@@ -3547,6 +3874,12 @@ class ItemPickGui:
         return not bool(self._arm_block_reason())
 
     def _update_profile_tool_offset_status(self) -> None:
+        if not self.node.has_item_pose_publisher():
+            self.active_profile_var.set('Active item teach: waiting for item_detect...')
+            self.tool_offset_profile_status_var.set(
+                'Start item_detect and load an item teach before arming.'
+            )
+            return
         profile_name = self._profile_display_name(self._active_item_profile_key)
         self.active_profile_var.set(f'Active item teach: {profile_name}')
         if self._active_item_profile_key is None:
@@ -3579,6 +3912,8 @@ class ItemPickGui:
             self.final_z_up_var,
             self.pre_pick_settling_time_var,
             self.pick_settling_time_var,
+        ]
+        tool_teach_vars = [
             self.tool_offset_x_var,
             self.tool_offset_y_var,
             self.tool_offset_z_var,
@@ -3588,6 +3923,8 @@ class ItemPickGui:
         ]
         for var in tracked_vars:
             var.trace_add('write', self._on_runtime_setting_changed)
+        for var in tool_teach_vars:
+            var.trace_add('write', self._on_tool_teach_setting_changed)
 
     def _sync_profile_tool_offsets_from_state(self, force: bool = False) -> None:
         active_profile_key, profile_offsets = self.node.get_active_profile_tool_offset_state(force=force)
@@ -3664,6 +4001,12 @@ class ItemPickGui:
         self._update_profile_tool_offset_status()
 
     def _save_profile_tool_offsets_for_active_item(self) -> bool:
+        if not self.node.has_item_pose_publisher():
+            message = 'Start item_detect and load an item teach before saving tool teach.'
+            self.node._set_action_text(message)
+            self.action_var.set(message)
+            return False
+
         active_profile_key = self._active_item_profile_key
         if active_profile_key is None:
             message = 'No active item teach selected in item_detect. Load an item teach profile first.'
@@ -3671,11 +4014,9 @@ class ItemPickGui:
             self.action_var.set(message)
             return False
 
-        tool_teach_path = tool_teach_path_for_profile(active_profile_key)
         payload: dict[str, object] = {
             'tool_teach_version': 3,
             'item_teach_name': item_teach_name_for_profile(active_profile_key),
-            'item_detect_profile_path': active_profile_key,
             'item_standoff_z_mm': float(self.post_stop_z_offset_var.get()),
             'approach_z_up_mm': float(self.approach_z_up_var.get()),
             'final_z_up_mm': float(self.final_z_up_var.get()),
@@ -3690,10 +4031,10 @@ class ItemPickGui:
         }
 
         try:
-            write_simple_yaml_mapping(tool_teach_path, payload)
+            write_embedded_tool_teach_mapping(active_profile_key, payload)
         except Exception as exc:
             self.node.get_logger().warn(
-                f'Failed to save tool teach sidecar "{tool_teach_path}": {exc}'
+                f'Failed to save embedded tool teach in "{active_profile_key}": {exc}'
             )
             message = f'Failed to save tool teach for "{self._profile_display_name(active_profile_key)}".'
             self.node._set_action_text(message)
@@ -3709,6 +4050,7 @@ class ItemPickGui:
             'schema_version': 8,
             'tf_only_mode': bool(self.tf_only_var.get()),
             'item_pose_wait_timeout_sec': float(self.item_pose_watch_timeout_var.get()),
+            'ee_intercept_speed_mm_s': float(LOCKED_MAX_SPEED_MM_S),
             'tray_intercept_x_offset_mm': 0.0,
             'tray_intercept_y_offset_mm': 0.0,
             'item_standoff_z_mm': float(self.post_stop_z_offset_var.get()),
@@ -3716,12 +4058,6 @@ class ItemPickGui:
             'final_z_up_mm': float(self.final_z_up_var.get()),
             'pre_pick_settling_time_sec': float(self.pre_pick_settling_time_var.get()),
             'pick_settling_time_sec': float(self.pick_settling_time_var.get()),
-            'tool_offset_x_mm': float(self.tool_offset_x_var.get()),
-            'tool_offset_y_mm': float(self.tool_offset_y_var.get()),
-            'tool_offset_z_mm': float(self.tool_offset_z_var.get()),
-            'tool_offset_rx_deg': float(self.tool_offset_rx_var.get()),
-            'tool_offset_ry_deg': float(self.tool_offset_ry_var.get()),
-            'tool_offset_rz_deg': float(self.tool_offset_rz_var.get()),
         }
 
     def _schedule_runtime_settings_save(self) -> None:
@@ -3742,6 +4078,15 @@ class ItemPickGui:
         self._set_arm_locked_setting_controls_enabled(not ui_locked)
         self._update_profile_tool_offset_status()
         self._schedule_runtime_settings_save()
+
+    def _on_tool_teach_setting_changed(self, *_args) -> None:
+        if self._suspend_runtime_settings_events:
+            return
+        snapshot = self.node.snapshot()
+        ui_locked = bool(snapshot.armed or snapshot.busy or self.node.is_manual_stop_inflight())
+        self._sync_tf_only_button(is_busy=ui_locked)
+        self._set_arm_locked_setting_controls_enabled(not ui_locked)
+        self._update_profile_tool_offset_status()
 
     def _load_runtime_settings(self) -> None:
         if not self._runtime_settings_path.exists():
@@ -3794,36 +4139,6 @@ class ItemPickGui:
                 SETTLING_TIME_MIN_SEC,
                 SETTLING_TIME_MAX_SEC,
             ))
-            self.tool_offset_x_var.set(self._clamp(
-                payload.get('tool_offset_x_mm', 0.0),
-                TOOL_OFFSET_TRANSLATION_MIN_MM,
-                TOOL_OFFSET_TRANSLATION_MAX_MM,
-            ))
-            self.tool_offset_y_var.set(self._clamp(
-                payload.get('tool_offset_y_mm', 0.0),
-                TOOL_OFFSET_TRANSLATION_MIN_MM,
-                TOOL_OFFSET_TRANSLATION_MAX_MM,
-            ))
-            self.tool_offset_z_var.set(self._clamp(
-                payload.get('tool_offset_z_mm', 0.0),
-                TOOL_OFFSET_TRANSLATION_MIN_MM,
-                TOOL_OFFSET_TRANSLATION_MAX_MM,
-            ))
-            self.tool_offset_rx_var.set(self._clamp(
-                payload.get('tool_offset_rx_deg', 0.0),
-                TOOL_OFFSET_ROTATION_MIN_DEG,
-                TOOL_OFFSET_ROTATION_MAX_DEG,
-            ))
-            self.tool_offset_ry_var.set(self._clamp(
-                payload.get('tool_offset_ry_deg', 0.0),
-                TOOL_OFFSET_ROTATION_MIN_DEG,
-                TOOL_OFFSET_ROTATION_MAX_DEG,
-            ))
-            self.tool_offset_rz_var.set(self._clamp(
-                payload.get('tool_offset_rz_deg', 0.0),
-                TOOL_OFFSET_ROTATION_MIN_DEG,
-                TOOL_OFFSET_ROTATION_MAX_DEG,
-            ))
         finally:
             self._suspend_runtime_settings_events = False
 
@@ -3858,6 +4173,8 @@ class ItemPickGui:
         self._set_arm_locked_setting_controls_enabled(not ui_locked)
         can_arm = self._can_arm_sequence()
         can_save_tool_offset = (
+            self.node.has_item_pose_publisher()
+            and
             self._active_item_profile_key is not None
             and not ui_locked
         )
@@ -3939,6 +4256,19 @@ def main(args=None) -> None:
     node = ItemPickNode()
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
+    if node.is_headless():
+        node.get_logger().info('Item pick running in headless service mode.')
+        try:
+            executor.spin()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            executor.remove_node(node)
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+        return
+
     stop_event = threading.Event()
 
     def spin() -> None:

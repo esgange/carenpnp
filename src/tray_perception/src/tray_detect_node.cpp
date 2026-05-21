@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <cstdlib>
@@ -28,10 +29,12 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <orbbec_camera_msgs/srv/set_int32.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <dobot_msgs_v4/msg/tray_vector.hpp>
 #include <dobot_msgs_v4/srv/get_tray_dimensions.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
@@ -53,6 +56,8 @@ using PolygonStampedMsg = geometry_msgs::msg::PolygonStamped;
 using TrayVectorMsg = dobot_msgs_v4::msg::TrayVector;
 using MarkerMsg = visualization_msgs::msg::Marker;
 using TriggerSrv = std_srvs::srv::Trigger;
+using SetBoolSrv = std_srvs::srv::SetBool;
+using SetInt32Srv = orbbec_camera_msgs::srv::SetInt32;
 
 constexpr double kMinOutlierDistancePx = 4.0;
 constexpr int kMaxSideTrimIterations = 24;
@@ -72,6 +77,97 @@ constexpr int kDepthThresholdMinMm = 1;
 constexpr int kDepthThresholdMaxMm = 20;
 constexpr int kDepthEdgeOffsetMinPx = 1;
 constexpr int kDepthEdgeOffsetMaxPx = 20;
+constexpr int kExposurePercentMin = 0;
+constexpr int kExposurePercentMax = 100;
+constexpr int kDefaultExposureMinUs = 1;
+constexpr int kDefaultExposureMaxUs = 32000;
+constexpr int kTrayColorExposureMaxUs = 100;
+
+bool isOpenCvWindowClosed(const std::string &window_name)
+{
+  static bool window_was_visible = false;
+  static const auto first_check_time = std::chrono::steady_clock::now();
+
+  double visible = -1.0;
+  try
+  {
+    visible = cv::getWindowProperty(window_name, cv::WND_PROP_VISIBLE);
+  }
+  catch (const cv::Exception &)
+  {
+    return window_was_visible;
+  }
+
+  if (visible >= 1.0)
+  {
+    window_was_visible = true;
+    return false;
+  }
+
+  const double age_sec = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - first_check_time).count();
+
+  // Some OpenCV HighGUI backends briefly report WND_PROP_VISIBLE == 0 while
+  // the window is still being mapped. Do not treat that startup state as a
+  // user close. Once the window was visible, visible < 1 means it was closed.
+  if (!window_was_visible && age_sec < 2.0)
+  {
+    return false;
+  }
+
+  return window_was_visible && visible < 1.0;
+}
+
+void destroyOpenCvWindowQuietly(const std::string &window_name)
+{
+  try
+  {
+    cv::destroyWindow(window_name);
+  }
+  catch (const cv::Exception &)
+  {
+  }
+}
+
+std::string shellQuote(const std::string &value)
+{
+  std::string quoted = "'";
+  for (const char ch : value)
+  {
+    if (ch == '\'')
+    {
+      quoted += "'\\''";
+    }
+    else
+    {
+      quoted.push_back(ch);
+    }
+  }
+  quoted.push_back('\'');
+  return quoted;
+}
+
+std::string trimTrailingLineEndings(std::string text)
+{
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+  {
+    text.pop_back();
+  }
+  return text;
+}
+
+bool pathsReferToSameFile(const std::filesystem::path &a, const std::filesystem::path &b)
+{
+  std::error_code ec;
+  if (std::filesystem::exists(a, ec) && std::filesystem::exists(b, ec))
+  {
+    if (std::filesystem::equivalent(a, b, ec))
+    {
+      return true;
+    }
+  }
+  return a.lexically_normal() == b.lexically_normal();
+}
 
 builtin_interfaces::msg::Time toBuiltinTime(const rclcpp::Time &stamp)
 {
@@ -95,6 +191,43 @@ double remapOutlierSensitivityToFitRange(int outlier_sensitivity)
 {
   const int clamped = std::clamp(outlier_sensitivity, 1, 100);
   return 50.0 + (static_cast<double>(clamped - 1) * 100.0 / 99.0);
+}
+
+int clampExposurePercent(int percent)
+{
+  return std::clamp(percent, kExposurePercentMin, kExposurePercentMax);
+}
+
+int clampExposureUsec(int value)
+{
+  return std::max(1, value);
+}
+
+int exposurePercentToUsec(int percent, int min_us, int max_us)
+{
+  const int clamped_percent = clampExposurePercent(percent);
+  if (clamped_percent <= 0)
+  {
+    return 0;
+  }
+  const int clamped_min = clampExposureUsec(min_us);
+  const int clamped_max = std::max(clamped_min, clampExposureUsec(max_us));
+  const double t = static_cast<double>(clamped_percent) / 100.0;
+  return std::clamp(
+    static_cast<int>(std::lround(static_cast<double>(clamped_min) + t * static_cast<double>(clamped_max - clamped_min))),
+    clamped_min,
+    clamped_max);
+}
+
+int clampExposureUsecOrAuto(int value, int min_us, int max_us)
+{
+  if (value <= 0)
+  {
+    return 0;
+  }
+  const int clamped_min = clampExposureUsec(min_us);
+  const int clamped_max = std::max(clamped_min, clampExposureUsec(max_us));
+  return std::clamp(value, clamped_min, clamped_max);
 }
 
 struct LineModel
@@ -203,11 +336,19 @@ struct TrayProfile
   std::string camera_info_topic;
   std::string overlay_topic;
   bool detection_use_depth {false};
-  int depth_threshold_mm {10};
-  int red_threshold {120};
-  int green_threshold {120};
-  int blue_threshold {120};
-  int ray_step_px {3};
+    int depth_threshold_mm {10};
+    int red_threshold {120};
+    int green_threshold {120};
+    int blue_threshold {120};
+    int color_exposure_percent {0};
+    int depth_exposure_percent {0};
+    int color_exposure_us {0};
+    int depth_exposure_us {0};
+    int color_exposure_min_us {kDefaultExposureMinUs};
+    int color_exposure_max_us {kTrayColorExposureMaxUs};
+    int depth_exposure_min_us {kDefaultExposureMinUs};
+    int depth_exposure_max_us {kDefaultExposureMaxUs};
+    int ray_step_px {3};
   int depth_edge_offset_px {4};
   int previous_color_percent {kDefaultPreviousColorPercent};
   int horizontal_ray_count {50};
@@ -351,10 +492,50 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
       params["depth_threshold_mm"] ? params["depth_threshold_mm"].as<int>() : 10,
       kDepthThresholdMinMm,
       kDepthThresholdMaxMm);
-    profile.red_threshold = params["red_threshold"] ? params["red_threshold"].as<int>() : 120;
-    profile.green_threshold = params["green_threshold"] ? params["green_threshold"].as<int>() : 120;
-    profile.blue_threshold = params["blue_threshold"] ? params["blue_threshold"].as<int>() : 120;
-    profile.ray_step_px = params["ray_step_px"] ? params["ray_step_px"].as<int>() : profile.ray_step_px;
+      profile.red_threshold = params["red_threshold"] ? params["red_threshold"].as<int>() : 120;
+      profile.green_threshold = params["green_threshold"] ? params["green_threshold"].as<int>() : 120;
+      profile.blue_threshold = params["blue_threshold"] ? params["blue_threshold"].as<int>() : 120;
+      if (params["color_exposure_percent"])
+      {
+        profile.color_exposure_percent = clampExposurePercent(params["color_exposure_percent"].as<int>());
+      }
+      profile.depth_exposure_percent = params["depth_exposure_percent"]
+        ? clampExposurePercent(params["depth_exposure_percent"].as<int>())
+        : profile.depth_exposure_percent;
+      profile.color_exposure_min_us = params["color_exposure_min_us"]
+        ? clampExposureUsec(params["color_exposure_min_us"].as<int>())
+        : profile.color_exposure_min_us;
+      profile.color_exposure_max_us = params["color_exposure_max_us"]
+        ? std::max(profile.color_exposure_min_us, clampExposureUsec(params["color_exposure_max_us"].as<int>()))
+        : profile.color_exposure_max_us;
+      profile.color_exposure_min_us = std::clamp(profile.color_exposure_min_us, 1, kTrayColorExposureMaxUs);
+      profile.color_exposure_max_us = kTrayColorExposureMaxUs;
+      profile.depth_exposure_min_us = params["depth_exposure_min_us"]
+        ? clampExposureUsec(params["depth_exposure_min_us"].as<int>())
+        : profile.depth_exposure_min_us;
+      profile.depth_exposure_max_us = params["depth_exposure_max_us"]
+        ? std::max(profile.depth_exposure_min_us, clampExposureUsec(params["depth_exposure_max_us"].as<int>()))
+        : profile.depth_exposure_max_us;
+      profile.color_exposure_us = params["color_exposure_us"]
+        ? clampExposureUsecOrAuto(
+            params["color_exposure_us"].as<int>(),
+            profile.color_exposure_min_us,
+            profile.color_exposure_max_us)
+        : exposurePercentToUsec(
+            profile.color_exposure_percent,
+            profile.color_exposure_min_us,
+            profile.color_exposure_max_us);
+      profile.depth_exposure_us = params["depth_exposure_us"]
+        ? clampExposureUsecOrAuto(
+            params["depth_exposure_us"].as<int>(),
+            profile.depth_exposure_min_us,
+            profile.depth_exposure_max_us)
+        : exposurePercentToUsec(
+            profile.depth_exposure_percent,
+            profile.depth_exposure_min_us,
+            profile.depth_exposure_max_us);
+      profile.depth_exposure_us = 0;
+      profile.ray_step_px = params["ray_step_px"] ? params["ray_step_px"].as<int>() : profile.ray_step_px;
     profile.depth_edge_offset_px = std::clamp(
       params["depth_edge_offset_px"] ? params["depth_edge_offset_px"].as<int>() : 4,
       kDepthEdgeOffsetMinPx,
@@ -3853,11 +4034,47 @@ public:
     profiles_dir_ = declare_parameter<std::string>(
       "profiles_dir",
       dobot_common::paths::workspacePath({"teach", "tray_teach"}, __FILE__).string());
-    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
-    depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
-    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
-    overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
-    tray_pose_topic_ = declare_parameter<std::string>("tray_pose_topic", "tray_pose");
+    const std::string selected_profile_path_param = declare_parameter<std::string>(
+      "selected_profile_path",
+      "");
+      color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
+      depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
+      camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
+      overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
+      camera_control_service_root_ = declare_parameter<std::string>(
+        "camera_control_service_root",
+        "/robot_camera");
+      normalizeCameraControlServiceRoot();
+      const int color_exposure_percent = clampExposurePercent(
+        declare_parameter<int>("color_exposure_percent", 0));
+      const int depth_exposure_percent = clampExposurePercent(
+        declare_parameter<int>("depth_exposure_percent", 0));
+      color_exposure_min_us_ = clampExposureUsec(
+        declare_parameter<int>("color_exposure_min_us", kDefaultExposureMinUs));
+      color_exposure_max_us_ = std::max(
+        color_exposure_min_us_,
+        clampExposureUsec(declare_parameter<int>("color_exposure_max_us", kTrayColorExposureMaxUs)));
+      color_exposure_min_us_ = std::clamp(color_exposure_min_us_, 1, kTrayColorExposureMaxUs);
+      color_exposure_max_us_ = kTrayColorExposureMaxUs;
+      depth_exposure_min_us_ = clampExposureUsec(
+        declare_parameter<int>("depth_exposure_min_us", kDefaultExposureMinUs));
+      depth_exposure_max_us_ = std::max(
+        depth_exposure_min_us_,
+        clampExposureUsec(declare_parameter<int>("depth_exposure_max_us", kDefaultExposureMaxUs)));
+      color_exposure_us_ = clampExposureUsecOrAuto(
+        declare_parameter<int>(
+          "color_exposure_us",
+          exposurePercentToUsec(color_exposure_percent, color_exposure_min_us_, color_exposure_max_us_)),
+        color_exposure_min_us_,
+        color_exposure_max_us_);
+      depth_exposure_us_ = clampExposureUsecOrAuto(
+        declare_parameter<int>(
+          "depth_exposure_us",
+          exposurePercentToUsec(depth_exposure_percent, depth_exposure_min_us_, depth_exposure_max_us_)),
+        depth_exposure_min_us_,
+        depth_exposure_max_us_);
+      depth_exposure_us_ = 0;
+      tray_pose_topic_ = declare_parameter<std::string>("tray_pose_topic", "tray_pose");
     tray_axis_overlay_topic_ = declare_parameter<std::string>("tray_axis_overlay_topic", "tray_axis_overlay");
     tray_vector_topic_ = declare_parameter<std::string>("tray_vector_topic", "tray_vector");
     tray_cube_marker_topic_ = declare_parameter<std::string>("tray_cube_marker_topic", "tray_cube_marker");
@@ -3923,6 +4140,7 @@ public:
       "seek_snapshots_dir",
       dobot_common::paths::workspacePath({"debug files", "seek_frames"}, __FILE__).string());
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
+    headless_ = declare_parameter<bool>("headless", false);
     const bool start_visualization = declare_parameter<bool>("start_visualization", true);
     display_view_ = start_visualization ? DisplayView::kRgb : DisplayView::kBinarized;
     const std::string detection_mode_param =
@@ -4065,20 +4283,44 @@ public:
     }
 
     refreshTrayProfiles();
-    selectInitialProfile();
+    bool selected_profile_loaded = false;
+    const std::filesystem::path launch_selected_profile_path = resolvePath(selected_profile_path_param);
+    if (!launch_selected_profile_path.empty())
+    {
+      selected_profile_loaded = selectProfileFromFile(launch_selected_profile_path, false);
+      if (!selected_profile_loaded)
+      {
+        RCLCPP_WARN(
+          get_logger(),
+          "Launch-selected tray detect profile could not be loaded: %s",
+          launch_selected_profile_path.c_str());
+      }
+    }
+    if (!selected_profile_loaded)
+    {
+      selectInitialProfile();
+    }
     loadRuntimeUiSettings();
-    createRosInterfaces();
-    movj_client_ = create_client<MovJSrv>(movj_service_name_);
-    cv::namedWindow(kDetectWindowName, cv::WINDOW_NORMAL);
-    cv::resizeWindow(kDetectWindowName, kPreviewCanvasWidth, kTopBarBaseHeight + kPreviewCanvasHeight);
-    cv::setMouseCallback(kDetectWindowName, &TrayDetectNode::onMouseThunk, this);
+      createRosInterfaces();
+      movj_client_ = create_client<MovJSrv>(movj_service_name_);
+      createCameraExposureClients();
+      camera_exposure_timer_ = create_wall_timer(
+        std::chrono::milliseconds(250),
+        std::bind(&TrayDetectNode::applyPendingCameraExposureSettings, this));
+      if (!headless_)
+      {
+        cv::namedWindow(kDetectWindowName, cv::WINDOW_NORMAL);
+        cv::resizeWindow(kDetectWindowName, kPreviewCanvasWidth, kTopBarBaseHeight + kPreviewCanvasHeight);
+        cv::setMouseCallback(kDetectWindowName, &TrayDetectNode::onMouseThunk, this);
+        visualization_window_created_ = true;
+      }
 
     RCLCPP_INFO(
       get_logger(),
       "Tray detect ready. Overlay topic=%s tray_pose topic=%s tray_vector topic=%s tray_cube_marker topic=%s "
       "(enabled=%s thickness=%.1fmm) detect_mode=%s depth_threshold=+/- %dmm depth_plane=%s "
       "z_axis=natural_edge base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
-      "selected_profile=%s profiles=%zu",
+      "selected_profile=%s profiles=%zu headless=%s",
       overlay_topic_.c_str(),
       tray_pose_topic_.c_str(),
       tray_vector_topic_.c_str(),
@@ -4097,7 +4339,14 @@ public:
       seek_service_name_.c_str(),
       go_to_teach_service_name_.c_str(),
       selectedProfileDisplayText().c_str(),
-      tray_profiles_.size());
+      tray_profiles_.size(),
+      headless_ ? "true" : "false");
+      RCLCPP_INFO(
+        get_logger(),
+        "Tray detect camera exposure controls. service_root=%s color=%s depth=%s",
+        camera_control_service_root_.c_str(),
+        exposureModeText(color_exposure_us_).c_str(),
+        exposureModeText(depth_exposure_us_).c_str());
     if (use_calibration_)
     {
       RCLCPP_INFO(
@@ -4117,7 +4366,10 @@ public:
   ~TrayDetectNode() override
   {
     saveRuntimeUiSettings();
-    cv::destroyWindow(kDetectWindowName);
+    if (visualization_window_created_)
+    {
+      destroyOpenCvWindowQuietly(kDetectWindowName);
+    }
   }
 
 private:
@@ -4134,6 +4386,42 @@ private:
     int min_value {1};
     int max_value {20};
   };
+
+  void processWindowEvents()
+  {
+    if (headless_ || !visualization_window_created_)
+    {
+      return;
+    }
+    cv::waitKey(1);
+    if (isOpenCvWindowClosed(kDetectWindowName))
+    {
+      requestShutdownFromWindowClose();
+    }
+  }
+
+  void requestShutdownFromWindowClose()
+  {
+    if (window_close_requested_)
+    {
+      return;
+    }
+    window_close_requested_ = true;
+    RCLCPP_INFO(get_logger(), "tray_detect window closed; shutting down.");
+    saveRuntimeUiSettings();
+    if (camera_status_timer_)
+    {
+      camera_status_timer_->cancel();
+    }
+    if (camera_exposure_timer_)
+    {
+      camera_exposure_timer_->cancel();
+    }
+    if (rclcpp::ok())
+    {
+      rclcpp::shutdown();
+    }
+  }
 
   struct SeekVectorSummary
   {
@@ -4348,9 +4636,9 @@ private:
     return true;
   }
 
-  void publishCalibrationTransform()
-  {
-    if (!static_tf_broadcaster_)
+    void publishCalibrationTransform()
+    {
+      if (!static_tf_broadcaster_)
     {
       return;
     }
@@ -4361,11 +4649,172 @@ private:
     tf_msg.child_frame_id = calibration_child_frame_;
     tf_msg.transform.translation = calibration_translation_;
     tf_msg.transform.rotation = calibration_rotation_;
-    static_tf_broadcaster_->sendTransform(tf_msg);
-  }
+      static_tf_broadcaster_->sendTransform(tf_msg);
+    }
 
-  void createRosInterfaces()
-  {
+    void markCameraExposureDirty()
+    {
+      camera_exposure_dirty_ = true;
+    }
+
+    void normalizeCameraControlServiceRoot()
+    {
+      if (camera_control_service_root_.empty())
+      {
+        camera_control_service_root_ = "/robot_camera";
+      }
+      while (camera_control_service_root_.size() > 1 && camera_control_service_root_.back() == '/')
+      {
+        camera_control_service_root_.pop_back();
+      }
+      if (camera_control_service_root_.front() != '/')
+      {
+        camera_control_service_root_ = "/" + camera_control_service_root_;
+      }
+    }
+
+    std::string cameraControlServiceName(const std::string &leaf) const
+    {
+      return camera_control_service_root_ + "/" + leaf;
+    }
+
+    void createCameraExposureClients()
+    {
+      color_auto_exposure_client_ =
+        create_client<SetBoolSrv>(cameraControlServiceName("set_color_auto_exposure"));
+      color_exposure_client_ =
+        create_client<SetInt32Srv>(cameraControlServiceName("set_color_exposure"));
+      depth_auto_exposure_client_ =
+        create_client<SetBoolSrv>(cameraControlServiceName("set_depth_auto_exposure"));
+      depth_exposure_client_ =
+        create_client<SetInt32Srv>(cameraControlServiceName("set_depth_exposure"));
+      markCameraExposureDirty();
+    }
+
+    std::string exposureModeText(int exposure_us) const
+    {
+      if (exposure_us <= 0)
+      {
+        return "auto";
+      }
+      return std::to_string(exposure_us) + "us";
+    }
+
+    bool applyCameraExposureSetting(
+      const std::string &label,
+      int exposure_us,
+      const rclcpp::Client<SetBoolSrv>::SharedPtr &auto_client,
+      const rclcpp::Client<SetInt32Srv>::SharedPtr &exposure_client,
+      int &last_applied_exposure_us)
+    {
+      if (last_applied_exposure_us == exposure_us)
+      {
+        return true;
+      }
+      if (!auto_client || !auto_client->service_is_ready())
+      {
+        return false;
+      }
+      if (exposure_us > 0 && (!exposure_client || !exposure_client->service_is_ready()))
+      {
+        return false;
+      }
+
+      auto auto_request = std::make_shared<SetBoolSrv::Request>();
+      auto_request->data = exposure_us <= 0;
+      auto_client->async_send_request(
+        auto_request,
+        [this, label](rclcpp::Client<SetBoolSrv>::SharedFuture future)
+        {
+          try
+          {
+            const auto response = future.get();
+            if (!response || !response->success)
+            {
+              RCLCPP_WARN(
+                get_logger(),
+                "%s auto exposure request failed: %s",
+                label.c_str(),
+                response ? response->message.c_str() : "no response");
+            }
+          }
+          catch (const std::exception &ex)
+          {
+            RCLCPP_WARN(get_logger(), "%s auto exposure request error: %s", label.c_str(), ex.what());
+          }
+        });
+
+      if (exposure_us > 0)
+      {
+        auto exposure_request = std::make_shared<SetInt32Srv::Request>();
+        exposure_request->data = exposure_us;
+        exposure_client->async_send_request(
+          exposure_request,
+          [this, label, exposure_us](rclcpp::Client<SetInt32Srv>::SharedFuture future)
+          {
+            try
+            {
+              const auto response = future.get();
+              if (!response || !response->success)
+              {
+                RCLCPP_WARN(
+                  get_logger(),
+                  "%s exposure %dus request failed: %s",
+                  label.c_str(),
+                  exposure_us,
+                  response ? response->message.c_str() : "no response");
+              }
+            }
+            catch (const std::exception &ex)
+            {
+              RCLCPP_WARN(get_logger(), "%s exposure request error: %s", label.c_str(), ex.what());
+            }
+          });
+      }
+
+      last_applied_exposure_us = exposure_us;
+      RCLCPP_INFO(
+        get_logger(),
+        "%s exposure set to %s",
+        label.c_str(),
+        exposureModeText(exposure_us).c_str());
+      return true;
+    }
+
+    void applyPendingCameraExposureSettings()
+    {
+      if (!camera_exposure_dirty_)
+      {
+        return;
+      }
+
+      const rclcpp::Time now = this->now();
+      if (last_camera_exposure_attempt_time_.nanoseconds() != 0 &&
+          (now - last_camera_exposure_attempt_time_).seconds() < 0.5)
+      {
+        return;
+      }
+      last_camera_exposure_attempt_time_ = now;
+
+      const bool color_ok = applyCameraExposureSetting(
+        "RGB",
+        color_exposure_us_,
+        color_auto_exposure_client_,
+        color_exposure_client_,
+        last_applied_color_exposure_us_);
+      depth_exposure_us_ = 0;
+      const bool depth_ok = applyCameraExposureSetting(
+        "Depth",
+        depth_exposure_us_,
+        depth_auto_exposure_client_,
+        depth_exposure_client_,
+        last_applied_depth_exposure_us_);
+
+      camera_exposure_dirty_ = !(color_ok && depth_ok);
+    }
+
+    void createRosInterfaces()
+    {
     overlay_pub_ = create_publisher<ImageMsg>(overlay_topic_, rclcpp::QoS(5));
     tray_pose_pub_ = create_publisher<PoseStampedMsg>(tray_pose_topic_, rclcpp::QoS(10));
     tray_axis_overlay_pub_ = create_publisher<PolygonStampedMsg>(tray_axis_overlay_topic_, rclcpp::QoS(10));
@@ -4735,10 +5184,26 @@ private:
       profile.depth_threshold_mm,
       kDepthThresholdMinMm,
       kDepthThresholdMaxMm);
-    red_threshold_ = profile.red_threshold;
-    green_threshold_ = profile.green_threshold;
-    blue_threshold_ = profile.blue_threshold;
-    ray_step_px_ = profile.ray_step_px;
+      red_threshold_ = profile.red_threshold;
+      green_threshold_ = profile.green_threshold;
+      blue_threshold_ = profile.blue_threshold;
+      color_exposure_min_us_ = clampExposureUsec(profile.color_exposure_min_us);
+      color_exposure_max_us_ = std::max(
+        color_exposure_min_us_,
+        clampExposureUsec(profile.color_exposure_max_us));
+      color_exposure_min_us_ = std::clamp(color_exposure_min_us_, 1, kTrayColorExposureMaxUs);
+      color_exposure_max_us_ = kTrayColorExposureMaxUs;
+      depth_exposure_min_us_ = clampExposureUsec(profile.depth_exposure_min_us);
+      depth_exposure_max_us_ = std::max(
+        depth_exposure_min_us_,
+        clampExposureUsec(profile.depth_exposure_max_us));
+      color_exposure_us_ = clampExposureUsecOrAuto(
+        profile.color_exposure_us,
+        color_exposure_min_us_,
+        color_exposure_max_us_);
+      depth_exposure_us_ = 0;
+      markCameraExposureDirty();
+      ray_step_px_ = profile.ray_step_px;
     depth_edge_offset_px_ = std::clamp(
       profile.depth_edge_offset_px,
       kDepthEdgeOffsetMinPx,
@@ -4821,12 +5286,102 @@ private:
     for (int i = 0; i < static_cast<int>(tray_profiles_.size()); ++i)
     {
       const std::filesystem::path candidate = tray_profiles_[i].path.lexically_normal();
-      if (candidate == requested || candidate.filename() == requested.filename())
+      if (pathsReferToSameFile(candidate, requested) || candidate.filename() == requested.filename())
       {
         return selectProfileByIndex(i, persist_runtime);
       }
     }
     return false;
+  }
+
+  bool selectProfileFromFile(const std::filesystem::path &path, bool persist_runtime = true)
+  {
+    if (path.empty())
+    {
+      return false;
+    }
+
+    refreshTrayProfiles();
+    if (selectProfileByPath(path, persist_runtime))
+    {
+      return true;
+    }
+
+    const auto profile = loadTrayProfileFile(path);
+    if (!profile.has_value())
+    {
+      profile_status_message_ = "Open Teach: selected YAML is not a tray teach profile";
+      return false;
+    }
+
+    tray_profiles_.push_back(*profile);
+    return selectProfileByIndex(static_cast<int>(tray_profiles_.size()) - 1, persist_runtime);
+  }
+
+  std::optional<std::filesystem::path> openTeachFileDialog()
+  {
+    std::filesystem::path start_dir = resolvePath(profiles_dir_);
+    std::string filename_arg = start_dir.string();
+    if (!filename_arg.empty() && filename_arg.back() != '/')
+    {
+      filename_arg.push_back('/');
+    }
+
+    const std::string command =
+      "if command -v zenity >/dev/null 2>&1; then "
+      "zenity --file-selection --title='Open Teach' --filename=" +
+      shellQuote(filename_arg) +
+      " --file-filter='YAML files | *.yaml *.yml' --file-filter='All files | *'; "
+      "elif command -v kdialog >/dev/null 2>&1; then "
+      "kdialog --title 'Open Teach' --getopenfilename " +
+      shellQuote(start_dir.string()) +
+      " 'YAML files (*.yaml *.yml)'; "
+      "fi 2>/dev/null";
+
+    FILE *pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr)
+    {
+      profile_status_message_ = "Open Teach: failed to start file picker";
+      return std::nullopt;
+    }
+
+    std::array<char, 512> buffer {};
+    std::string selected_path;
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
+    {
+      selected_path += buffer.data();
+    }
+    const int status = pclose(pipe);
+    (void)status;
+
+    selected_path = trimTrailingLineEndings(selected_path);
+    if (selected_path.empty())
+    {
+      return std::nullopt;
+    }
+    return resolvePath(selected_path);
+  }
+
+  void requestOpenTeachFile()
+  {
+    profile_dropdown_open_ = false;
+    profile_status_message_ = "Open Teach: select tray teach YAML";
+    const auto selected_path = openTeachFileDialog();
+    if (!selected_path.has_value())
+    {
+      profile_status_message_ = "Open Teach cancelled";
+      return;
+    }
+
+    if (!selectProfileFromFile(*selected_path))
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "Open Teach failed to load selected profile: %s",
+        selected_path->string().c_str());
+      return;
+    }
+    profile_status_message_ = "Loaded " + selectedProfileDisplayText();
   }
 
   std::string runtimeViewModeToken() const
@@ -4877,15 +5432,6 @@ private:
         return;
       }
 
-      if (const YAML::Node selected_profile_path = root["selected_profile_path"];
-        selected_profile_path && selected_profile_path.IsScalar())
-      {
-        const std::string profile_path_text = selected_profile_path.as<std::string>();
-        if (!profile_path_text.empty())
-        {
-          selectProfileByPath(resolvePath(profile_path_text), false);
-        }
-      }
       if (const YAML::Node view_mode = root["view_mode"]; view_mode && view_mode.IsScalar())
       {
         applyRuntimeViewModeToken(view_mode.as<std::string>());
@@ -4961,10 +5507,6 @@ private:
 
       YAML::Emitter out;
       out << YAML::BeginMap;
-      out << YAML::Key << "selected_profile_path" << YAML::Value <<
-        ((selected_profile_index_ >= 0 && selected_profile_index_ < static_cast<int>(tray_profiles_.size()))
-          ? tray_profiles_[selected_profile_index_].path.string()
-          : selected_profile_path_.string());
       out << YAML::Key << "view_mode" << YAML::Value << runtimeViewModeToken();
       out << YAML::Key << "overlay_enabled" << YAML::Value << overlay_enabled_;
       out << YAML::Key << "edge_tolerance_percent" << YAML::Value << area_tolerance_percent_;
@@ -5193,8 +5735,7 @@ private:
 
   int topBarHeight() const
   {
-    return kTopBarBaseHeight +
-      (profile_dropdown_open_ ? static_cast<int>(profile_option_rects_.size()) * kDropdownRowHeight : 0);
+    return kTopBarBaseHeight;
   }
 
   void layoutTopBar(int width)
@@ -5204,38 +5745,46 @@ private:
     const int top_row_height = 38;
     const int control_gap = 10;
 
-    const int view_width = 150;
-    const int overlay_width = 150;
-    const int seek_width = 120;
-    view_toggle_button_.rect = cv::Rect(margin, top_row_y, view_width, top_row_height);
+    const int button_count = 7;
+    const int top_button_width = std::max(
+      112,
+      std::min(
+        132,
+        (width - 2 * margin - (button_count - 1) * control_gap) / button_count));
+    int button_x = margin;
+    view_toggle_button_.rect = cv::Rect(button_x, top_row_y, top_button_width, top_row_height);
+    button_x += top_button_width + control_gap;
     overlay_toggle_button_.rect = cv::Rect(
-      view_toggle_button_.rect.x + view_toggle_button_.rect.width + control_gap,
+      button_x,
       top_row_y,
-      overlay_width,
+      top_button_width,
       top_row_height);
+    button_x += top_button_width + control_gap;
     seek_toggle_button_.rect = cv::Rect(
-      overlay_toggle_button_.rect.x + overlay_toggle_button_.rect.width + control_gap,
+      button_x,
       top_row_y,
-      seek_width,
+      top_button_width,
       top_row_height);
-
-    const int delete_width = 148;
-    const int go_to_teach_width = 148;
-    delete_button_.rect = cv::Rect(width - margin - delete_width, top_row_y, delete_width, top_row_height);
+    button_x += top_button_width + control_gap;
+    debug_images_button_.rect = cv::Rect(
+      button_x,
+      top_row_y,
+      top_button_width,
+      top_row_height);
+    button_x += top_button_width + control_gap;
     go_to_teach_button_.rect = cv::Rect(
-      delete_button_.rect.x - control_gap - go_to_teach_width,
+      button_x,
       top_row_y,
-      go_to_teach_width,
+      top_button_width,
       top_row_height);
-
-    const int dropdown_left = seek_toggle_button_.rect.x + seek_toggle_button_.rect.width + 14;
-    const int dropdown_right = go_to_teach_button_.rect.x - 14;
-    const int dropdown_width = std::max(160, dropdown_right - dropdown_left);
+    button_x += top_button_width + control_gap;
     profile_dropdown_rect_ = cv::Rect(
-      dropdown_left,
+      button_x,
       top_row_y,
-      std::max(80, dropdown_width),
+      top_button_width,
       top_row_height);
+    button_x += top_button_width + control_gap;
+    delete_button_.rect = cv::Rect(button_x, top_row_y, top_button_width, top_row_height);
 
     const int panel_y = top_row_y + top_row_height + 12;
     const int panel_gap = 10;
@@ -5817,6 +6366,15 @@ private:
       seek_valid_confidence_frames_);
   }
 
+  void toggleDebugImages()
+  {
+    debug_images_enabled_ = !debug_images_enabled_;
+    saveRuntimeUiSettings();
+    profile_status_message_ = debug_images_enabled_
+      ? "Debug images enabled"
+      : "Debug images disabled";
+  }
+
   bool writeSeekPoseData(
     const std::filesystem::path &pose_path,
     const SeekCapture &first_capture,
@@ -5959,46 +6517,55 @@ private:
     const std::filesystem::path pose_path =
       std::filesystem::path(seek_snapshots_dir_) / ("seek_" + std::to_string(stamp_ns) + "_pose.yaml");
 
-    std::filesystem::path output_dir(seek_snapshots_dir_);
-    std::error_code fs_error;
-    std::filesystem::create_directories(output_dir, fs_error);
-    if (fs_error)
+    if (!debug_images_enabled_)
     {
-      profile_status_message_ = "Seek done: failed to prepare screenshot directory";
+      profile_status_message_ = "Seek done: debug save off";
     }
     else
     {
-      const bool wrote_first = !first_capture.frame.empty() && cv::imwrite(first_path.string(), first_capture.frame);
-      const bool wrote_last = !last_capture.frame.empty() && cv::imwrite(last_path.string(), last_capture.frame);
-      const bool wrote_pose = writeSeekPoseData(
-        pose_path,
-        first_capture,
-        last_capture,
-        motion,
-        seek_valid_motion_samples_.size(),
-        first_path,
-        last_path,
-        effective_decay_sec);
-
-      if (wrote_first && wrote_last && wrote_pose)
+      std::filesystem::path output_dir(seek_snapshots_dir_);
+      std::error_code fs_error;
+      std::filesystem::create_directories(output_dir, fs_error);
+      if (fs_error)
       {
-        profile_status_message_ = "Seek done: saved frames + pose data";
-        RCLCPP_INFO(
-          get_logger(),
-          "Seek data saved:\n  first frame: %s\n  last frame:  %s\n  pose yaml:   %s",
-          first_path.c_str(),
-          last_path.c_str(),
-          pose_path.c_str());
+        profile_status_message_ = "Seek done: failed to prepare screenshot directory";
       }
       else
       {
-        profile_status_message_ = "Seek done: partial save (check logs)";
-        RCLCPP_WARN(
-          get_logger(),
-          "Seek save partial. first=%s last=%s pose=%s",
-          wrote_first ? "ok" : "fail",
-          wrote_last ? "ok" : "fail",
-          wrote_pose ? "ok" : "fail");
+        const bool wrote_first =
+          !first_capture.frame.empty() && cv::imwrite(first_path.string(), first_capture.frame);
+        const bool wrote_last =
+          !last_capture.frame.empty() && cv::imwrite(last_path.string(), last_capture.frame);
+        const bool wrote_pose = writeSeekPoseData(
+          pose_path,
+          first_capture,
+          last_capture,
+          motion,
+          seek_valid_motion_samples_.size(),
+          first_path,
+          last_path,
+          effective_decay_sec);
+
+        if (wrote_first && wrote_last && wrote_pose)
+        {
+          profile_status_message_ = "Seek done: saved frames + pose data";
+          RCLCPP_INFO(
+            get_logger(),
+            "Seek data saved:\n  first frame: %s\n  last frame:  %s\n  pose yaml:   %s",
+            first_path.c_str(),
+            last_path.c_str(),
+            pose_path.c_str());
+        }
+        else
+        {
+          profile_status_message_ = "Seek done: partial save (check logs)";
+          RCLCPP_WARN(
+            get_logger(),
+            "Seek save partial. first=%s last=%s pose=%s",
+            wrote_first ? "ok" : "fail",
+            wrote_last ? "ok" : "fail",
+            wrote_pose ? "ok" : "fail");
+        }
       }
     }
 
@@ -6361,14 +6928,17 @@ private:
       overlay_pub_->publish(*overlay_image.toImageMsg());
     }
 
-    const cv::Size window_size(output.cols, output.rows);
-    if (window_size != rendered_window_size_)
+    if (!headless_)
     {
-      cv::resizeWindow(kDetectWindowName, window_size.width, window_size.height);
-      rendered_window_size_ = window_size;
+      const cv::Size window_size(output.cols, output.rows);
+      if (window_size != rendered_window_size_)
+      {
+        cv::resizeWindow(kDetectWindowName, window_size.width, window_size.height);
+        rendered_window_size_ = window_size;
+      }
+      cv::imshow(kDetectWindowName, output);
+      processWindowEvents();
     }
-    cv::imshow(kDetectWindowName, output);
-    cv::waitKey(1);
     last_camera_render_time_ = std::chrono::steady_clock::now();
   }
 
@@ -6434,8 +7004,12 @@ private:
       overlay_image.image = output;
       overlay_pub_->publish(*overlay_image.toImageMsg());
     }
-    cv::imshow(kDetectWindowName, output);
-    cv::waitKey(1);
+    if (!headless_)
+    {
+      cv::imshow(kDetectWindowName, output);
+      processWindowEvents();
+    }
+    last_camera_render_time_ = std::chrono::steady_clock::now();
   }
 
   static void onMouseThunk(int event, int x, int y, int flags, void *userdata)
@@ -6498,6 +7072,13 @@ private:
         return;
       }
 
+      if (debug_images_button_.rect.contains(point))
+      {
+        profile_dropdown_open_ = false;
+        toggleDebugImages();
+        return;
+      }
+
       if (delete_button_.rect.contains(point))
       {
         profile_dropdown_open_ = false;
@@ -6514,23 +7095,8 @@ private:
 
       if (profile_dropdown_rect_.contains(point))
       {
-        if (!profile_dropdown_open_)
-        {
-          refreshTrayProfiles();
-        }
-        profile_dropdown_open_ = !profile_dropdown_open_;
+        requestOpenTeachFile();
         return;
-      }
-
-      if (profile_dropdown_open_)
-      {
-        const int clicked_profile_index = profileIndexAtPoint(point);
-        if (clicked_profile_index >= 0)
-        {
-          selectProfileByIndex(clicked_profile_index);
-          profile_dropdown_open_ = false;
-          return;
-        }
       }
 
       if (toleranceHitRect().contains(point))
@@ -6726,12 +7292,13 @@ private:
       const cv::Scalar border = enabled ? border_on : cv::Scalar(102, 106, 112);
       cv::rectangle(bar, button.rect, fill, cv::FILLED);
       cv::rectangle(bar, button.rect, border, 2);
+      const std::string fitted_text = fitTextToWidth(text, button.rect.width - 18, 0.52, 1);
       cv::putText(
         bar,
-        text,
-        cv::Point(button.rect.x + 12, button.rect.y + 26),
+        fitted_text,
+        cv::Point(button.rect.x + 9, button.rect.y + 26),
         cv::FONT_HERSHEY_DUPLEX,
-        0.56,
+        0.52,
         cv::Scalar(245, 245, 245),
         1,
         cv::LINE_AA);
@@ -6745,36 +7312,20 @@ private:
       seek_mode_active_ || seek_result_latched_,
       cv::Scalar(70, 126, 186),
       cv::Scalar(126, 202, 255));
+    draw_button(
+      debug_images_button_,
+      "Debug Img",
+      true,
+      debug_images_enabled_ ? cv::Scalar(70, 126, 186) : cv::Scalar(58, 64, 72),
+      debug_images_enabled_ ? cv::Scalar(126, 202, 255) : cv::Scalar(112, 120, 130));
     draw_button(go_to_teach_button_, go_to_teach_in_progress_ ? "Go Teach..." : "Go To Teach", can_go_to_teach, cv::Scalar(70, 140, 94), cv::Scalar(134, 232, 165));
     draw_button(delete_button_, "Delete Tray", can_delete, cv::Scalar(86, 76, 148), cv::Scalar(160, 146, 246));
-
-    cv::rectangle(bar, profile_dropdown_rect_, cv::Scalar(61, 78, 96), cv::FILLED);
-    cv::rectangle(bar, profile_dropdown_rect_, cv::Scalar(130, 166, 198), 2);
-    const std::string selected_text = fitTextToWidth(
-      selectedProfileDisplayText(),
-      profile_dropdown_rect_.width - 34);
-    cv::putText(
-      bar,
-      selected_text,
-      cv::Point(profile_dropdown_rect_.x + 12, profile_dropdown_rect_.y + 26),
-      cv::FONT_HERSHEY_DUPLEX,
-      0.55,
-      cv::Scalar(245, 245, 245),
-      1,
-      cv::LINE_AA);
-
-    const int arrow_center_x = profile_dropdown_rect_.x + profile_dropdown_rect_.width - 16;
-    const int arrow_center_y = profile_dropdown_rect_.y + 20;
-    const std::vector<cv::Point> arrow = profile_dropdown_open_
-      ? std::vector<cv::Point>{
-          cv::Point(arrow_center_x - 5, arrow_center_y + 2),
-          cv::Point(arrow_center_x + 5, arrow_center_y + 2),
-          cv::Point(arrow_center_x, arrow_center_y - 4)}
-      : std::vector<cv::Point>{
-          cv::Point(arrow_center_x - 5, arrow_center_y - 2),
-          cv::Point(arrow_center_x + 5, arrow_center_y - 2),
-          cv::Point(arrow_center_x, arrow_center_y + 4)};
-    cv::fillConvexPoly(bar, arrow, cv::Scalar(245, 245, 245));
+    draw_button(
+      UiButton{"Open Teach", profile_dropdown_rect_},
+      "Open Teach",
+      true,
+      cv::Scalar(61, 78, 96),
+      cv::Scalar(130, 166, 198));
 
     const auto draw_panel = [&](const cv::Rect &rect, const std::string &title)
     {
@@ -7117,9 +7668,10 @@ private:
   std::string seek_service_name_;
   std::string seek_complete_service_name_;
   std::string seek_status_service_name_;
-  std::string go_to_teach_service_name_;
-  std::string movj_service_name_;
-  std::string calibration_parent_frame_;
+    std::string go_to_teach_service_name_;
+    std::string movj_service_name_;
+    std::string camera_control_service_root_ {"/robot_camera"};
+    std::string calibration_parent_frame_;
   std::string calibration_child_frame_;
   std::string calibration_dir_;
   std::string calibration_file_;
@@ -7136,12 +7688,20 @@ private:
   bool auto_discover_calibration_ {true};
   bool publish_overlay_ {true};
   bool publish_tray_cube_marker_ {true};
+  bool headless_ {false};
+  bool visualization_window_created_ {false};
   bool detection_use_depth_ {false};
   cv::Size rendered_window_size_ {};
-  int red_threshold_ {120};
-  int green_threshold_ {120};
-  int blue_threshold_ {120};
-  int depth_threshold_mm_ {10};
+    int red_threshold_ {120};
+    int green_threshold_ {120};
+    int blue_threshold_ {120};
+    int color_exposure_us_ {0};
+    int depth_exposure_us_ {0};
+    int color_exposure_min_us_ {kDefaultExposureMinUs};
+    int color_exposure_max_us_ {kTrayColorExposureMaxUs};
+    int depth_exposure_min_us_ {kDefaultExposureMinUs};
+    int depth_exposure_max_us_ {kDefaultExposureMaxUs};
+    int depth_threshold_mm_ {10};
   DepthPlaneModel depth_plane_model_;
   int ray_step_px_ {3};
   int depth_edge_offset_px_ {4};
@@ -7163,6 +7723,7 @@ private:
   bool seek_window_slider_active_ {false};
   bool seek_decay_slider_active_ {false};
   bool seek_confidence_slider_active_ {false};
+  bool window_close_requested_ {false};
   std::string tray_name_ {"tray"};
   std::array<double, 6> teach_joints_deg_ {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints_ {false};
@@ -7180,10 +7741,12 @@ private:
   int seek_decay_tenths_ {1};
   int seek_valid_confidence_frames_ {21};
   int seek_valid_frame_count_ {0};
+  bool debug_images_enabled_ {false};
   std::optional<AxisAlignedRoiBounds> depth_plane_roi_bounds_;
   UiButton view_toggle_button_ {"View", cv::Rect(18, 14, 180, 42)};
   UiButton overlay_toggle_button_ {"Overlay", cv::Rect(18, 14, 150, 42)};
   UiButton seek_toggle_button_ {"Seek", cv::Rect(18, 14, 120, 42)};
+  UiButton debug_images_button_ {"Debug Img", cv::Rect(18, 14, 160, 42)};
   UiButton delete_button_ {"Delete Tray", cv::Rect(18, 14, 160, 42)};
   UiButton go_to_teach_button_ {"Go to Teach", cv::Rect(18, 14, 160, 42)};
   UiSlider tolerance_slider_ {"Tolerance", cv::Rect(), 1, 20};
@@ -7214,13 +7777,17 @@ private:
   std::deque<TimedTrayPose3D> tray_pose_history_;
   std::string pose_history_frame_id_;
   std::optional<SeekCapture> seek_first_valid_capture_;
-  std::optional<SeekCapture> seek_last_valid_capture_;
-  std::deque<SeekMotionSample> seek_valid_motion_samples_;
-  SeekVectorSummary seek_vector_summary_;
-  std::optional<std::pair<double, double>> latest_live_tray_size_m_;
-  std::string seek_snapshots_dir_;
+    std::optional<SeekCapture> seek_last_valid_capture_;
+    std::deque<SeekMotionSample> seek_valid_motion_samples_;
+    SeekVectorSummary seek_vector_summary_;
+    std::optional<std::pair<double, double>> latest_live_tray_size_m_;
+    std::string seek_snapshots_dir_;
+    bool camera_exposure_dirty_ {true};
+    rclcpp::Time last_camera_exposure_attempt_time_ {0, 0, RCL_ROS_TIME};
+    int last_applied_color_exposure_us_ {-1};
+    int last_applied_depth_exposure_us_ {-1};
 
-  rclcpp::Publisher<ImageMsg>::SharedPtr overlay_pub_;
+    rclcpp::Publisher<ImageMsg>::SharedPtr overlay_pub_;
   rclcpp::Publisher<PoseStampedMsg>::SharedPtr tray_pose_pub_;
   rclcpp::Publisher<PolygonStampedMsg>::SharedPtr tray_axis_overlay_pub_;
   rclcpp::Publisher<TrayVectorMsg>::SharedPtr tray_vector_pub_;
@@ -7229,10 +7796,15 @@ private:
   rclcpp::Service<TriggerSrv>::SharedPtr seek_service_;
   rclcpp::Service<TriggerSrv>::SharedPtr seek_complete_service_;
   rclcpp::Service<TriggerSrv>::SharedPtr seek_status_service_;
-  rclcpp::Service<TriggerSrv>::SharedPtr go_to_teach_service_;
-  rclcpp::TimerBase::SharedPtr camera_status_timer_;
-  rclcpp::Client<MovJSrv>::SharedPtr movj_client_;
-  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+    rclcpp::Service<TriggerSrv>::SharedPtr go_to_teach_service_;
+    rclcpp::TimerBase::SharedPtr camera_status_timer_;
+    rclcpp::TimerBase::SharedPtr camera_exposure_timer_;
+    rclcpp::Client<MovJSrv>::SharedPtr movj_client_;
+    rclcpp::Client<SetBoolSrv>::SharedPtr color_auto_exposure_client_;
+    rclcpp::Client<SetInt32Srv>::SharedPtr color_exposure_client_;
+    rclcpp::Client<SetBoolSrv>::SharedPtr depth_auto_exposure_client_;
+    rclcpp::Client<SetInt32Srv>::SharedPtr depth_exposure_client_;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
   rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;

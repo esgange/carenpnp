@@ -13,10 +13,12 @@ import numpy as np
 import rclpy
 import torch
 import yaml
+from orbbec_camera_msgs.srv import SetInt32
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from sensor_msgs.msg import Image
+from std_srvs.srv import SetBool
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -28,7 +30,6 @@ def workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -77,6 +78,11 @@ PANEL_PAD = 20
 BUTTON_HEIGHT = 38
 DROPDOWN_ROW_HEIGHT = 32
 MAX_DROPDOWN_ROWS = 7
+EXPOSURE_PERCENT_MIN = 0
+EXPOSURE_PERCENT_MAX = 100
+DEFAULT_EXPOSURE_MIN_US = 1
+DEFAULT_EXPOSURE_MAX_US = 32000
+TEACH_COLOR_EXPOSURE_MAX_US = 100
 
 
 @dataclass
@@ -84,6 +90,7 @@ class BinEntry:
     label: str
     path: Path
     bin_name: str
+    teach_date: str
     roi_points: List[Tuple[float, float]]
     depth_plane: Dict[str, float]
 
@@ -93,13 +100,14 @@ class Button:
     name: str
     rect: Tuple[int, int, int, int]
     enabled: bool = True
+    role: str = "default"
 
 
 def resolve_path(path_text: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(path_text))).resolve()
 
 
-def safe_name(text: str, fallback: str = "item") -> str:
+def safe_name(text: str, fallback: str = "") -> str:
     value = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip().lower()).strip("_")
     return value or fallback
 
@@ -118,6 +126,44 @@ def as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def clamp_exposure_percent(percent: int) -> int:
+    return max(EXPOSURE_PERCENT_MIN, min(EXPOSURE_PERCENT_MAX, int(percent)))
+
+
+def clamp_exposure_usec(value: int) -> int:
+    return max(1, int(value))
+
+
+def exposure_percent_to_usec(percent: int, min_us: int, max_us: int) -> int:
+    clamped_percent = clamp_exposure_percent(percent)
+    if clamped_percent <= 0:
+        return 0
+    clamped_min = clamp_exposure_usec(min_us)
+    clamped_max = max(clamped_min, clamp_exposure_usec(max_us))
+    value = clamped_min + round((clamped_max - clamped_min) * (clamped_percent / 100.0))
+    return max(clamped_min, min(clamped_max, int(value)))
+
+
+def clamp_exposure_usec_or_auto(value: int, min_us: int, max_us: int) -> int:
+    if int(value) <= 0:
+        return 0
+    clamped_min = clamp_exposure_usec(min_us)
+    clamped_max = max(clamped_min, clamp_exposure_usec(max_us))
+    return max(clamped_min, min(clamped_max, int(value)))
+
+
+def exposure_usec_to_percent(exposure_us: int, min_us: int, max_us: int) -> int:
+    if int(exposure_us) <= 0:
+        return 0
+    clamped_min = clamp_exposure_usec(min_us)
+    clamped_max = max(clamped_min, clamp_exposure_usec(max_us))
+    clamped_exposure = max(clamped_min, min(clamped_max, int(exposure_us)))
+    if clamped_max == clamped_min:
+        return 100
+    return clamp_exposure_percent(
+        round(((clamped_exposure - clamped_min) / float(clamped_max - clamped_min)) * 100.0))
 
 
 def parse_flat_points(values) -> List[Tuple[float, float]]:
@@ -148,7 +194,7 @@ class ItemTeachYoloNode(Node):
 
         self.color_topic = self.declare_parameter("color_topic", "/robot_camera/color/image_raw").value
         self.joint_states_topic = self.declare_parameter("joint_states_topic", "/joint_states_robot").value
-        self.item_name = self.declare_parameter("item_name", "item").value
+        self.item_name = str(self.declare_parameter("item_name", "").value).strip()
         self.bin_teach_dir = resolve_path(
             self.declare_parameter(
                 "bin_teach_dir",
@@ -157,22 +203,68 @@ class ItemTeachYoloNode(Node):
         self.runtime_root = resolve_path(
             self.declare_parameter(
                 "runtime_root",
-                str(workspace_path("teach", "bins_yolo", "runtime")),
+                str(workspace_path("config", "item_perception_yolo", "item_teach_yolo_runtime")),
             ).value)
+        self.runtime_settings_path = resolve_path(
+            self.declare_parameter(
+                "runtime_settings_path",
+                str(workspace_path("config", "item_perception_yolo", "item_teach_yolo_runtime_settings.yaml")),
+            ).value)
+        self.clear_runtime_on_start = as_bool(
+            self.declare_parameter("clear_runtime_on_start", True).value)
         self.profile_dir = resolve_path(
             self.declare_parameter(
                 "profile_dir",
-                str(workspace_path("teach", "bins_yolo", "profiles")),
+                str(workspace_path("teach", "item_teach_yolo")),
             ).value)
         self.model_root = resolve_path(
             self.declare_parameter(
                 "model_root",
-                str(workspace_path("teach", "bins_yolo", "models")),
+                str(workspace_path("teach", "item_teach_yolo")),
             ).value)
         self.depth_topic = self.declare_parameter("depth_topic", "/robot_camera/depth/image_raw").value
         self.camera_info_topic = self.declare_parameter(
             "camera_info_topic", "/robot_camera/color/camera_info").value
         self.overlay_topic = self.declare_parameter("overlay_topic", "bin_overlay").value
+        self.camera_control_service_root = self.normalize_camera_control_service_root(
+            self.declare_parameter("camera_control_service_root", "/robot_camera").value)
+        color_exposure_percent = clamp_exposure_percent(
+            int(self.declare_parameter("color_exposure_percent", 0).value))
+        depth_exposure_percent = clamp_exposure_percent(
+            int(self.declare_parameter("depth_exposure_percent", 0).value))
+        self.color_exposure_min_us = clamp_exposure_usec(
+            int(self.declare_parameter("color_exposure_min_us", DEFAULT_EXPOSURE_MIN_US).value))
+        self.color_exposure_max_us = max(
+            self.color_exposure_min_us,
+            clamp_exposure_usec(
+                int(self.declare_parameter("color_exposure_max_us", DEFAULT_EXPOSURE_MAX_US).value)))
+        self.color_exposure_min_us = max(1, min(self.color_exposure_min_us, TEACH_COLOR_EXPOSURE_MAX_US))
+        self.color_exposure_max_us = TEACH_COLOR_EXPOSURE_MAX_US
+        self.depth_exposure_min_us = clamp_exposure_usec(
+            int(self.declare_parameter("depth_exposure_min_us", DEFAULT_EXPOSURE_MIN_US).value))
+        self.depth_exposure_max_us = max(
+            self.depth_exposure_min_us,
+            clamp_exposure_usec(
+                int(self.declare_parameter("depth_exposure_max_us", DEFAULT_EXPOSURE_MAX_US).value)))
+        self.color_exposure_us = clamp_exposure_usec_or_auto(
+            int(self.declare_parameter(
+                "color_exposure_us",
+                exposure_percent_to_usec(
+                    color_exposure_percent,
+                    self.color_exposure_min_us,
+                    self.color_exposure_max_us)).value),
+            self.color_exposure_min_us,
+            self.color_exposure_max_us)
+        self.depth_exposure_us = clamp_exposure_usec_or_auto(
+            int(self.declare_parameter(
+                "depth_exposure_us",
+                exposure_percent_to_usec(
+                    depth_exposure_percent,
+                    self.depth_exposure_min_us,
+                    self.depth_exposure_max_us)).value),
+            self.depth_exposure_min_us,
+            self.depth_exposure_max_us)
+        self.depth_exposure_us = 0
         self.sam2_checkpoint = resolve_path(
             self.declare_parameter(
                 "sam2_checkpoint",
@@ -216,6 +308,8 @@ class ItemTeachYoloNode(Node):
         self.item_name_edit_buffer = self.item_name
 
         self.sample_count = 0
+        self.background_sample_count = 0
+        self.sample_history: List[Dict[str, str]] = []
         self.training_thread: Optional[threading.Thread] = None
         self.training_status = "idle"
         self.training_epoch_current = 0
@@ -232,7 +326,18 @@ class ItemTeachYoloNode(Node):
         self.preview_scale = 1.0
         self.preview_image_size = (0, 0)
         self.preview_source_size = (0, 0)
+        self.rendered_window_size = (0, 0)
+        self.exposure_slider_rect = (0, 0, 0, 0)
+        self.exposure_slider_active = False
+        self.camera_exposure_dirty = True
+        self.last_camera_exposure_attempt_time = self.get_clock().now()
+        self.last_applied_color_exposure_us = -1
+        self.last_applied_depth_exposure_us = -1
 
+        self.load_runtime_settings()
+
+        if self.clear_runtime_on_start:
+            self.clear_runtime_root()
         self.session_dir = self.create_session_dir()
         self.configure_session_storage()
         self.write_dataset_yaml()
@@ -253,16 +358,184 @@ class ItemTeachYoloNode(Node):
             self.joint_state_callback,
             10,
         )
+        self.create_camera_exposure_clients()
+        self.camera_exposure_timer = self.create_timer(
+            0.2, self.apply_pending_camera_exposure_settings)
 
         window_flags = cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0)
         cv2.namedWindow(WINDOW_NAME, window_flags)
+        cv2.resizeWindow(
+            WINDOW_NAME,
+            LEFT_PANEL_WIDTH + PREVIEW_CANVAS_WIDTH,
+            VIDEO_TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT,
+        )
         cv2.setMouseCallback(WINDOW_NAME, self.mouse_callback)
         self.timer = self.create_timer(1.0 / 20.0, self.update_view)
         self.get_logger().info(f"item_teach_yolo session: {self.session_dir}")
 
+    def normalize_camera_control_service_root(self, value: str) -> str:
+        root = str(value or "/robot_camera").strip() or "/robot_camera"
+        while len(root) > 1 and root.endswith("/"):
+            root = root[:-1]
+        if not root.startswith("/"):
+            root = "/" + root
+        return root
+
+    def camera_control_service_name(self, leaf: str) -> str:
+        return f"{self.camera_control_service_root}/{leaf}"
+
+    def create_camera_exposure_clients(self) -> None:
+        self.color_auto_exposure_client = self.create_client(
+            SetBool, self.camera_control_service_name("set_color_auto_exposure"))
+        self.color_exposure_client = self.create_client(
+            SetInt32, self.camera_control_service_name("set_color_exposure"))
+        self.depth_auto_exposure_client = self.create_client(
+            SetBool, self.camera_control_service_name("set_depth_auto_exposure"))
+        self.depth_exposure_client = self.create_client(
+            SetInt32, self.camera_control_service_name("set_depth_exposure"))
+        self.mark_camera_exposure_dirty()
+
+    def exposure_mode_text(self, exposure_us: int) -> str:
+        return "auto" if exposure_us <= 0 else f"{exposure_us} us"
+
+    def mark_camera_exposure_dirty(self) -> None:
+        self.camera_exposure_dirty = True
+
+    def apply_camera_exposure_setting(self, label: str, exposure_us: int,
+                                      auto_client, exposure_client,
+                                      last_attr: str) -> bool:
+        if getattr(self, last_attr) == exposure_us:
+            return True
+        if auto_client is None or not auto_client.service_is_ready():
+            return False
+        if exposure_us > 0 and (exposure_client is None or not exposure_client.service_is_ready()):
+            return False
+
+        auto_request = SetBool.Request()
+        auto_request.data = exposure_us <= 0
+        future = auto_client.call_async(auto_request)
+
+        def on_auto_done(done_future, request_label=label):
+            try:
+                response = done_future.result()
+                if response is None or not response.success:
+                    message = response.message if response is not None else "no response"
+                    self.get_logger().warn(f"{request_label} auto exposure request failed: {message}")
+            except Exception as exc:
+                self.get_logger().warn(f"{request_label} auto exposure request error: {exc}")
+
+        future.add_done_callback(on_auto_done)
+
+        if exposure_us > 0:
+            exposure_request = SetInt32.Request()
+            exposure_request.data = exposure_us
+            exposure_future = exposure_client.call_async(exposure_request)
+
+            def on_exposure_done(done_future, request_label=label, request_exposure=exposure_us):
+                try:
+                    response = done_future.result()
+                    if response is None or not response.success:
+                        message = response.message if response is not None else "no response"
+                        self.get_logger().warn(
+                            f"{request_label} exposure {request_exposure} us request failed: {message}")
+                except Exception as exc:
+                    self.get_logger().warn(f"{request_label} exposure request error: {exc}")
+
+            exposure_future.add_done_callback(on_exposure_done)
+
+        setattr(self, last_attr, exposure_us)
+        self.get_logger().info(f"{label} exposure set to {self.exposure_mode_text(exposure_us)}")
+        return True
+
+    def apply_pending_camera_exposure_settings(self) -> None:
+        if not self.camera_exposure_dirty:
+            return
+        now = self.get_clock().now()
+        if (now - self.last_camera_exposure_attempt_time).nanoseconds < 500_000_000:
+            return
+        self.last_camera_exposure_attempt_time = now
+
+        color_ok = self.apply_camera_exposure_setting(
+            "RGB",
+            self.color_exposure_us,
+            self.color_auto_exposure_client,
+            self.color_exposure_client,
+            "last_applied_color_exposure_us")
+        self.depth_exposure_us = 0
+        depth_ok = self.apply_camera_exposure_setting(
+            "Depth",
+            self.depth_exposure_us,
+            self.depth_auto_exposure_client,
+            self.depth_exposure_client,
+            "last_applied_depth_exposure_us")
+        self.camera_exposure_dirty = not (color_ok and depth_ok)
+
+    def load_runtime_settings(self) -> None:
+        if not self.runtime_settings_path.exists():
+            return
+        try:
+            root = yaml.safe_load(self.runtime_settings_path.read_text(encoding="utf-8")) or {}
+            params = root.get("item_teach_yolo_runtime", {}).get("ros__parameters", {})
+            if not isinstance(params, dict):
+                return
+            self.color_exposure_min_us = max(
+                1,
+                min(
+                    clamp_exposure_usec(
+                        int(params.get("color_exposure_min_us", self.color_exposure_min_us))),
+                    TEACH_COLOR_EXPOSURE_MAX_US))
+            self.color_exposure_max_us = TEACH_COLOR_EXPOSURE_MAX_US
+            self.depth_exposure_min_us = clamp_exposure_usec(
+                int(params.get("depth_exposure_min_us", self.depth_exposure_min_us)))
+            self.depth_exposure_max_us = max(
+                self.depth_exposure_min_us,
+                clamp_exposure_usec(
+                    int(params.get("depth_exposure_max_us", self.depth_exposure_max_us))))
+            if "color_exposure_us" in params:
+                self.color_exposure_us = clamp_exposure_usec_or_auto(
+                    int(params["color_exposure_us"]),
+                    self.color_exposure_min_us,
+                    self.color_exposure_max_us)
+            elif "color_exposure_percent" in params:
+                self.color_exposure_us = exposure_percent_to_usec(
+                    int(params["color_exposure_percent"]),
+                    self.color_exposure_min_us,
+                    self.color_exposure_max_us)
+            self.depth_exposure_us = 0
+            self.mark_camera_exposure_dirty()
+        except Exception as exc:
+            self.get_logger().warn(f"YOLO teach runtime settings load failed: {exc}")
+
+    def save_runtime_settings(self) -> None:
+        try:
+            self.runtime_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "item_teach_yolo_runtime": {
+                    "ros__parameters": {
+                        "camera_control_service_root": self.camera_control_service_root,
+                        "color_exposure_us": self.color_exposure_us,
+                        "depth_exposure_us": 0,
+                        "color_exposure_percent": exposure_usec_to_percent(
+                            self.color_exposure_us,
+                            self.color_exposure_min_us,
+                            self.color_exposure_max_us),
+                        "depth_exposure_percent": 0,
+                        "color_exposure_min_us": self.color_exposure_min_us,
+                        "color_exposure_max_us": self.color_exposure_max_us,
+                        "depth_exposure_min_us": self.depth_exposure_min_us,
+                        "depth_exposure_max_us": self.depth_exposure_max_us,
+                    }
+                }
+            }
+            tmp_path = self.runtime_settings_path.with_suffix(".tmp")
+            tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+            tmp_path.replace(self.runtime_settings_path)
+        except Exception as exc:
+            self.get_logger().warn(f"YOLO teach runtime settings save failed: {exc}")
+
     def create_session_dir(self) -> Path:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
-        name = f"{safe_name(self.item_name)}_{timestamp_for_path()}"
+        name = f"{safe_name(self.item_name, fallback='unnamed_item')}_{timestamp_for_path()}"
         path = self.runtime_root / name
         suffix = 1
         while path.exists():
@@ -270,6 +543,34 @@ class ItemTeachYoloNode(Node):
             suffix += 1
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def runtime_root_is_safe_to_clear(self, path: Path) -> bool:
+        workspace = workspace_root().resolve()
+        config_root = (workspace / "config").resolve()
+        if path == workspace or path == config_root or path == Path(path.anchor):
+            return False
+        try:
+            path.relative_to(config_root)
+            return True
+        except ValueError:
+            pass
+        return path.name in ("runtime", "item_teach_yolo_runtime") and len(path.parts) >= 3
+
+    def clear_runtime_root(self) -> None:
+        try:
+            self.runtime_root.mkdir(parents=True, exist_ok=True)
+            resolved_root = self.runtime_root.resolve()
+            if not self.runtime_root_is_safe_to_clear(resolved_root):
+                self.get_logger().warn(
+                    f"Skipping runtime cleanup for unsafe runtime_root={resolved_root}")
+                return
+            for child in resolved_root.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        except Exception as exc:
+            self.get_logger().warn(f"Could not clear YOLO teach runtime folder {self.runtime_root}: {exc}")
 
     def configure_session_storage(self) -> None:
         self.dataset_dir = self.session_dir / "dataset"
@@ -310,6 +611,8 @@ class ItemTeachYoloNode(Node):
         self.item_name = new_name
         self.item_name_edit_buffer = new_name
         self.sample_count = 0
+        self.background_sample_count = 0
+        self.sample_history.clear()
         self.training_status = "idle"
         self.training_epoch_current = 0
         self.training_epoch_total = max(1, self.train_epochs)
@@ -326,11 +629,12 @@ class ItemTeachYoloNode(Node):
         self.save_session()
 
     def write_dataset_yaml(self) -> None:
+        class_name = self.item_name.strip() if self.has_item_name() else "unnamed_item"
         data = {
             "path": str(self.dataset_dir),
             "train": "images/train",
             "val": "images/train",
-            "names": {0: self.item_name},
+            "names": {0: class_name},
         }
         self.dataset_yaml_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
@@ -342,6 +646,10 @@ class ItemTeachYoloNode(Node):
                 "session_dir": str(self.session_dir),
                 "dataset_yaml": str(self.dataset_yaml_path),
                 "sample_count": self.sample_count,
+                "background_sample_count": self.background_sample_count,
+                "total_training_image_count": self.total_training_image_count(),
+                "background_ratio_percent": self.background_ratio_percent(),
+                "sample_history": list(self.sample_history),
                 "training_status": self.training_status,
                 "training_epoch_current": self.training_epoch_current,
                 "training_epoch_total": self.training_epoch_total,
@@ -353,6 +661,18 @@ class ItemTeachYoloNode(Node):
                 "active_bin_name": active_bin.bin_name if active_bin else "",
                 "active_bin_file": str(active_bin.path) if active_bin else "",
                 "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
+                "camera_control_service_root": self.camera_control_service_root,
+                "color_exposure_us": self.color_exposure_us,
+                "depth_exposure_us": 0,
+                "color_exposure_percent": exposure_usec_to_percent(
+                    self.color_exposure_us,
+                    self.color_exposure_min_us,
+                    self.color_exposure_max_us),
+                "depth_exposure_percent": 0,
+                "color_exposure_min_us": self.color_exposure_min_us,
+                "color_exposure_max_us": self.color_exposure_max_us,
+                "depth_exposure_min_us": self.depth_exposure_min_us,
+                "depth_exposure_max_us": self.depth_exposure_max_us,
                 "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
                 "positive_prompt_count": len(self.positive_points),
                 "negative_prompt_count": len(self.negative_points),
@@ -365,7 +685,11 @@ class ItemTeachYoloNode(Node):
     def refresh_bin_files(self) -> None:
         entries: List[BinEntry] = []
         if self.bin_teach_dir.exists():
-            for path in sorted(self.bin_teach_dir.glob("*.yaml")):
+            for path in sorted(
+                self.bin_teach_dir.glob("*.yaml"),
+                key=lambda candidate: candidate.stat().st_mtime,
+                reverse=True,
+            ):
                 entry = self.parse_bin_file(path)
                 if entry is not None:
                     entries.append(entry)
@@ -391,10 +715,17 @@ class ItemTeachYoloNode(Node):
             ]:
                 if key in bin_node:
                     depth_plane[key] = bin_node[key]
+            teach_date = str(bin_node.get("teach_date", ""))
+            label = bin_name
+            if teach_date:
+                label = f"{label} | {teach_date}"
+            elif bin_name != path.stem:
+                label = f"{label} | {path.stem}"
             return BinEntry(
-                label=f"{bin_name} ({path.name})",
+                label=label,
                 path=path,
                 bin_name=bin_name,
+                teach_date=teach_date,
                 roi_points=roi_points,
                 depth_plane=depth_plane,
             )
@@ -591,6 +922,9 @@ class ItemTeachYoloNode(Node):
         return " ".join(values) + "\n"
 
     def save_sample(self) -> None:
+        if not self.has_item_name():
+            self.status = self.item_name_error()
+            return
         if self.frozen_crop_bgr is None or self.current_mask is None:
             self.status = "No SAM2 mask to save"
             return
@@ -631,14 +965,179 @@ class ItemTeachYoloNode(Node):
             "preview": str(preview_path),
         }
         prompt_path.write_text(yaml.safe_dump(prompt_data, sort_keys=False), encoding="utf-8")
+        self.sample_history.append({"kind": "item", "stem": stem})
         self.write_dataset_yaml()
-        self.write_profile()
-        self.status = f"Saved YOLO sample {self.sample_count}"
+        self.clear_prompts(save=False)
+        self.status = f"Saved item sample {self.sample_count} | {self.background_ratio_label()}"
         self.save_session()
+
+    def save_background_sample(self) -> None:
+        if not self.has_item_name():
+            self.status = self.item_name_error()
+            return
+        crop_info = self.current_roi_crop()
+        if crop_info is None:
+            self.status = "Select a bin and wait for color image"
+            return
+
+        crop, rect, _ = crop_info
+        self.background_sample_count += 1
+        stem = f"background_{self.background_sample_count:06d}"
+        image_path = self.images_dir / f"{stem}.png"
+        label_path = self.labels_dir / f"{stem}.txt"
+        preview_path = self.previews_dir / f"{stem}_preview.png"
+        prompt_path = self.prompts_dir / f"{stem}.yaml"
+
+        cv2.imwrite(str(image_path), crop)
+        label_path.write_text("", encoding="utf-8")
+        cv2.imwrite(str(preview_path), crop)
+        prompt_data = {
+            "sample": stem,
+            "sample_type": "background",
+            "item_name": self.item_name,
+            "bin_name": self.active_bin.bin_name if self.active_bin else "",
+            "bin_file": str(self.active_bin.path) if self.active_bin else "",
+            "roi_crop_rect": list(rect),
+            "image": str(image_path),
+            "label": str(label_path),
+            "preview": str(preview_path),
+            "note": "Empty YOLO label file marks this ROI crop as background.",
+        }
+        prompt_path.write_text(yaml.safe_dump(prompt_data, sort_keys=False), encoding="utf-8")
+        self.sample_history.append({"kind": "background", "stem": stem})
+        self.write_dataset_yaml()
+        self.clear_prompts(save=False)
+        self.status = f"Saved background {self.background_sample_count} | {self.background_ratio_label()}"
+        self.save_session()
+
+    def can_delete_last_sample(self) -> bool:
+        training_active = self.training_thread is not None and self.training_thread.is_alive()
+        return self.total_training_image_count() > 0 and not training_active and not self.final_model_dir
+
+    def can_save_background_sample(self) -> bool:
+        training_active = self.training_thread is not None and self.training_thread.is_alive()
+        return (
+            self.has_item_name() and
+            self.active_bin is not None and
+            self.latest_bgr is not None and
+            not training_active and
+            not self.final_model_dir
+        )
+
+    def delete_last_sample(self) -> None:
+        entry = self.latest_sample_entry()
+        if entry is None:
+            self.status = "No saved samples to delete"
+            return
+        if self.training_thread is not None and self.training_thread.is_alive():
+            self.status = "Cannot delete samples while training"
+            return
+        if self.final_model_dir:
+            self.status = "Cannot delete samples after training; start a fresh teach"
+            return
+
+        kind = entry.get("kind", "item")
+        stem = entry.get("stem", "")
+        if not stem:
+            self.status = "No saved samples to delete"
+            return
+        paths = [
+            self.images_dir / f"{stem}.png",
+            self.labels_dir / f"{stem}.txt",
+            self.prompts_dir / f"{stem}.yaml",
+        ]
+        if kind == "background":
+            paths.append(self.previews_dir / f"{stem}_preview.png")
+        else:
+            paths.extend([
+                self.masks_dir / f"{stem}.png",
+                self.previews_dir / f"{stem}_overlay.png",
+            ])
+        deleted_any = False
+        for path in paths:
+            try:
+                if path.exists():
+                    path.unlink()
+                    deleted_any = True
+            except Exception as exc:
+                self.get_logger().warn(f"Could not delete YOLO sample artifact {path}: {exc}")
+
+        if self.sample_history and self.sample_history[-1] == entry:
+            self.sample_history.pop()
+        else:
+            self.sample_history = [
+                saved for saved in self.sample_history
+                if not (saved.get("kind") == kind and saved.get("stem") == stem)
+            ]
+        if kind == "background":
+            self.background_sample_count = max(0, self.background_sample_count - 1)
+        else:
+            self.sample_count = max(0, self.sample_count - 1)
+        self.write_dataset_yaml()
+        self.status = (
+            f"Deleted {stem}; {self.sample_count_label()}"
+            if deleted_any else
+            f"{stem} files missing; {self.sample_count_label()}"
+        )
+        self.save_session()
+
+    def latest_sample_entry(self) -> Optional[Dict[str, str]]:
+        if self.sample_history:
+            return dict(self.sample_history[-1])
+
+        candidates: List[Tuple[float, Dict[str, str]]] = []
+        if self.sample_count > 0:
+            stem = f"sample_{self.sample_count:06d}"
+            path = self.images_dir / f"{stem}.png"
+            if path.exists():
+                candidates.append((path.stat().st_mtime, {"kind": "item", "stem": stem}))
+        if self.background_sample_count > 0:
+            stem = f"background_{self.background_sample_count:06d}"
+            path = self.images_dir / f"{stem}.png"
+            if path.exists():
+                candidates.append((path.stat().st_mtime, {"kind": "background", "stem": stem}))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def total_training_image_count(self) -> int:
+        return self.sample_count + self.background_sample_count
+
+    def background_ratio_percent(self) -> float:
+        total = self.total_training_image_count()
+        if total <= 0:
+            return 0.0
+        return round((float(self.background_sample_count) / float(total)) * 100.0, 1)
+
+    def background_ratio_label(self) -> str:
+        return f"BG {self.background_ratio_percent():.1f}% target 10-20%"
+
+    def background_ratio_color(self) -> Tuple[int, int, int]:
+        ratio = self.background_ratio_percent()
+        if 10.0 <= ratio <= 20.0:
+            return 184, 224, 194
+        return 205, 188, 170
+
+    def has_item_name(self) -> bool:
+        return bool(safe_name(self.item_name))
+
+    def item_name_error(self) -> str:
+        if not self.item_name.strip():
+            return "Enter item name first"
+        return "Item name needs letters or numbers"
+
+    def sample_count_label(self) -> str:
+        return (
+            f"Item {self.sample_count} | BG {self.background_sample_count} | "
+            f"Total {self.total_training_image_count()}"
+        )
 
     def start_training(self) -> None:
         if self.training_thread is not None and self.training_thread.is_alive():
             self.status = "Training already running"
+            return
+        if not self.has_item_name():
+            self.status = self.item_name_error()
             return
         if self.sample_count <= 0:
             self.status = "Save at least one sample first"
@@ -647,7 +1146,10 @@ class ItemTeachYoloNode(Node):
         self.training_epoch_current = 0
         self.training_epoch_total = max(1, self.train_epochs)
         self.training_progress = 0.0
-        self.status = f"Training YOLO11-seg on {self.sample_count} samples"
+        self.status = (
+            f"Training YOLO11-seg on {self.sample_count} item + "
+            f"{self.background_sample_count} background samples"
+        )
         self.save_session()
         self.training_thread = threading.Thread(target=self.train_worker, daemon=True)
         self.training_thread.start()
@@ -717,15 +1219,21 @@ class ItemTeachYoloNode(Node):
         finally:
             self.save_session()
 
-    def unique_model_dir(self) -> Path:
+    def teach_bundle_stem(self) -> str:
         active_bin = self.active_bin
         bin_suffix = f"_bin_{safe_name(active_bin.bin_name)}" if active_bin else ""
-        stem = f"item_{safe_name(self.item_name)}{bin_suffix}_{compact_date_for_path()}"
-        self.model_root.mkdir(parents=True, exist_ok=True)
-        path = self.model_root / stem
+        item_token = safe_name(self.item_name)
+        if not item_token:
+            raise RuntimeError("Enter item name before finalizing YOLO teach.")
+        return f"item_{item_token}{bin_suffix}_{compact_date_for_path()}"
+
+    def unique_model_dir(self) -> Path:
+        stem = self.teach_bundle_stem()
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        path = self.profile_dir / stem
         suffix = 1
         while path.exists():
-            path = self.model_root / f"{stem}_{suffix}"
+            path = self.profile_dir / f"{stem}_{suffix}"
             suffix += 1
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -741,7 +1249,6 @@ class ItemTeachYoloNode(Node):
         final_onnx = model_dir / "best.onnx"
         shutil.copy2(best_path, final_pt)
 
-        exported_path = ""
         try:
             trained_model = YOLO(str(best_path))
             exported = trained_model.export(
@@ -751,43 +1258,24 @@ class ItemTeachYoloNode(Node):
                 dynamic=False,
                 simplify=False,
             )
-            exported_path = str(exported)
-            exported_file = Path(exported_path)
+            exported_file = Path(str(exported))
             if exported_file.exists():
                 shutil.copy2(exported_file, final_onnx)
         except Exception as exc:
             self.get_logger().warn(f"YOLO ONNX export failed; detect needs ONNX for CPU speed: {exc}")
-
-        shutil.copy2(self.dataset_yaml_path, model_dir / "dataset.yaml")
-        summary = {
-            "item_name": self.item_name,
-            "class_id": 0,
-            "class_name": self.item_name,
-            "associated_bin_name": self.active_bin.bin_name if self.active_bin else "",
-            "session_dir": str(self.session_dir),
-            "runtime_best_pt": str(best_path),
-            "runtime_exported_onnx": exported_path,
-            "model_pt_path": str(final_pt),
-            "model_onnx_path": str(final_onnx) if final_onnx.exists() else "",
-            "sample_count": self.sample_count,
-            "train_epochs": self.train_epochs,
-            "train_imgsz": self.train_imgsz,
-            "train_device": self.train_device,
-            "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
-            "has_teach_joints": self.has_joint_positions,
-        }
-        (model_dir / "train_summary.yaml").write_text(
-            yaml.safe_dump(summary, sort_keys=False),
-            encoding="utf-8")
 
         self.final_model_dir = str(model_dir)
         self.trained_model_path = str(final_pt)
         self.trained_onnx_path = str(final_onnx) if final_onnx.exists() else ""
 
     def write_profile(self) -> None:
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        if not self.final_model_dir:
+            return
+        model_dir = Path(self.final_model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
         active_bin = self.active_bin
-        date_stamp = compact_date_for_path()
+        date_match = re.search(r"_(\d{8})(?:_\d+)?$", model_dir.name)
+        date_stamp = date_match.group(1) if date_match else compact_date_for_path()
         params = {
             "detection_backend": "yolo11_seg_onnx",
             "item_name": self.item_name,
@@ -798,13 +1286,27 @@ class ItemTeachYoloNode(Node):
             "depth_topic": self.depth_topic,
             "camera_info_topic": self.camera_info_topic,
             "overlay_topic": self.overlay_topic,
+            "camera_control_service_root": self.camera_control_service_root,
+            "color_exposure_us": self.color_exposure_us,
+            "depth_exposure_us": 0,
+            "color_exposure_percent": exposure_usec_to_percent(
+                self.color_exposure_us,
+                self.color_exposure_min_us,
+                self.color_exposure_max_us),
+            "depth_exposure_percent": 0,
+            "color_exposure_min_us": self.color_exposure_min_us,
+            "color_exposure_max_us": self.color_exposure_max_us,
+            "depth_exposure_min_us": self.depth_exposure_min_us,
+            "depth_exposure_max_us": self.depth_exposure_max_us,
             "session_dir": str(self.session_dir),
             "model_dir": self.final_model_dir,
             "model_path": self.trained_onnx_path,
             "model_onnx_path": self.trained_onnx_path,
             "model_pt_path": self.trained_model_path,
-            "dataset_yaml": str(self.dataset_yaml_path),
             "sample_count": self.sample_count,
+            "background_sample_count": self.background_sample_count,
+            "total_training_image_count": self.total_training_image_count(),
+            "background_ratio_percent": self.background_ratio_percent(),
             "train_epochs": self.train_epochs,
             "train_imgsz": self.train_imgsz,
             "trained_model_path": self.trained_model_path,
@@ -838,11 +1340,7 @@ class ItemTeachYoloNode(Node):
             "item_detect": {"ros__parameters": params},
             "item_yolo": {"ros__parameters": params},
         }
-        bin_suffix = f"_bin_{safe_name(active_bin.bin_name)}" if active_bin else ""
-        profile_path = (
-            self.profile_dir /
-            f"item_{safe_name(self.item_name)}{bin_suffix}_yolo_{date_stamp}.yaml"
-        )
+        profile_path = model_dir / f"{model_dir.name}.yaml"
         profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
         self.latest_profile_path = str(profile_path)
 
@@ -878,23 +1376,34 @@ class ItemTeachYoloNode(Node):
         return x0 + point[0], y0 + point[1]
 
     def draw_button(self, canvas: np.ndarray, name: str, rect: Tuple[int, int, int, int],
-                    label: str, enabled: bool = True, active: bool = False) -> None:
+                    label: str, enabled: bool = True, active: bool = False,
+                    role: str = "default") -> None:
         x, y, w, h = rect
-        if active:
+        if role == "save":
+            fill = (38, 82, 55) if active or enabled else (36, 56, 44)
+            border = (118, 214, 146) if active or enabled else (72, 114, 84)
+            text = (230, 248, 234) if enabled else (136, 162, 142)
+        elif role == "danger":
+            fill = (82, 48, 46) if active or enabled else (58, 43, 42)
+            border = (224, 142, 132) if active or enabled else (120, 82, 78)
+            text = (250, 232, 228) if enabled else (162, 136, 132)
+        elif active:
             fill = (70, 126, 186)
             border = (126, 202, 255)
+            text = (238, 242, 245)
         elif enabled:
             fill = (48, 64, 76)
             border = (170, 210, 240)
+            text = (238, 242, 245)
         else:
             fill = (52, 52, 52)
             border = (102, 106, 112)
-        text = (238, 242, 245) if enabled else (150, 150, 150)
+            text = (150, 150, 150)
         cv2.rectangle(canvas, (x, y), (x + w, y + h), fill, -1)
         cv2.rectangle(canvas, (x, y), (x + w, y + h), border, 2)
         cv2.putText(canvas, fit_text(label, max(6, w // 11)), (x + 10, y + 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, text, 1, cv2.LINE_AA)
-        self.buttons[name] = Button(name, rect, enabled)
+        self.buttons[name] = Button(name, rect, enabled, role)
 
     def draw_progress_button(self, canvas: np.ndarray, name: str, rect: Tuple[int, int, int, int],
                              label: str, progress: float, enabled: bool = True) -> None:
@@ -911,6 +1420,74 @@ class ItemTeachYoloNode(Node):
         cv2.putText(canvas, fit_text(label, max(6, w // 11)), (x + 10, y + 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 242, 245), 1, cv2.LINE_AA)
         self.buttons[name] = Button(name, rect, enabled)
+
+    def draw_exposure_slider(self, panel: np.ndarray, y: int) -> int:
+        label = "RGB Exposure us"
+        value_text = "auto" if self.color_exposure_us <= 0 else f"{self.color_exposure_us} us"
+        track_x = PANEL_PAD
+        track_y = y + 30
+        track_w = LEFT_PANEL_WIDTH - 2 * PANEL_PAD
+        track_h = 12
+
+        cv2.putText(panel, label, (track_x, track_y - 10), cv2.FONT_HERSHEY_DUPLEX,
+                    0.45, (214, 218, 224), 1, cv2.LINE_AA)
+        cv2.putText(panel, value_text, (track_x + track_w - 54, track_y - 10),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.43, (186, 191, 198), 1, cv2.LINE_AA)
+
+        self.exposure_slider_rect = (track_x, track_y - 8, track_w, track_h + 16)
+        cv2.rectangle(panel, (track_x, track_y), (track_x + track_w, track_y + track_h),
+                      (67, 72, 78), -1)
+        cv2.rectangle(panel, (track_x, track_y), (track_x + track_w, track_y + track_h),
+                      (92, 99, 107), 1)
+
+        t = float(self.color_exposure_us) / float(max(1, self.color_exposure_max_us))
+        t = min(max(t, 0.0), 1.0)
+        fill_w = int(round(track_w * t))
+        knob_x = track_x + fill_w
+        knob_y = track_y + track_h // 2
+        accent = (130, 170, 200) if self.color_exposure_us <= 0 else (108, 206, 224)
+        cv2.line(panel, (track_x + 1, knob_y), (track_x + track_w - 1, knob_y),
+                 accent, 2, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, knob_y), 9, (245, 245, 245), -1, cv2.LINE_AA)
+        cv2.circle(panel, (knob_x, knob_y), 9, (96, 100, 106), 1, cv2.LINE_AA)
+        return y + 62
+
+    def update_color_exposure_from_x(self, x: int, save: bool) -> None:
+        sx, sy, sw, sh = self.exposure_slider_rect
+        if sw <= 0:
+            return
+        clamped_x = min(max(x, sx), sx + sw)
+        ratio = float(clamped_x - sx) / float(max(1, sw))
+        new_value = int(round(ratio * float(self.color_exposure_max_us)))
+        new_value = clamp_exposure_usec_or_auto(
+            new_value,
+            self.color_exposure_min_us,
+            self.color_exposure_max_us)
+        if new_value != self.color_exposure_us:
+            self.color_exposure_us = new_value
+            self.mark_camera_exposure_dirty()
+            self.status = f"RGB exposure: {self.exposure_mode_text(self.color_exposure_us)}"
+        if save:
+            self.save_runtime_settings()
+            self.save_session()
+
+    def handle_exposure_slider_mouse(self, event: int, x: int, y: int) -> bool:
+        if self.bin_dropdown_open and not self.exposure_slider_active:
+            return False
+        sx, sy, sw, sh = self.exposure_slider_rect
+        inside = sx <= x <= sx + sw and sy <= y <= sy + sh
+        if event == cv2.EVENT_LBUTTONDOWN and inside:
+            self.exposure_slider_active = True
+            self.update_color_exposure_from_x(x, save=True)
+            return True
+        if event == cv2.EVENT_MOUSEMOVE and self.exposure_slider_active:
+            self.update_color_exposure_from_x(x, save=False)
+            return True
+        if event == cv2.EVENT_LBUTTONUP and self.exposure_slider_active:
+            self.update_color_exposure_from_x(x, save=True)
+            self.exposure_slider_active = False
+            return True
+        return False
 
     def update_view(self) -> None:
         if self.prediction_dirty and not self.predicting:
@@ -947,35 +1524,58 @@ class ItemTeachYoloNode(Node):
                 cv2.circle(display_frame, frame_point, 6, (60, 70, 240), -1)
                 cv2.circle(display_frame, frame_point, 8, (20, 20, 120), 1)
 
-        canvas_h = VIDEO_TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT
-        canvas_w = LEFT_PANEL_WIDTH + PREVIEW_CANVAS_WIDTH
+        preview, scale = self.fit_preview(display_frame)
+        preview_w, preview_h = preview.shape[1], preview.shape[0]
+        canvas_h = max(VIDEO_TOP_BAR_HEIGHT + preview_h, VIDEO_TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT)
+        canvas_w = LEFT_PANEL_WIDTH + preview_w
         canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         canvas[:] = (18, 22, 26)
 
-        preview, scale = self.fit_preview(display_frame)
         self.preview_scale = scale
-        self.preview_image_size = (preview.shape[1], preview.shape[0])
+        self.preview_image_size = (preview_w, preview_h)
         preview_x = LEFT_PANEL_WIDTH
         preview_y = VIDEO_TOP_BAR_HEIGHT
-        canvas[preview_y:preview_y + preview.shape[0], preview_x:preview_x + preview.shape[1]] = preview
-        self.preview_rect = (preview_x, preview_y, preview.shape[1], preview.shape[0])
+        canvas[preview_y:preview_y + preview_h, preview_x:preview_x + preview_w] = preview
+        self.preview_rect = (preview_x, preview_y, preview_w, preview_h)
 
         self.draw_panel(canvas)
         self.draw_video_bar(canvas)
+        self.resize_window_if_needed(canvas_w, canvas_h)
         cv2.imshow(WINDOW_NAME, canvas)
         self.handle_key(cv2.waitKey(1))
+
+    def preview_canvas_size_for_source(self, image: np.ndarray) -> Tuple[int, int]:
+        h, w = image.shape[:2]
+        requested_scale = self.display_scale if self.display_scale > 0.0 else 1.0
+        if w <= 0 or h <= 0:
+            return PREVIEW_CANVAS_WIDTH, PREVIEW_CANVAS_HEIGHT
+        preview_w = max(
+            PREVIEW_CANVAS_WIDTH,
+            int(round(float(w) * requested_scale)),
+        )
+        preview_h = max(1, int(round(float(preview_w) * float(h) / float(w))))
+        return preview_w, preview_h
 
     def fit_preview(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
         h, w = image.shape[:2]
         if h <= 0 or w <= 0:
             return np.zeros((PREVIEW_CANVAS_HEIGHT, PREVIEW_CANVAS_WIDTH, 3), dtype=np.uint8), 1.0
-        scale = min(PREVIEW_CANVAS_WIDTH / float(w), PREVIEW_CANVAS_HEIGHT / float(h))
-        scale *= max(0.1, self.display_scale)
-        scale = min(scale, PREVIEW_CANVAS_WIDTH / float(w), PREVIEW_CANVAS_HEIGHT / float(h))
+        preview_w, preview_h = self.preview_canvas_size_for_source(image)
+        scale = min(preview_w / float(w), preview_h / float(h))
         new_w = max(1, int(round(w * scale)))
         new_h = max(1, int(round(h * scale)))
         preview = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         return preview, scale
+
+    def resize_window_if_needed(self, width: int, height: int) -> None:
+        window_size = (int(width), int(height))
+        if window_size == self.rendered_window_size:
+            return
+        try:
+            cv2.resizeWindow(WINDOW_NAME, window_size[0], window_size[1])
+            self.rendered_window_size = window_size
+        except cv2.error as exc:
+            self.get_logger().warn(f"Could not resize YOLO teach window: {exc}")
 
     def draw_panel(self, canvas: np.ndarray) -> None:
         panel = canvas[:, :LEFT_PANEL_WIDTH]
@@ -994,10 +1594,14 @@ class ItemTeachYoloNode(Node):
         cv2.rectangle(panel, (PANEL_PAD, input_y), (PANEL_PAD + input_w, input_y + BUTTON_HEIGHT), input_fill, -1)
         cv2.rectangle(panel, (PANEL_PAD, input_y), (PANEL_PAD + input_w, input_y + BUTTON_HEIGHT), input_border, 2)
         item_text = self.item_name_edit_buffer if self.item_name_edit_active else self.item_name
+        show_item_placeholder = not item_text.strip() and not self.item_name_edit_active
+        if show_item_placeholder:
+            item_text = "Enter item name"
         if self.item_name_edit_active:
             item_text += "|"
+        item_color = (150, 156, 164) if show_item_placeholder else (238, 242, 245)
         cv2.putText(panel, fit_text(item_text, 34), (PANEL_PAD + 10, input_y + 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, (238, 242, 245), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, item_color, 1, cv2.LINE_AA)
 
         y = 136
         self.draw_button(
@@ -1008,34 +1612,43 @@ class ItemTeachYoloNode(Node):
             bool(self.bin_entries),
             self.bin_dropdown_open,
         )
-        y += BUTTON_HEIGHT + 24
+        y += BUTTON_HEIGHT + 10
+
+        y = self.draw_exposure_slider(panel, y)
 
         cv2.putText(panel, "SAM2 Prompts", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.58, (235, 238, 242), 1, cv2.LINE_AA)
-        y += 12
+        y += 10
         cv2.putText(panel, f"Positive: {len(self.positive_points)}    Negative: {len(self.negative_points)}",
-                    (PANEL_PAD, y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (205, 218, 226), 1, cv2.LINE_AA)
-        y += 44
-        self.draw_button(panel, "clear_prompts", (PANEL_PAD, y, 186, BUTTON_HEIGHT),
-                         "Clear Prompts", True)
-        self.draw_button(panel, "save_sample", (PANEL_PAD + 202, y, 198, BUTTON_HEIGHT),
-                         "Save Sample", self.current_mask is not None)
-        y += BUTTON_HEIGHT + 24
+                    (PANEL_PAD, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (205, 218, 226), 1, cv2.LINE_AA)
+        y += 38
+        self.draw_button(panel, "clear_prompts", (PANEL_PAD, y, 190, BUTTON_HEIGHT),
+                         "Clear", True, role="danger")
+        self.draw_button(panel, "delete_last_sample", (PANEL_PAD + 210, y, 190, BUTTON_HEIGHT),
+                         "Del Last", self.can_delete_last_sample(), role="danger")
+        y += BUTTON_HEIGHT + 8
+        self.draw_button(panel, "save_sample", (PANEL_PAD, y, 190, BUTTON_HEIGHT),
+                         "Save Item", self.current_mask is not None and self.has_item_name(), role="save")
+        self.draw_button(panel, "save_background_sample", (PANEL_PAD + 210, y, 190, BUTTON_HEIGHT),
+                         "Save BG", self.can_save_background_sample(), role="save")
+        y += BUTTON_HEIGHT + 14
 
         cv2.putText(panel, "YOLO11", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.58, (235, 238, 242), 1, cv2.LINE_AA)
         y += 12
-        cv2.putText(panel, f"Samples: {self.sample_count}", (PANEL_PAD, y + 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (190, 232, 190), 1, cv2.LINE_AA)
-        cv2.putText(panel, f"Status: {fit_text(self.training_status, 24)}", (PANEL_PAD + 160, y + 24),
+        cv2.putText(panel, self.sample_count_label(), (PANEL_PAD, y + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (190, 232, 190), 1, cv2.LINE_AA)
+        cv2.putText(panel, self.background_ratio_label(), (PANEL_PAD, y + 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, self.background_ratio_color(), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"Status: {fit_text(self.training_status, 30)}", (PANEL_PAD, y + 72),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (205, 218, 226), 1, cv2.LINE_AA)
         joint_status = "Teach Position: captured" if self.has_joint_positions else "Teach Position: waiting"
-        cv2.putText(panel, joint_status, (PANEL_PAD, y + 48),
+        cv2.putText(panel, joint_status, (PANEL_PAD, y + 96),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                     (184, 224, 194) if self.has_joint_positions else (205, 188, 170),
                     1,
                     cv2.LINE_AA)
-        y += 66
+        y += 104
         training_active = self.training_thread is not None and self.training_thread.is_alive()
         train_rect = (PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, BUTTON_HEIGHT)
         if training_active:
@@ -1045,44 +1658,51 @@ class ItemTeachYoloNode(Node):
             )
             self.draw_progress_button(panel, "train_yolo", train_rect, train_label, self.training_progress, True)
         elif self.training_status == "done":
-            self.draw_progress_button(panel, "train_yolo", train_rect, "Train YOLO11: done", 1.0, self.sample_count > 0)
+            self.draw_progress_button(
+                panel, "train_yolo", train_rect, "Train YOLO11: done", 1.0,
+                self.sample_count > 0 and self.has_item_name())
         else:
-            self.draw_button(panel, "train_yolo", train_rect, "Train YOLO11", self.sample_count > 0)
-        y += BUTTON_HEIGHT + 26
+            self.draw_button(panel, "train_yolo", train_rect, "Train YOLO11",
+                             self.sample_count > 0 and self.has_item_name())
+        y += BUTTON_HEIGHT + 10
 
         cv2.putText(panel, "Status", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
-        y += 28
-        self.draw_wrapped_text(panel, self.status, PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, 4)
-        y += 98
+                    0.52, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 20
+        status_lines = self.draw_wrapped_text(
+            panel, self.status, PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, 3, 0.44)
+        y += max(30, status_lines * 22 + 8)
 
         cv2.putText(panel, "Session", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
-        y += 28
-        self.draw_wrapped_text(panel, str(self.session_dir), PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, 3, 0.43)
-        y += 76
+                    0.52, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 20
+        session_lines = self.draw_wrapped_text(
+            panel, str(self.session_dir), PANEL_PAD, y, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, 2, 0.39)
+        y += max(30, session_lines * 22 + 6)
 
         cv2.putText(panel, "Controls", (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.58, (235, 238, 242), 1, cv2.LINE_AA)
-        y += 28
+                    0.52, (235, 238, 242), 1, cv2.LINE_AA)
+        y += 20
         instructions = [
             "Left click: positive prompt",
             "Right click: negative prompt",
-            "Save Sample: mask to YOLO label",
+            "Save Item: mask to YOLO label",
+            "Save BG: empty label target 10-20%",
+            "Del Last: remove newest sample",
             "Train YOLO11: train segmentation model",
         ]
         for line in instructions:
             cv2.putText(panel, line, (PANEL_PAD, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.46, (184, 196, 205), 1, cv2.LINE_AA)
-            y += 24
+                        0.43, (184, 196, 205), 1, cv2.LINE_AA)
+            y += 21
 
         if self.bin_dropdown_open:
             self.draw_bin_dropdown(panel)
 
     def commit_item_name_edit(self) -> None:
         new_name = self.item_name_edit_buffer.strip()
-        if not new_name:
-            self.status = "Item name cannot be empty"
+        if not safe_name(new_name):
+            self.status = "Item name cannot be empty" if not new_name else "Item name needs letters or numbers"
             self.item_name_edit_buffer = self.item_name
             self.item_name_edit_active = False
             return
@@ -1139,7 +1759,7 @@ class ItemTeachYoloNode(Node):
                     0.56, (216, 224, 232), 1, cv2.LINE_AA)
 
     def draw_wrapped_text(self, image: np.ndarray, text: str, x: int, y: int,
-                          width: int, max_lines: int, scale: float = 0.48) -> None:
+                          width: int, max_lines: int, scale: float = 0.48) -> int:
         max_chars = max(10, width // 9)
         words = text.split()
         lines: List[str] = []
@@ -1156,11 +1776,13 @@ class ItemTeachYoloNode(Node):
                 break
         if current and len(lines) < max_lines:
             lines.append(current)
-        for i, line in enumerate(lines[:max_lines]):
+        drawn_lines = lines[:max_lines]
+        for i, line in enumerate(drawn_lines):
             if i == max_lines - 1 and len(lines) == max_lines and len(line) > max_chars - 3:
                 line = line[:max_chars - 3] + "..."
             cv2.putText(image, line, (x, y + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                         scale, (190, 202, 212), 1, cv2.LINE_AA)
+        return max(1, len(drawn_lines))
 
     def bin_dropdown_label(self) -> str:
         if self.active_bin is not None:
@@ -1184,7 +1806,12 @@ class ItemTeachYoloNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.47, (238, 242, 245), 1, cv2.LINE_AA)
 
     def mouse_callback(self, event, x: int, y: int, flags, param) -> None:
+        if event in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONUP):
+            self.handle_exposure_slider_mouse(event, x, y)
+            return
         if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+            return
+        if event == cv2.EVENT_LBUTTONDOWN and self.handle_exposure_slider_mouse(event, x, y):
             return
         if event == cv2.EVENT_LBUTTONDOWN and self.handle_button_click(x, y):
             return
@@ -1213,6 +1840,10 @@ class ItemTeachYoloNode(Node):
                     self.clear_prompts()
                 elif name == "save_sample":
                     self.save_sample()
+                elif name == "save_background_sample":
+                    self.save_background_sample()
+                elif name == "delete_last_sample":
+                    self.delete_last_sample()
                 elif name == "train_yolo":
                     self.start_training()
                 elif name == "live_view":
@@ -1274,6 +1905,7 @@ def main(args=None) -> None:
     try:
         rclpy.spin(node)
     finally:
+        node.save_runtime_settings()
         node.save_session()
         cv2.destroyWindow(WINDOW_NAME)
         node.destroy_node()

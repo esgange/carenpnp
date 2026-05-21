@@ -1,0 +1,21 @@
+# Cell External Bridge config for this robot-arm PC.
+#
+# Edit this file per arm, source it in the station shell, then start the bridge.
+
+# RabbitMQ on the conveyor/master PC. Must include the correct vhost.
+RABBITMQ_URL=amqp://catarm-server:change-me-server-password@192.168.100.98:5672/%2Fcatarm
+RABBITMQ_EXCHANGE=catarm.events
+
+# Must match the conveyor PC exactly.
+MESSAGE_SIGNING_KEY=change-me-message-signing-key
+
+# Per-arm identity. ARM_NUMBER drives the RabbitMQ routing keys.
+BELT_ID=belt-a
+CELL_BRIDGE_ID=edge_01
+ROBOT_ARM_ID=arm_01
+ARM_NUMBER=1
+
+# Robot bringup. Robot Cell Orchestrator passes this file to cr_robot_ros2.
+ROS_LOCALHOST_ONLY=true
+ROBOT_IP_ADDRESS=192.168.200.1
+ROBOT_TYPE=cr10

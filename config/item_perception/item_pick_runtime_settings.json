@@ -2,18 +2,12 @@
   "schema_version": 8,
   "tf_only_mode": false,
   "item_pose_wait_timeout_sec": 60.0,
+  "ee_intercept_speed_mm_s": 350.0,
   "tray_intercept_x_offset_mm": 0.0,
   "tray_intercept_y_offset_mm": 0.0,
-  "item_standoff_z_mm": 97.0,
+  "item_standoff_z_mm": 90.0,
   "approach_z_up_mm": 50.0,
-  "final_z_up_mm": 200.0,
+  "final_z_up_mm": 100.0,
   "pre_pick_settling_time_sec": 1.0,
-  "pick_settling_time_sec": 0.2,
-  "settling_time_sec": 0.2,
-  "tool_offset_x_mm": 0.0,
-  "tool_offset_y_mm": 0.0,
-  "tool_offset_z_mm": 0.0,
-  "tool_offset_rx_deg": 0.0,
-  "tool_offset_ry_deg": 0.0,
-  "tool_offset_rz_deg": 0.0
+  "pick_settling_time_sec": 0.2
 }

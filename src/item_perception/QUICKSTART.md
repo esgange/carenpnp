@@ -17,7 +17,7 @@ source install/setup.bash
 If this robot setup does not already have a platform reference, create it once:
 
 ```bash
-ros2 launch camera_calibration platform_teach.launch.py platform_name:=robot_platform_1
+ros2 launch camera_calibration platform_teach.launch.py
 ```
 
 Then teach or update the bin:
@@ -54,14 +54,15 @@ WORKSPACE_ROOT/teach/item_teach/item_<name>_<ddmmyyyy>.yaml
 WORKSPACE_ROOT/teach/item_teach/item_<name>_bin_<associated_bin>_<ddmmyyyy>.yaml
 ```
 
-The item name and bin name are independent. Loading `blue_bin` in `item_teach`
+Teach starts with blank item/bin names, so enter the name in the UI before
+saving. The item name and bin name are independent. Loading `blue_bin` in `item_teach`
 associates the saved item profile with that bin, reuses/scales its ROI, and uses
 the same four corner points for the depth-normalize plane.
 
 New bin-teach profiles are saved as:
 
 ```text
-WORKSPACE_ROOT/teach/bin_teach/<name>.yaml
+WORKSPACE_ROOT/teach/bin_teach/bin_<name>_<ddmmyyyy>.yaml
 ```
 
 The bin-teach file stores both the ROI corners and the bin reference depth plane.
@@ -86,5 +87,5 @@ Default outputs:
 - `/bin_pose`
 - `/bin_cube_marker`
 
-Use the top dropdown to select a profile. Use `Delete Item` to remove the
-selected dated profile from disk and refresh the dropdown.
+Use `Open Teach` to browse `teach/item_teach` and select a profile YAML. Use
+`Delete Item` to remove the selected dated profile from disk.

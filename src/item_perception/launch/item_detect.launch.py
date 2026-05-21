@@ -13,7 +13,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -73,7 +72,7 @@ def _find_latest_calibration(calibration_dir: str) -> str:
             if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
                 continue
             name = path.name
-            if name.startswith("axab_calibration_eyeonhand_"):
+            if name.startswith("axab_calibration_eyetohand_"):
                 yaml_files.append(path)
         if not yaml_files:
             return ""
@@ -94,9 +93,21 @@ def _calibration_file_is_usable(path: str) -> bool:
 
 def _launch_setup(context, *args, **kwargs):
     params_file = LaunchConfiguration("params_file").perform(context).strip()
+    profiles_dir = os.path.expanduser(LaunchConfiguration("profiles_dir").perform(context).strip())
+    selected_profile_path = os.path.expanduser(
+        LaunchConfiguration("selected_profile_path").perform(context).strip()
+    )
+    runtime_settings_file = os.path.expanduser(
+        LaunchConfiguration("runtime_settings_file").perform(context).strip()
+    )
+    selected_profile_export_file = os.path.expanduser(
+        LaunchConfiguration("selected_profile_export_file").perform(context).strip()
+    )
     color_topic = LaunchConfiguration("color_topic").perform(context)
     depth_topic = LaunchConfiguration("depth_topic").perform(context)
     camera_info_topic = LaunchConfiguration("camera_info_topic").perform(context)
+    overlay_topic = LaunchConfiguration("overlay_topic").perform(context)
+    publish_overlay = _to_bool(LaunchConfiguration("publish_overlay").perform(context))
     bin_pose_topic = LaunchConfiguration("bin_pose_topic").perform(context)
     bin_item_pose_array_topic = LaunchConfiguration("bin_item_pose_array_topic").perform(context)
     camera_control_service_root = LaunchConfiguration("camera_control_service_root").perform(context)
@@ -127,6 +138,7 @@ def _launch_setup(context, *args, **kwargs):
     align_item_z_axis_to_depth_plane = _to_bool(
         LaunchConfiguration("align_item_z_axis_to_depth_plane").perform(context)
     )
+    headless = _to_bool(LaunchConfiguration("headless").perform(context))
 
     selected_file = ""
     if use_calibration:
@@ -143,7 +155,7 @@ def _launch_setup(context, *args, **kwargs):
             selected_file = _find_latest_calibration(calibration_dir)
             if not selected_file:
                 msg = (
-                    "[item_detect.launch] No non-empty calibration YAML found in "
+                    "[item_detect.launch] No non-empty eye-to-hand calibration YAML found in "
                     f"{calibration_dir}. Provide one via calibration_file:=<path>."
                 )
                 _show_missing_calibration_dialog(msg)
@@ -159,6 +171,8 @@ def _launch_setup(context, *args, **kwargs):
             "color_topic": color_topic,
             "depth_topic": depth_topic,
             "camera_info_topic": camera_info_topic,
+            "overlay_topic": overlay_topic,
+            "publish_overlay": publish_overlay,
             "camera_control_service_root": camera_control_service_root,
             "color_exposure_min_us": color_exposure_min_us,
             "color_exposure_max_us": color_exposure_max_us,
@@ -166,8 +180,13 @@ def _launch_setup(context, *args, **kwargs):
             "depth_exposure_max_us": depth_exposure_max_us,
             "bin_pose_topic": bin_pose_topic,
             "bin_item_pose_array_topic": bin_item_pose_array_topic,
+            "profiles_dir": profiles_dir,
+            "selected_profile_path": selected_profile_path,
+            "runtime_settings_file": runtime_settings_file,
+            "selected_profile_export_file": selected_profile_export_file,
             "camera_frame": bin_camera_frame,
             "start_visualization": start_visualization,
+            "headless": headless,
             "use_calibration": use_calibration,
             "publish_static_calibration_tf": use_calibration,
             "calibration_parent_frame": parent_frame,
@@ -223,20 +242,44 @@ def generate_launch_description():
             default_value="",
         ),
         DeclareLaunchArgument(
+            "profiles_dir",
+            default_value=_repo_path("teach", "item_teach"),
+        ),
+        DeclareLaunchArgument(
+            "selected_profile_path",
+            default_value="",
+        ),
+        DeclareLaunchArgument(
+            "runtime_settings_file",
+            default_value=_repo_path("config", "item_perception", "item_detect_runtime_settings.yaml"),
+        ),
+        DeclareLaunchArgument(
+            "selected_profile_export_file",
+            default_value=_repo_path("config", "item_perception", "item_detect_selected_profile.txt"),
+        ),
+        DeclareLaunchArgument(
             "color_topic",
-            default_value="/robot_camera/color/image_raw",
+            default_value="/bin_camera/color/image_raw",
         ),
         DeclareLaunchArgument(
             "depth_topic",
-            default_value="/robot_camera/depth/image_raw",
+            default_value="/bin_camera/depth/image_raw",
         ),
         DeclareLaunchArgument(
             "camera_info_topic",
-            default_value="/robot_camera/color/camera_info",
+            default_value="/bin_camera/color/camera_info",
+        ),
+        DeclareLaunchArgument(
+            "overlay_topic",
+            default_value="bin_overlay",
+        ),
+        DeclareLaunchArgument(
+            "publish_overlay",
+            default_value="true",
         ),
         DeclareLaunchArgument(
             "camera_control_service_root",
-            default_value="/robot_camera",
+            default_value="/bin_camera",
         ),
         DeclareLaunchArgument(
             "color_exposure_min_us",
@@ -268,11 +311,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "parent_frame",
-            default_value="Link6",
+            default_value="base_link",
         ),
         DeclareLaunchArgument(
             "child_frame",
-            default_value="calibrated_camera_link",
+            default_value="bin_calibrated_link",
         ),
         DeclareLaunchArgument(
             "calibration_dir",
@@ -289,6 +332,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "start_visualization",
             default_value="true",
+        ),
+        DeclareLaunchArgument(
+            "headless",
+            default_value="false",
         ),
         DeclareLaunchArgument(
             "align_item_z_axis_to_depth_plane",

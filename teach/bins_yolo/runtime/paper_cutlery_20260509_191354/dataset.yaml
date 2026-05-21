@@ -1,5 +1,0 @@
-path: /home/erds/DOBOT_pickn_place/teach/bins_yolo/runtime/paper_cutlery_20260509_191354/dataset
-train: images/train
-val: images/train
-names:
-  0: paper_cutlery

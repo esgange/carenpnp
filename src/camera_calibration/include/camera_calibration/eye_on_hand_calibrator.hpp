@@ -49,6 +49,13 @@ private:
   std::string gripper_frame_;
   std::string camera_frame_;
   std::string target_frame_;
+  double max_target_age_sec_{1.5};
+  std::string calibration_name_;
+  std::string tracking_base_frame_;
+  std::string tracking_marker_frame_;
+  std::string move_group_namespace_;
+  std::string move_group_;
+  bool freehand_robot_movement_{true};
   std::string calibration_mode_{"eye_on_hand"};
   bool has_solution_{false};
   Eigen::Matrix3d last_rotation_{Eigen::Matrix3d::Identity()};

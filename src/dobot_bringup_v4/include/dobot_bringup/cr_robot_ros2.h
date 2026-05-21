@@ -113,8 +113,6 @@
 #include <dobot_msgs_v4/srv/mov_l.hpp>
 #include <dobot_msgs_v4/srv/rel_joint_mov_j.hpp>
 #include <dobot_msgs_v4/srv/get_current_command_id.hpp>
-#include <dobot_msgs_v4/srv/servo_j.hpp>
-#include <dobot_msgs_v4/srv/servo_p.hpp>
 
 class CRRobotRos2 : public rclcpp::Node
 {
@@ -224,8 +222,6 @@ protected:
     bool RelMovLUser(const std::shared_ptr<dobot_msgs_v4::srv::RelMovLUser::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::RelMovLUser::Response> response);
     bool RelJointMovJ(const std::shared_ptr<dobot_msgs_v4::srv::RelJointMovJ::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::RelJointMovJ::Response> response);
     bool GetCurrentCommandId(const std::shared_ptr<dobot_msgs_v4::srv::GetCurrentCommandId::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::GetCurrentCommandId::Response> response);
-    bool ServoJ(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Response> response);
-    bool ServoP(const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Response> response);
 
 private:
     rclcpp::TimerBase::SharedPtr kTimer;
@@ -319,8 +315,6 @@ private:
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::RelMovLUser>> kServiceRelMovLUser;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::RelJointMovJ>> kServiceRelJointMovJ;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::GetCurrentCommandId>> kServiceGetCurrentCommandId;
-    std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::ServoJ>> kServiceServoJ;
-    std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::ServoP>> kServiceServoP;
     std::shared_ptr<rclcpp::Client<dobot_msgs_v4::srv::GetErrorID>> kClientGeterror;
 
 private:

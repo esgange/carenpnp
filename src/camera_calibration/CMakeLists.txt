@@ -6,7 +6,9 @@ if(NOT CMAKE_CXX_STANDARD)
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(aruco_perception REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -41,6 +43,7 @@ ament_target_dependencies(eye_on_hand_calibrator
 add_executable(calibration_perception src/calibration_perception.cpp)
 ament_target_dependencies(calibration_perception
   rclcpp
+  rcl_interfaces
   geometry_msgs
   tf2
   tf2_geometry_msgs
@@ -49,6 +52,7 @@ ament_target_dependencies(calibration_perception
 
 add_executable(platform_teach src/platform_teach_node.cpp)
 ament_target_dependencies(platform_teach
+  aruco_perception
   rclcpp
   geometry_msgs
   sensor_msgs

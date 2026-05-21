@@ -123,9 +123,8 @@ set(srv_files
        "srv/RelMovLUser.srv"
        "srv/GetTrayDimensions.srv"
        "srv/TrayInterceptStart.srv"
+       "srv/LoadOnlineProgram.srv"
        "srv/GetCurrentCommandId.srv"
-       "srv/ServoJ.srv"
-       "srv/ServoP.srv"
        "srv/TcpDashboard.srv"
         )
 

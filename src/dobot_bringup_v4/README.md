@@ -25,30 +25,34 @@ source install/setup.bash
 
 ## Configuration
 
-Robot connection settings are stored in:
+Robot connection settings are normally stored in the repo root:
 
 ```text
-WORKSPACE_ROOT/config/robot_bringup/param.json
+WORKSPACE_ROOT/station_config
 ```
 
-Installed launches prefer the workspace-level config and fall back to the
-installed package-share copy.
+Robot Cell Orchestrator passes this file when launching Robot Bringup. Direct `ros2 launch`
+also finds it by default from the workspace root.
 
 Important fields:
 
 | Field | Meaning |
 | --- | --- |
-| `robot_number` | Number of robot entries in the file. |
-| `current_robot` | 1-based index of the active robot entry. |
-| `ros_localhost_only` | When true, sourcing `install/setup.bash` exports `ROS_LOCALHOST_ONLY=1`, so ROS 2 discovery/topics stay on this computer. |
-| `node_info[].ip_address` | Robot controller IP address. |
-| `node_info[].robot_type` | Robot model, such as `cr5`, `cr10`, `cr16`, `me6`, or `nova5`. |
-| `node_info[].trajectory_duration` | Default trajectory duration parameter. |
-| `node_info[].robot_node_name` | ROS node name for bringup. |
+| `ROBOT_NUMBER` | Robot count passed to bringup. |
+| `ROS_LOCALHOST_ONLY` | When true, launch files export `ROS_LOCALHOST_ONLY=1`, so ROS 2 discovery/topics stay on this computer. |
+| `ROBOT_IP_ADDRESS` | Robot controller IP address. |
+| `ROBOT_TYPE` | Robot model, such as `cr5`, `cr10`, `cr16`, `me6`, or `nova5`. |
 
 `ROS_DOMAIN_ID` is normally provided by the shell environment. A custom config
 may still include an optional legacy `ros_domain_id` field, and launch files
 will honor it when present.
+
+Legacy JSON configs are still accepted through the `config:=...` launch
+argument:
+
+```text
+WORKSPACE_ROOT/config/robot_bringup/param.json
+```
 
 After sourcing the workspace, verify the ROS environment with:
 
@@ -68,6 +72,13 @@ Use a custom config:
 ```bash
 ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py \
   config:=/absolute/path/to/param.json
+```
+
+Use a custom station config:
+
+```bash
+ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py \
+  station_config:=/absolute/path/to/station_config
 ```
 
 ## Published State

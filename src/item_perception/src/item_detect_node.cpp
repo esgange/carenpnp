@@ -4,6 +4,7 @@
 #include <cctype>
 #include <deque>
 #include <exception>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <cmath>
@@ -99,6 +100,93 @@ constexpr int kDefaultExposureMaxUs = 32000;
 constexpr int kPoseReferenceSlotCount = 4;
 constexpr int kSeekMotionHistoryMaxSamples = 10;
 constexpr double kSeekResultFreezeSeconds = 3.0;
+
+bool isOpenCvWindowClosed(const std::string &window_name)
+{
+  static bool window_was_visible = false;
+  static const auto first_check_time = std::chrono::steady_clock::now();
+
+  double visible = -1.0;
+  try
+  {
+    visible = cv::getWindowProperty(window_name, cv::WND_PROP_VISIBLE);
+  }
+  catch (const cv::Exception &)
+  {
+    return window_was_visible;
+  }
+
+  if (visible >= 1.0)
+  {
+    window_was_visible = true;
+    return false;
+  }
+
+  const double age_sec = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - first_check_time).count();
+
+  // Some OpenCV HighGUI backends briefly report WND_PROP_VISIBLE == 0 while
+  // the window is still being mapped. Do not treat that startup state as a
+  // user close. Once the window was visible, visible < 1 means it was closed.
+  if (!window_was_visible && age_sec < 2.0)
+  {
+    return false;
+  }
+
+  return window_was_visible && visible < 1.0;
+}
+
+void destroyOpenCvWindowQuietly(const std::string &window_name)
+{
+  try
+  {
+    cv::destroyWindow(window_name);
+  }
+  catch (const cv::Exception &)
+  {
+  }
+}
+
+std::string shellQuote(const std::string &value)
+{
+  std::string quoted = "'";
+  for (const char ch : value)
+  {
+    if (ch == '\'')
+    {
+      quoted += "'\\''";
+    }
+    else
+    {
+      quoted.push_back(ch);
+    }
+  }
+  quoted.push_back('\'');
+  return quoted;
+}
+
+std::string trimTrailingLineEndings(std::string text)
+{
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+  {
+    text.pop_back();
+  }
+  return text;
+}
+
+bool pathsReferToSameFile(const std::filesystem::path &a, const std::filesystem::path &b)
+{
+  std::error_code ec;
+  if (std::filesystem::exists(a, ec) && std::filesystem::exists(b, ec))
+  {
+    if (std::filesystem::equivalent(a, b, ec))
+    {
+      return true;
+    }
+  }
+  return a.lexically_normal() == b.lexically_normal();
+}
+
 int clampAdaptiveDepthTrimAddPx(int add_px)
 {
   return std::clamp(add_px, kAdaptiveDepthTrimAddMinPx, kAdaptiveDepthTrimAddMaxPx);
@@ -513,6 +601,7 @@ struct ItemProfile
   std::vector<cv::Point2f> roi_points;
   std::array<double, 6> teach_joints_deg {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints {false};
+  bool has_tool_teach {false};
 };
 
 struct DepthPlaneModel
@@ -667,9 +756,10 @@ std::optional<ItemProfile> loadItemProfileFile(const std::filesystem::path &path
 
     ItemProfile profile;
     profile.path = path;
-    profile.color_topic = params["color_topic"] ? params["color_topic"].as<std::string>() : "/robot_camera/color/image_raw";
-    profile.depth_topic = params["depth_topic"] ? params["depth_topic"].as<std::string>() : "/robot_camera/depth/image_raw";
-    profile.camera_info_topic = params["camera_info_topic"] ? params["camera_info_topic"].as<std::string>() : "/robot_camera/color/camera_info";
+    profile.has_tool_teach = root["tool_teach"] && root["tool_teach"].IsMap();
+    profile.color_topic = params["color_topic"] ? params["color_topic"].as<std::string>() : "/bin_camera/color/image_raw";
+    profile.depth_topic = params["depth_topic"] ? params["depth_topic"].as<std::string>() : "/bin_camera/depth/image_raw";
+    profile.camera_info_topic = params["camera_info_topic"] ? params["camera_info_topic"].as<std::string>() : "/bin_camera/color/camera_info";
     profile.overlay_topic = params["overlay_topic"] ? params["overlay_topic"].as<std::string>() : "bin_overlay";
     if (params["detection_mode"])
     {
@@ -1208,6 +1298,10 @@ std::optional<ItemProfile> loadItemProfileFile(const std::filesystem::path &path
       profile.associated_bin_name,
       profile.teach_date,
       path);
+    if (profile.has_tool_teach)
+    {
+      profile.display_label += " | tool";
+    }
     return profile;
   }
   catch (const YAML::Exception &)
@@ -7694,13 +7788,16 @@ public:
     profiles_dir_ = declare_parameter<std::string>(
       "profiles_dir",
       dobot_common::paths::workspacePath({"teach", "item_teach"}, __FILE__).string());
-    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
-    depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
-	    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
+    const std::string selected_profile_path_param = declare_parameter<std::string>(
+      "selected_profile_path",
+      "");
+    color_topic_ = declare_parameter<std::string>("color_topic", "/bin_camera/color/image_raw");
+    depth_topic_ = declare_parameter<std::string>("depth_topic", "/bin_camera/depth/image_raw");
+	    camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/bin_camera/color/camera_info");
 	    overlay_topic_ = declare_parameter<std::string>("overlay_topic", "bin_overlay");
 	    camera_control_service_root_ = declare_parameter<std::string>(
 	      "camera_control_service_root",
-	      "/robot_camera");
+	      "/bin_camera");
 	    normalizeCameraControlServiceRoot();
 	    const int color_exposure_percent = clampExposurePercent(
 	      declare_parameter<int>("color_exposure_percent", 0));
@@ -7752,9 +7849,9 @@ public:
     align_item_z_axis_to_depth_plane_ = declare_parameter<bool>(
       "align_item_z_axis_to_depth_plane",
       true);
-    calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "Link6");
+    calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "base_link");
     calibration_child_frame_ = declare_parameter<std::string>(
-      "calibration_child_frame", "calibrated_camera_link");
+      "calibration_child_frame", "bin_calibrated_link");
     calibration_dir_ = declare_parameter<std::string>(
       "calibration_dir", defaultCalibrationDir());
     calibration_file_ = declare_parameter<std::string>("calibration_file", "");
@@ -7781,6 +7878,7 @@ public:
       "seek_snapshots_dir",
       dobot_common::paths::workspacePath({"debug files", "seek_frames"}, __FILE__).string());
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
+    headless_ = declare_parameter<bool>("headless", false);
     const bool start_visualization = declare_parameter<bool>("start_visualization", true);
     display_view_ = start_visualization ? DisplayView::kRgb : DisplayView::kBinarized;
     const std::string detection_mode_param =
@@ -7955,26 +8053,47 @@ public:
     }
 
     refreshItemProfiles();
-    selectInitialProfile();
+    bool selected_profile_loaded = false;
+    const std::filesystem::path launch_selected_profile_path = resolvePath(selected_profile_path_param);
+    if (!launch_selected_profile_path.empty())
+    {
+      selected_profile_loaded = selectProfileFromFile(launch_selected_profile_path, false);
+      if (!selected_profile_loaded)
+      {
+        RCLCPP_WARN(
+          get_logger(),
+          "Launch-selected item detect profile could not be loaded: %s",
+          launch_selected_profile_path.c_str());
+      }
+    }
+    if (!selected_profile_loaded)
+    {
+      selectInitialProfile();
+    }
     loadRuntimeUiSettings();
-	    saveSelectedProfileExportFile();
-	    createRosInterfaces();
-	    movj_client_ = create_client<MovJSrv>(movj_service_name_);
-	    createCameraExposureClients();
-	    camera_exposure_timer_ = create_wall_timer(
-	      std::chrono::milliseconds(250),
-	      std::bind(&ItemDetectNode::applyPendingCameraExposureSettings, this));
+    saveRuntimeUiSettings();
+    saveSelectedProfileExportFile();
+    createRosInterfaces();
+    movj_client_ = create_client<MovJSrv>(movj_service_name_);
+    createCameraExposureClients();
+    camera_exposure_timer_ = create_wall_timer(
+      std::chrono::milliseconds(250),
+      std::bind(&ItemDetectNode::applyPendingCameraExposureSettings, this));
 
-    cv::namedWindow(kDetectWindowName, cv::WINDOW_NORMAL);
-    cv::resizeWindow(kDetectWindowName, kPreviewCanvasWidth, kTopBarBaseHeight + kPreviewCanvasHeight);
-    cv::setMouseCallback(kDetectWindowName, &ItemDetectNode::onMouseThunk, this);
+    if (!headless_)
+    {
+      cv::namedWindow(kDetectWindowName, cv::WINDOW_NORMAL);
+      cv::resizeWindow(kDetectWindowName, kPreviewCanvasWidth, kTopBarBaseHeight + kPreviewCanvasHeight);
+      cv::setMouseCallback(kDetectWindowName, &ItemDetectNode::onMouseThunk, this);
+      visualization_window_created_ = true;
+    }
 
     RCLCPP_INFO(
       get_logger(),
       "item_detect ready. Overlay topic=%s seek_pose topic=%s item_pose_array topic=%s item_marker topic=%s "
       "(enabled=%s thickness=%.1fmm) detect_mode=%s depth_threshold=+/- %dmm depth_plane=%s "
       "z_axis_align=%s movj_service=%s seek_service=%s go_to_teach_service=%s "
-      "selected_profile=%s profiles=%zu",
+      "selected_profile=%s profiles=%zu headless=%s",
       overlay_topic_.c_str(),
       seek_pose_topic_.c_str(),
       item_pose_array_topic_.c_str(),
@@ -7989,7 +8108,8 @@ public:
       seek_service_name_.c_str(),
       go_to_teach_service_name_.c_str(),
 	      selectedProfileDisplayText().c_str(),
-	      item_profiles_.size());
+	      item_profiles_.size(),
+      headless_ ? "true" : "false");
 	    RCLCPP_INFO(
 	      get_logger(),
 	      "item_detect camera exposure controls. service_root=%s color=%s depth=%s",
@@ -8015,7 +8135,10 @@ public:
   ~ItemDetectNode() override
   {
     saveRuntimeUiSettings();
-    cv::destroyWindow(kDetectWindowName);
+    if (visualization_window_created_)
+    {
+      destroyOpenCvWindowQuietly(kDetectWindowName);
+    }
   }
 
 private:
@@ -8032,6 +8155,42 @@ private:
     int min_value {1};
     int max_value {20};
   };
+
+  void processWindowEvents()
+  {
+    if (headless_ || !visualization_window_created_)
+    {
+      return;
+    }
+    cv::waitKey(1);
+    if (isOpenCvWindowClosed(kDetectWindowName))
+    {
+      requestShutdownFromWindowClose();
+    }
+  }
+
+  void requestShutdownFromWindowClose()
+  {
+    if (window_close_requested_)
+    {
+      return;
+    }
+    window_close_requested_ = true;
+    RCLCPP_INFO(get_logger(), "item_detect window closed; shutting down.");
+    saveRuntimeUiSettings();
+    if (camera_status_timer_)
+    {
+      camera_status_timer_->cancel();
+    }
+    if (camera_exposure_timer_)
+    {
+      camera_exposure_timer_->cancel();
+    }
+    if (rclcpp::ok())
+    {
+      rclcpp::shutdown();
+    }
+  }
 
   struct ItemSummary
   {
@@ -8155,7 +8314,7 @@ private:
           continue;
         }
         const std::string filename = p.filename().string();
-        if (filename.rfind("axab_calibration_eyeonhand_", 0) != 0)
+        if (filename.rfind("axab_calibration_eyetohand_", 0) != 0)
         {
           continue;
         }
@@ -8280,7 +8439,7 @@ private:
 	  {
 	    if (camera_control_service_root_.empty())
 	    {
-	      camera_control_service_root_ = "/robot_camera";
+	      camera_control_service_root_ = "/bin_camera";
 	    }
 	    while (camera_control_service_root_.size() > 1 && camera_control_service_root_.back() == '/')
 	    {
@@ -8773,7 +8932,9 @@ private:
     {
       for (int i = 0; i < static_cast<int>(item_profiles_.size()); ++i)
       {
-        if (item_profiles_[i].path == selected_profile_path_)
+        if (
+          pathsReferToSameFile(item_profiles_[i].path, selected_profile_path_) ||
+          item_profiles_[i].path.filename() == selected_profile_path_.filename())
         {
           selected_profile_index_ = i;
           return;
@@ -8993,12 +9154,104 @@ private:
     for (int i = 0; i < static_cast<int>(item_profiles_.size()); ++i)
     {
       const std::filesystem::path candidate = item_profiles_[i].path.lexically_normal();
-      if (candidate == requested || candidate.filename() == requested.filename())
+      if (pathsReferToSameFile(candidate, requested) || candidate.filename() == requested.filename())
       {
         return selectProfileByIndex(i, persist_runtime);
       }
     }
     return false;
+  }
+
+  bool selectProfileFromFile(const std::filesystem::path &path, bool persist_runtime = true)
+  {
+    if (path.empty())
+    {
+      return false;
+    }
+
+    refreshItemProfiles();
+    if (selectProfileByPath(path, persist_runtime))
+    {
+      return true;
+    }
+
+    const auto profile = loadItemProfileFile(path);
+    if (!profile.has_value())
+    {
+      profile_status_message_ = "Open Teach: selected YAML is not an item teach profile";
+      return false;
+    }
+
+    item_profiles_.push_back(*profile);
+    return selectProfileByIndex(static_cast<int>(item_profiles_.size()) - 1, persist_runtime);
+  }
+
+  std::optional<std::filesystem::path> openTeachFileDialog()
+  {
+    std::filesystem::path start_dir = resolvePath(profiles_dir_);
+    std::string filename_arg = start_dir.string();
+    if (!filename_arg.empty() && filename_arg.back() != '/')
+    {
+      filename_arg.push_back('/');
+    }
+
+    const std::string command =
+      "if command -v zenity >/dev/null 2>&1; then "
+      "zenity --file-selection --title='Open Teach' --filename=" +
+      shellQuote(filename_arg) +
+      " --file-filter='YAML files | *.yaml *.yml' --file-filter='All files | *'; "
+      "elif command -v kdialog >/dev/null 2>&1; then "
+      "kdialog --title 'Open Teach' --getopenfilename " +
+      shellQuote(start_dir.string()) +
+      " 'YAML files (*.yaml *.yml)'; "
+      "fi 2>/dev/null";
+
+    FILE *pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr)
+    {
+      profile_status_message_ = "Open Teach: failed to start file picker";
+      return std::nullopt;
+    }
+
+    std::array<char, 512> buffer {};
+    std::string selected_path;
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
+    {
+      selected_path += buffer.data();
+    }
+    const int status = pclose(pipe);
+    (void)status;
+
+    selected_path = trimTrailingLineEndings(selected_path);
+    if (selected_path.empty())
+    {
+      return std::nullopt;
+    }
+    return resolvePath(selected_path);
+  }
+
+  void requestOpenTeachFile()
+  {
+    profile_dropdown_open_ = false;
+    profile_status_message_ = "Open Teach: select item teach YAML";
+    const auto selected_path = openTeachFileDialog();
+    if (!selected_path.has_value())
+    {
+      profile_status_message_ = "Open Teach cancelled";
+      return;
+    }
+
+    if (!selectProfileFromFile(*selected_path))
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "Open Teach failed to load selected profile: %s",
+        selected_path->string().c_str());
+      return;
+    }
+    saveRuntimeUiSettings();
+    saveSelectedProfileExportFile();
+    profile_status_message_ = "Loaded " + selectedProfileDisplayText();
   }
 
   std::string runtimeViewModeToken() const
@@ -9052,16 +9305,6 @@ private:
       if (!root || !root.IsMap())
       {
         return;
-      }
-
-      if (const YAML::Node selected_profile_path = root["selected_profile_path"];
-        selected_profile_path && selected_profile_path.IsScalar())
-      {
-        const std::string profile_path_text = selected_profile_path.as<std::string>();
-        if (!profile_path_text.empty())
-        {
-          selectProfileByPath(resolvePath(profile_path_text), false);
-        }
       }
       if (const YAML::Node view_mode = root["view_mode"]; view_mode && view_mode.IsScalar())
       {
@@ -9134,10 +9377,6 @@ private:
 
       YAML::Emitter out;
       out << YAML::BeginMap;
-      out << YAML::Key << "selected_profile_path" << YAML::Value <<
-        ((selected_profile_index_ >= 0 && selected_profile_index_ < static_cast<int>(item_profiles_.size()))
-          ? item_profiles_[selected_profile_index_].path.string()
-          : selected_profile_path_.string());
       out << YAML::Key << "view_mode" << YAML::Value << runtimeViewModeToken();
       out << YAML::Key << "overlay_enabled" << YAML::Value << overlay_enabled_;
       out << YAML::Key << "blob_tolerance_percent" << YAML::Value << blob_tolerance_percent_;
@@ -9408,8 +9647,7 @@ private:
 
   int topBarHeight() const
   {
-    return kTopBarBaseHeight +
-      (profile_dropdown_open_ ? static_cast<int>(profile_option_rects_.size()) * kDropdownRowHeight : 0);
+    return kTopBarBaseHeight;
   }
 
   void layoutTopBar(int width)
@@ -9419,38 +9657,46 @@ private:
     const int top_row_height = 38;
     const int control_gap = 10;
 
-    const int view_width = 150;
-    const int overlay_width = 150;
-    const int seek_width = 120;
-    view_toggle_button_.rect = cv::Rect(margin, top_row_y, view_width, top_row_height);
+    const int button_count = 7;
+    const int top_button_width = std::max(
+      112,
+      std::min(
+        132,
+        (width - 2 * margin - (button_count - 1) * control_gap) / button_count));
+    int button_x = margin;
+    view_toggle_button_.rect = cv::Rect(button_x, top_row_y, top_button_width, top_row_height);
+    button_x += top_button_width + control_gap;
     overlay_toggle_button_.rect = cv::Rect(
-      view_toggle_button_.rect.x + view_toggle_button_.rect.width + control_gap,
+      button_x,
       top_row_y,
-      overlay_width,
+      top_button_width,
       top_row_height);
+    button_x += top_button_width + control_gap;
     seek_toggle_button_.rect = cv::Rect(
-      overlay_toggle_button_.rect.x + overlay_toggle_button_.rect.width + control_gap,
+      button_x,
       top_row_y,
-      seek_width,
+      top_button_width,
       top_row_height);
-
-    const int delete_width = 148;
-    const int go_to_teach_width = 148;
-    delete_button_.rect = cv::Rect(width - margin - delete_width, top_row_y, delete_width, top_row_height);
+    button_x += top_button_width + control_gap;
+    debug_images_button_.rect = cv::Rect(
+      button_x,
+      top_row_y,
+      top_button_width,
+      top_row_height);
+    button_x += top_button_width + control_gap;
     go_to_teach_button_.rect = cv::Rect(
-      delete_button_.rect.x - control_gap - go_to_teach_width,
+      button_x,
       top_row_y,
-      go_to_teach_width,
+      top_button_width,
       top_row_height);
-
-    const int dropdown_left = seek_toggle_button_.rect.x + seek_toggle_button_.rect.width + 14;
-    const int dropdown_right = go_to_teach_button_.rect.x - 14;
-    const int dropdown_width = std::max(160, dropdown_right - dropdown_left);
+    button_x += top_button_width + control_gap;
     profile_dropdown_rect_ = cv::Rect(
-      dropdown_left,
+      button_x,
       top_row_y,
-      std::max(80, dropdown_width),
+      top_button_width,
       top_row_height);
+    button_x += top_button_width + control_gap;
+    delete_button_.rect = cv::Rect(button_x, top_row_y, top_button_width, top_row_height);
 
     const int panel_y = top_row_y + top_row_height + 12;
     const int panel_gap = 10;
@@ -10033,6 +10279,15 @@ private:
     profile_status_message_ = "Seek armed: publish nearest-to-peak pose on next valid frame";
   }
 
+  void toggleDebugImages()
+  {
+    debug_images_enabled_ = !debug_images_enabled_;
+    saveRuntimeUiSettings();
+    profile_status_message_ = debug_images_enabled_
+      ? "Debug images enabled"
+      : "Debug images disabled";
+  }
+
   bool writeSeekPoseData(
     const std::filesystem::path &pose_path,
     const SeekCapture &last_capture,
@@ -10159,42 +10414,53 @@ private:
     const std::filesystem::path pose_path =
       std::filesystem::path(seek_snapshots_dir_) / ("seek_" + std::to_string(stamp_ns) + "_pose.yaml");
 
-    std::filesystem::path output_dir(seek_snapshots_dir_);
-    std::error_code fs_error;
-    std::filesystem::create_directories(output_dir, fs_error);
-    bool wrote_pose = false;
-    if (fs_error)
+    bool debug_save_failed = false;
+    if (!debug_images_enabled_)
     {
-      profile_status_message_ = "Seek done: failed to prepare screenshot directory";
+      profile_status_message_ = "Seek done, sent " + formatPose6D(last_capture.pose) + " (debug save off)";
     }
     else
     {
-      const bool wrote_last = !last_capture.frame.empty() && cv::imwrite(last_path.string(), last_capture.frame);
-      wrote_pose = writeSeekPoseData(
-        pose_path,
-        last_capture,
-        motion,
-        seek_valid_motion_samples_.size(),
-        last_path,
-        effective_decay_sec);
-
-      if (wrote_last && wrote_pose)
+      std::filesystem::path output_dir(seek_snapshots_dir_);
+      std::error_code fs_error;
+      std::filesystem::create_directories(output_dir, fs_error);
+      bool wrote_pose = false;
+      if (fs_error)
       {
-        profile_status_message_ = "Seek done, sent " + formatPose6D(last_capture.pose);
-        RCLCPP_INFO(
-          get_logger(),
-          "Seek data saved:\n  last frame: %s\n  pose yaml:  %s",
-          last_path.c_str(),
-          pose_path.c_str());
+        profile_status_message_ = "Seek done: failed to prepare screenshot directory";
+        debug_save_failed = true;
       }
       else
       {
-        profile_status_message_ = "Seek done, sent " + formatPose6D(last_capture.pose) + " (partial save)";
-        RCLCPP_WARN(
-          get_logger(),
-          "Seek save partial. last=%s pose=%s",
-          wrote_last ? "ok" : "fail",
-          wrote_pose ? "ok" : "fail");
+        const bool wrote_last =
+          !last_capture.frame.empty() && cv::imwrite(last_path.string(), last_capture.frame);
+        wrote_pose = writeSeekPoseData(
+          pose_path,
+          last_capture,
+          motion,
+          seek_valid_motion_samples_.size(),
+          last_path,
+          effective_decay_sec);
+
+        if (wrote_last && wrote_pose)
+        {
+          profile_status_message_ = "Seek done, sent " + formatPose6D(last_capture.pose);
+          RCLCPP_INFO(
+            get_logger(),
+            "Seek data saved:\n  last frame: %s\n  pose yaml:  %s",
+            last_path.c_str(),
+            pose_path.c_str());
+        }
+        else
+        {
+          debug_save_failed = true;
+          profile_status_message_ = "Seek done, sent " + formatPose6D(last_capture.pose) + " (partial save)";
+          RCLCPP_WARN(
+            get_logger(),
+            "Seek save partial. last=%s pose=%s",
+            wrote_last ? "ok" : "fail",
+            wrote_pose ? "ok" : "fail");
+        }
       }
     }
 
@@ -10202,7 +10468,7 @@ private:
     seek_mode_active_ = false;
     seek_result_latched_ = true;
     resetSeekSessionState();
-    if (!wrote_pose)
+    if (debug_save_failed)
     {
       profile_status_message_ = "Seek done, handed off item target (debug save failed)";
     }
@@ -10962,14 +11228,17 @@ private:
       overlay_pub_->publish(*overlay_image.toImageMsg());
     }
 
-    const cv::Size window_size(output.cols, output.rows);
-    if (window_size != rendered_window_size_)
+    if (!headless_)
     {
-      cv::resizeWindow(kDetectWindowName, window_size.width, window_size.height);
-      rendered_window_size_ = window_size;
+      const cv::Size window_size(output.cols, output.rows);
+      if (window_size != rendered_window_size_)
+      {
+        cv::resizeWindow(kDetectWindowName, window_size.width, window_size.height);
+        rendered_window_size_ = window_size;
+      }
+      cv::imshow(kDetectWindowName, output);
+      processWindowEvents();
     }
-    cv::imshow(kDetectWindowName, output);
-    cv::waitKey(1);
     last_camera_render_time_ = std::chrono::steady_clock::now();
   }
 
@@ -11035,8 +11304,12 @@ private:
       overlay_image.image = output;
       overlay_pub_->publish(*overlay_image.toImageMsg());
     }
-    cv::imshow(kDetectWindowName, output);
-    cv::waitKey(1);
+    if (!headless_)
+    {
+      cv::imshow(kDetectWindowName, output);
+      processWindowEvents();
+    }
+    last_camera_render_time_ = std::chrono::steady_clock::now();
   }
 
   static void onMouseThunk(int event, int x, int y, int flags, void *userdata)
@@ -11098,6 +11371,13 @@ private:
         return;
       }
 
+      if (debug_images_button_.rect.contains(point))
+      {
+        profile_dropdown_open_ = false;
+        toggleDebugImages();
+        return;
+      }
+
       if (delete_button_.rect.contains(point))
       {
         profile_dropdown_open_ = false;
@@ -11114,23 +11394,8 @@ private:
 
       if (profile_dropdown_rect_.contains(point))
       {
-        if (!profile_dropdown_open_)
-        {
-          refreshItemProfiles();
-        }
-        profile_dropdown_open_ = !profile_dropdown_open_;
+        requestOpenTeachFile();
         return;
-      }
-
-      if (profile_dropdown_open_)
-      {
-        const int clicked_profile_index = profileIndexAtPoint(point);
-        if (clicked_profile_index >= 0)
-        {
-          selectProfileByIndex(clicked_profile_index);
-          profile_dropdown_open_ = false;
-          return;
-        }
       }
 
       if (toleranceHitRect().contains(point))
@@ -11306,12 +11571,13 @@ private:
       const cv::Scalar border = enabled ? border_on : cv::Scalar(102, 106, 112);
       cv::rectangle(bar, button.rect, fill, cv::FILLED);
       cv::rectangle(bar, button.rect, border, 2);
+      const std::string fitted_text = fitTextToWidth(text, button.rect.width - 18, 0.52, 1);
       cv::putText(
         bar,
-        text,
-        cv::Point(button.rect.x + 12, button.rect.y + 26),
+        fitted_text,
+        cv::Point(button.rect.x + 9, button.rect.y + 26),
         cv::FONT_HERSHEY_DUPLEX,
-        0.56,
+        0.52,
         cv::Scalar(245, 245, 245),
         1,
         cv::LINE_AA);
@@ -11325,36 +11591,20 @@ private:
       seek_mode_active_ || seek_result_latched_,
       cv::Scalar(70, 126, 186),
       cv::Scalar(126, 202, 255));
+    draw_button(
+      debug_images_button_,
+      "Debug Img",
+      true,
+      debug_images_enabled_ ? cv::Scalar(70, 126, 186) : cv::Scalar(58, 64, 72),
+      debug_images_enabled_ ? cv::Scalar(126, 202, 255) : cv::Scalar(112, 120, 130));
     draw_button(go_to_teach_button_, go_to_teach_in_progress_ ? "Go Teach..." : "Go To Teach", can_go_to_teach, cv::Scalar(70, 140, 94), cv::Scalar(134, 232, 165));
     draw_button(delete_button_, "Delete Item", can_delete, cv::Scalar(86, 76, 148), cv::Scalar(160, 146, 246));
-
-    cv::rectangle(bar, profile_dropdown_rect_, cv::Scalar(61, 78, 96), cv::FILLED);
-    cv::rectangle(bar, profile_dropdown_rect_, cv::Scalar(130, 166, 198), 2);
-    const std::string selected_text = fitTextToWidth(
-      selectedProfileDisplayText(),
-      profile_dropdown_rect_.width - 34);
-    cv::putText(
-      bar,
-      selected_text,
-      cv::Point(profile_dropdown_rect_.x + 12, profile_dropdown_rect_.y + 26),
-      cv::FONT_HERSHEY_DUPLEX,
-      0.55,
-      cv::Scalar(245, 245, 245),
-      1,
-      cv::LINE_AA);
-
-    const int arrow_center_x = profile_dropdown_rect_.x + profile_dropdown_rect_.width - 16;
-    const int arrow_center_y = profile_dropdown_rect_.y + 20;
-    const std::vector<cv::Point> arrow = profile_dropdown_open_
-      ? std::vector<cv::Point>{
-          cv::Point(arrow_center_x - 5, arrow_center_y + 2),
-          cv::Point(arrow_center_x + 5, arrow_center_y + 2),
-          cv::Point(arrow_center_x, arrow_center_y - 4)}
-      : std::vector<cv::Point>{
-          cv::Point(arrow_center_x - 5, arrow_center_y - 2),
-          cv::Point(arrow_center_x + 5, arrow_center_y - 2),
-          cv::Point(arrow_center_x, arrow_center_y + 4)};
-    cv::fillConvexPoly(bar, arrow, cv::Scalar(245, 245, 245));
+    draw_button(
+      UiButton{"Open Teach", profile_dropdown_rect_},
+      "Open Teach",
+      true,
+      cv::Scalar(61, 78, 96),
+      cv::Scalar(130, 166, 198));
 
     const auto draw_panel = [&](const cv::Rect &rect, const std::string &title)
     {
@@ -11512,26 +11762,6 @@ private:
       1,
       cv::LINE_AA);
 
-    if (profile_dropdown_open_)
-    {
-      for (int i = 0; i < static_cast<int>(profile_option_rects_.size()); ++i)
-      {
-        const bool selected = i == selected_profile_index_;
-        const cv::Scalar fill = selected ? cv::Scalar(72, 120, 72) : cv::Scalar(58, 58, 58);
-        const cv::Scalar border = selected ? cv::Scalar(120, 255, 120) : cv::Scalar(110, 110, 110);
-        cv::rectangle(bar, profile_option_rects_[i], fill, cv::FILLED);
-        cv::rectangle(bar, profile_option_rects_[i], border, 1);
-        cv::putText(
-          bar,
-          fitTextToWidth(item_profiles_[i].display_label, profile_option_rects_[i].width - 20),
-          cv::Point(profile_option_rects_[i].x + 10, profile_option_rects_[i].y + 22),
-          cv::FONT_HERSHEY_SIMPLEX,
-          0.55,
-          cv::Scalar(255, 255, 255),
-          1);
-      }
-    }
-
     return bar;
   }
 
@@ -11680,7 +11910,7 @@ private:
   std::string seek_status_service_name_;
 	  std::string go_to_teach_service_name_;
 	  std::string movj_service_name_;
-	  std::string camera_control_service_root_ {"/robot_camera"};
+	  std::string camera_control_service_root_ {"/bin_camera"};
 	  std::string calibration_parent_frame_;
   std::string calibration_child_frame_;
   std::string calibration_dir_;
@@ -11698,6 +11928,8 @@ private:
   bool publish_overlay_ {true};
   bool publish_item_cube_marker_ {true};
   bool align_item_z_axis_to_depth_plane_ {true};
+  bool headless_ {false};
+  bool visualization_window_created_ {false};
   bool detection_use_depth_ {false};
   cv::Size rendered_window_size_ {};
 	  int red_threshold_ {120};
@@ -11738,9 +11970,10 @@ private:
   bool profile_dropdown_open_ {false};
   bool tolerance_slider_active_ {false};
   bool seek_window_slider_active_ {false};
-	  bool seek_decay_slider_active_ {false};
-	  bool camera_exposure_dirty_ {true};
-	  std::string item_name_ {"item"};
+		  bool seek_decay_slider_active_ {false};
+		  bool camera_exposure_dirty_ {true};
+		  bool window_close_requested_ {false};
+		  std::string item_name_ {"item"};
   std::array<double, 6> teach_joints_deg_ {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints_ {false};
   bool go_to_teach_in_progress_ {false};
@@ -11750,10 +11983,12 @@ private:
   int seek_window_tenths_ {1};
   int seek_decay_tenths_ {1};
   int seek_valid_frame_count_ {0};
+  bool debug_images_enabled_ {false};
   std::optional<AxisAlignedRoiBounds> depth_plane_roi_bounds_;
   UiButton view_toggle_button_ {"View", cv::Rect(18, 14, 180, 42)};
   UiButton overlay_toggle_button_ {"Overlay", cv::Rect(18, 14, 150, 42)};
   UiButton seek_toggle_button_ {"Seek", cv::Rect(18, 14, 120, 42)};
+  UiButton debug_images_button_ {"Debug Img", cv::Rect(18, 14, 160, 42)};
   UiButton delete_button_ {"Delete Item", cv::Rect(18, 14, 160, 42)};
   UiButton go_to_teach_button_ {"Go to Teach", cv::Rect(18, 14, 160, 42)};
   UiSlider tolerance_slider_ {"Tolerance", cv::Rect(), kBlobToleranceMinPercent, kBlobToleranceMaxPercent};

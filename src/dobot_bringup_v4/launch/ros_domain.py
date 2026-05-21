@@ -13,9 +13,10 @@ ROS_DOMAIN_ID_MAX = 232
 
 def _looks_like_workspace_root(path: Path) -> bool:
     return (
+        (path / 'station_config').exists()
+        or
         (path / 'config' / 'robot_bringup' / 'param.json').exists()
         or (path / 'src' / 'dobot_msgs_v4').exists()
-        or (path / 'docker-compose.yml').exists()
     )
 
 
@@ -44,6 +45,48 @@ def _default_config_path() -> Path:
     return package_config
 
 
+def _default_station_config_path() -> Path:
+    return _workspace_root() / 'station_config'
+
+
+def _load_station_config(path: Path) -> dict[str, str]:
+    settings: dict[str, str] = {}
+    if not path.exists():
+        return settings
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[len('export '):].strip()
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        settings[key.strip()] = value
+    return settings
+
+
+def _bool_to_ros(value, *, default=False) -> str:
+    if value is None:
+        return '1' if default else '0'
+    if isinstance(value, bool):
+        return '1' if value else '0'
+    if isinstance(value, int) and value in (0, 1):
+        return str(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ('1', 'true', 'yes', 'on'):
+            return '1'
+        if normalized in ('0', 'false', 'no', 'off'):
+            return '0'
+    raise ValueError(
+        f'ros_localhost_only must be true/false or 1/0; got {value!r}'
+    )
+
+
 def ros_domain_id(config_path: str | Path | None = None) -> str:
     path = Path(config_path).expanduser() if config_path is not None else _default_config_path()
     if not path.exists():
@@ -63,25 +106,20 @@ def ros_domain_id(config_path: str | Path | None = None) -> str:
 
 
 def ros_localhost_only(config_path: str | Path | None = None) -> str:
+    station_settings = _load_station_config(_default_station_config_path())
+    station_value = station_settings.get('ROS_LOCALHOST_ONLY')
+    if station_value not in (None, ''):
+        return _bool_to_ros(station_value)
+
     path = Path(config_path).expanduser() if config_path is not None else _default_config_path()
     if not path.exists():
         return '0'
 
     data = json.loads(path.read_text())
-    value = data.get('ros_localhost_only', False)
-    if isinstance(value, bool):
-        return '1' if value else '0'
-    if isinstance(value, int) and value in (0, 1):
-        return str(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ('1', 'true', 'yes', 'on'):
-            return '1'
-        if normalized in ('0', 'false', 'no', 'off'):
-            return '0'
-    raise ValueError(
-        f'ros_localhost_only must be true/false or 1/0; got {value!r} from {path}'
-    )
+    try:
+        return _bool_to_ros(data.get('ros_localhost_only', False))
+    except ValueError as exc:
+        raise ValueError(f'{exc} from {path}') from exc
 
 
 def ros_domain_env(config_path: str | Path | None = None) -> dict[str, str]:

@@ -15,6 +15,7 @@
   <depend>std_srvs</depend>
   <depend>visualization_msgs</depend>
   <depend>dobot_msgs_v4</depend>
+  <depend>orbbec_camera_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>tf2_ros</depend>
   <depend>yaml-cpp</depend>

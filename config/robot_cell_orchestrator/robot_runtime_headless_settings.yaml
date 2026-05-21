@@ -1,0 +1,84 @@
+schema_version: 1
+
+mode: online
+runtime_dir: runtime
+offline_item_profiles_dir: teach/item_teach
+offline_tray_profiles_dir: teach/tray_teach
+
+profiles:
+  item_profiles_dir: ""
+  tray_profiles_dir: ""
+
+launch:
+  cameras: true
+  item_detect: true
+  item_pick: true
+  tray_detect: true
+  tray_intercept: true
+  rviz: false
+  load_runtime_settings: true
+  start_visualization: false
+
+camera:
+  config_file: config/camera_bringup/orbbec_cameras.yaml
+  enabled_cameras: all
+  orbbec_launch_file: gemini_330_series.launch.py
+  device_num: ""
+  launch_args: {}
+
+common:
+  color_topic: /robot_camera/color/image_raw
+  depth_topic: /robot_camera/depth/image_raw
+  camera_info_topic: /robot_camera/color/camera_info
+  camera_control_service_root: /robot_camera
+  use_calibration: true
+  calibration_dir: calibration
+  calibration_file: ""
+  calibration_parent_frame: Link6
+  calibration_child_frame: calibrated_camera_link
+  camera_frame: ""
+  robot_goal_frame_id: base_link
+  robot_gripper_frame_id: Link6
+  motion_service_root: /dobot_bringup_ros2/srv
+  gripper_do_service: ""
+
+item_detect:
+  params_file: ""
+  color_topic: /bin_camera/color/image_raw
+  depth_topic: /bin_camera/depth/image_raw
+  camera_info_topic: /bin_camera/color/camera_info
+  camera_control_service_root: /bin_camera
+  use_calibration: true
+  calibration_dir: calibration
+  calibration_file: ""
+  calibration_parent_frame: base_link
+  calibration_child_frame: bin_calibrated_link
+  camera_frame: ""
+  runtime_settings_file: config/item_perception/item_detect_runtime_settings.yaml
+  selected_profile_export_file: config/item_perception/item_detect_selected_profile.txt
+  pose_topic: bin_seek_pose
+  pose_array_topic: bin_item_poses
+  seek_complete_service: item_detect/seek_complete
+
+item_pick:
+  runtime_settings_file: config/item_perception/item_pick_runtime_settings.json
+  start_sequence_service: item_pick/start_sequence
+  track_service: item_pick/track
+  track_status_service: item_pick/track_status
+  parameters: {}
+
+tray_detect:
+  params_file: config/tray_perception/tray_teach_settings.yaml
+  runtime_settings_file: config/tray_perception/tray_detect_runtime_settings.yaml
+  pose_topic: tray_pose
+  vector_topic: tray_vector
+  dimensions_service: tray_detect/get_tray_dimensions
+  seek_complete_service: tray_detect/seek_complete
+
+tray_intercept:
+  runtime_settings_file: config/tray_perception/tray_intercept_runtime_settings.json
+  axis_overlay_topic: tray_axis_overlay
+  start_sequence_service: tray_intercept/start_sequence
+  track_service: tray_intercept/track
+  track_status_service: tray_intercept/track_status
+  parameters: {}

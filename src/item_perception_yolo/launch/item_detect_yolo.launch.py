@@ -14,7 +14,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -226,11 +225,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "profiles_dir",
-            default_value=_repo_path("teach", "bins_yolo", "profiles"),
+            default_value=_repo_path("teach", "item_teach_yolo"),
         ),
         DeclareLaunchArgument(
             "model_root",
-            default_value=_repo_path("teach", "bins_yolo", "models"),
+            default_value=_repo_path("teach", "item_teach_yolo"),
         ),
         DeclareLaunchArgument(
             "color_topic",

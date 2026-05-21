@@ -9,12 +9,12 @@ from pathlib import Path
 
 import rclpy
 from rclpy.duration import Duration
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
 from dobot_msgs_v4.msg import ToolVectorActual, TrayVector
-from dobot_msgs_v4.srv import CP, GetTrayDimensions, MovL, MovLIO, SpeedFactor, Stop, TrayInterceptStart
+from dobot_msgs_v4.srv import CP, DO, GetTrayDimensions, MovL, MovLIO, SpeedFactor, Stop, TrayInterceptStart
 from geometry_msgs.msg import PolygonStamped, TransformStamped
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -35,7 +35,6 @@ def workspace_root() -> Path:
             (path / 'src').exists() and
             (
                 (path / 'README.md').exists()
-                or (path / 'docker-compose.yml').exists()
                 or (path / 'src' / 'dobot_msgs_v4').exists()
             )
         )
@@ -134,9 +133,27 @@ MOTION_PROFILE_ENFORCE_WAIT_SEC = 12.0
 MOTION_PROFILE_ENFORCE_CALL_SEC = 8.0
 MOVLIO_RELEASE_MODE_PERCENT = 0
 MOVLIO_RELEASE_START_DISTANCE_PERCENT = 1
+TRAY_RELEASE_OPEN_SETTLE_SEC = 0.5
+TRAY_RELEASE_NO_MOTION_TOLERANCE_MM = 0.5
 GRIPPER_DO_CLOSE_INDEX = 1
 GRIPPER_DO_OPEN_INDEX = 2
 GRIPPER_DO_SUCTION_INDEX = 3
+TRAY_INTERCEPT_RUNTIME_REQUIRED_KEYS = (
+    'schema_version',
+    'tf_only_mode',
+    'tray_vector_wait_timeout_sec',
+    'ee_intercept_speed_mm_s',
+    'ee_final_pose_angle_deg',
+    'tray_intercept_x_offset_mm',
+    'tray_intercept_y_offset_mm',
+    'tray_standoff_z_mm',
+    'command_hysteresis_sec',
+    'follow_distance_mm',
+    'post_follow_z_up_mm',
+    'release_grip_enabled',
+    'preview_tray_length_mm',
+    'preview_tray_width_mm',
+)
 
 
 @dataclass
@@ -186,6 +203,19 @@ class RelMovLMiniNode(Node):
         super().__init__('tray_intercept')
         self._lock = threading.Lock()
         self._snapshot = MiniSnapshot()
+        self._headless = bool(self.declare_parameter('headless', False).value)
+        self._runtime_settings_path = Path(
+            str(self.declare_parameter('runtime_settings_file', str(RUNTIME_SETTINGS_PATH)).value)
+        ).expanduser()
+        self._load_runtime_settings_on_start = bool(
+            self.declare_parameter('load_runtime_settings', True).value
+        )
+        self._motion_service_root = str(
+            self.declare_parameter('motion_service_root', SERVICE_ROOT_DEFAULT).value
+        ).strip().rstrip('/') or SERVICE_ROOT_DEFAULT
+        self._tray_vector_topic = str(
+            self.declare_parameter('tray_vector_topic', TRAY_VECTOR_TOPIC).value
+        ).strip() or TRAY_VECTOR_TOPIC
         self._speed_calibration_path: Path | None = None
         self._calibration_startup_cp: int | None = None
         self._calibration_startup_speed_factor: int | None = None
@@ -197,18 +227,64 @@ class RelMovLMiniNode(Node):
         self._tray_watch_deadline_monotonic = 0.0
         self._tray_watch_stop_dispatched = False
         self._tray_watch_generation = 0
-        self._tray_watch_tf_only_mode = True
-        self._tray_vector_watch_timeout_sec = TRAY_VECTOR_WATCH_TIMEOUT_SEC
+        self._tray_watch_tf_only_mode = bool(
+            self.declare_parameter('tf_only_mode', True).value
+        )
+        self._tray_vector_watch_timeout_sec = max(
+            TRAY_VECTOR_WATCH_TIMEOUT_MIN,
+            min(
+                TRAY_VECTOR_WATCH_TIMEOUT_MAX,
+                float(
+                    self.declare_parameter(
+                        'tray_vector_wait_timeout_sec',
+                        TRAY_VECTOR_WATCH_TIMEOUT_SEC,
+                    ).value
+                ),
+            ),
+        )
         self._preview_inflight = False
         self._cancel_requested = False
         self._manual_stop_inflight = False
-        self._post_stop_movel_speed_mm_s = FIXED_EE_INTERCEPT_SPEED_MM_S
-        self._ee_final_pose_angle_deg = EE_FINAL_POSE_ANGLE_DEFAULT_DEG
-        self._post_stop_x_offset_mm = 0.0
-        self._post_stop_y_offset_mm = 0.0
-        self._post_stop_z_offset_mm = 100.0
-        self._tray_preview_length_mm = TRAY_PREVIEW_LENGTH_MM
-        self._tray_preview_width_mm = TRAY_PREVIEW_WIDTH_MM
+        self._post_stop_movel_speed_mm_s = max(
+            LINEAR_SPEED_MM_S_MIN,
+            min(
+                LINEAR_SPEED_MM_S_MAX,
+                float(self.declare_parameter('ee_intercept_speed_mm_s', FIXED_EE_INTERCEPT_SPEED_MM_S).value),
+            ),
+        )
+        self._ee_final_pose_angle_deg = max(
+            EE_FINAL_POSE_ANGLE_MIN_DEG,
+            min(
+                EE_FINAL_POSE_ANGLE_MAX_DEG,
+                float(self.declare_parameter('ee_final_pose_angle_deg', EE_FINAL_POSE_ANGLE_DEFAULT_DEG).value),
+            ),
+        )
+        self._post_stop_x_offset_mm = max(
+            POST_STOP_X_OFFSET_MIN,
+            min(POST_STOP_X_OFFSET_MAX, float(self.declare_parameter('tray_intercept_x_offset_mm', 0.0).value)),
+        )
+        self._post_stop_y_offset_mm = max(
+            POST_STOP_Y_OFFSET_MIN,
+            min(POST_STOP_Y_OFFSET_MAX, float(self.declare_parameter('tray_intercept_y_offset_mm', 0.0).value)),
+        )
+        self._post_stop_z_offset_mm = max(
+            POST_STOP_Z_OFFSET_MIN,
+            min(POST_STOP_Z_OFFSET_MAX, float(self.declare_parameter('tray_standoff_z_mm', 100.0).value)),
+        )
+        self._tray_preview_length_mm = max(
+            TRAY_PREVIEW_LENGTH_MIN_MM,
+            min(
+                TRAY_PREVIEW_LENGTH_MAX_MM,
+                float(self.declare_parameter('preview_tray_length_mm', TRAY_PREVIEW_LENGTH_MM).value),
+            ),
+        )
+        self._tray_preview_width_mm = max(
+            TRAY_PREVIEW_WIDTH_MIN_MM,
+            min(
+                TRAY_PREVIEW_WIDTH_MAX_MM,
+                float(self.declare_parameter('preview_tray_width_mm', TRAY_PREVIEW_WIDTH_MM).value),
+            ),
+        )
         self._command_hysteresis_sec = max(
             COMMAND_HYSTERESIS_MIN_SEC,
             min(
@@ -221,9 +297,17 @@ class RelMovLMiniNode(Node):
                 ),
             ),
         )
-        self._follow_distance_mm = 200.0
-        self._post_follow_z_up_mm = 300.0
-        self._release_grip_enabled = False
+        self._follow_distance_mm = max(
+            FOLLOW_DISTANCE_MIN,
+            min(FOLLOW_DISTANCE_MAX, float(self.declare_parameter('follow_distance_mm', 200.0).value)),
+        )
+        self._post_follow_z_up_mm = max(
+            POST_FOLLOW_Z_UP_MIN,
+            min(POST_FOLLOW_Z_UP_MAX, float(self.declare_parameter('post_follow_z_up_mm', 300.0).value)),
+        )
+        self._release_grip_enabled = bool(
+            self.declare_parameter('release_grip_enabled', False).value
+        )
         self._publish_goal_debug_tf = bool(
             self.declare_parameter('publish_goal_debug_tf', True).value
         )
@@ -299,11 +383,12 @@ class RelMovLMiniNode(Node):
             ).value
         ).strip() or TRAY_SEEK_COMPLETE_SERVICE_DEFAULT
 
-        self._mov_l_client = self.create_client(MovL, f'{SERVICE_ROOT_DEFAULT}/MovL')
-        self._mov_lio_client = self.create_client(MovLIO, f'{SERVICE_ROOT_DEFAULT}/MovLIO')
-        self._stop_client = self.create_client(Stop, f'{SERVICE_ROOT_DEFAULT}/Stop')
-        self._cp_client = self.create_client(CP, f'{SERVICE_ROOT_DEFAULT}/CP')
-        self._speed_factor_client = self.create_client(SpeedFactor, f'{SERVICE_ROOT_DEFAULT}/SpeedFactor')
+        self._mov_l_client = self.create_client(MovL, f'{self._motion_service_root}/MovL')
+        self._mov_lio_client = self.create_client(MovLIO, f'{self._motion_service_root}/MovLIO')
+        self._stop_client = self.create_client(Stop, f'{self._motion_service_root}/Stop')
+        self._cp_client = self.create_client(CP, f'{self._motion_service_root}/CP')
+        self._do_client = self.create_client(DO, f'{self._motion_service_root}/DO')
+        self._speed_factor_client = self.create_client(SpeedFactor, f'{self._motion_service_root}/SpeedFactor')
         self._tray_dimensions_client = self.create_client(
             GetTrayDimensions,
             self._tray_dimensions_service_name,
@@ -322,7 +407,7 @@ class RelMovLMiniNode(Node):
         self._last_tray_preview_x_axis = (1.0, 0.0)
         self._last_tray_preview_y_axis = (0.0, 1.0)
         self.create_subscription(ToolVectorActual, 'dobot_msgs_v4/msg/ToolVectorActual', self._tcp_callback, 10)
-        self.create_subscription(TrayVector, TRAY_VECTOR_TOPIC, self._tray_vector_callback, 10)
+        self.create_subscription(TrayVector, self._tray_vector_topic, self._tray_vector_callback, 10)
         self.create_subscription(PolygonStamped, self._tray_axis_overlay_topic, self._tray_axis_overlay_callback, 10)
         self._start_sequence_service = self.create_service(
             TrayInterceptStart,
@@ -339,12 +424,22 @@ class RelMovLMiniNode(Node):
             self._track_status_service_name,
             self._track_status_service_callback,
         )
+        runtime_loaded = False
+        if self._load_runtime_settings_on_start:
+            runtime_loaded = self.load_runtime_settings(require_complete=self._headless)
+        if self._headless and self._load_runtime_settings_on_start and not runtime_loaded:
+            raise RuntimeError(
+                f'Tray intercept headless mode requires a complete runtime settings file: '
+                f'{self._runtime_settings_path}'
+            )
         self.get_logger().info('Tray mode configured: queued MovL motion, MovLIO when release IO is enabled.')
         self.get_logger().info(f'Start tray sequence service: {self._start_sequence_service_name}')
         self.get_logger().info(f'Track virtual-click service: {self._track_service_name}')
         self.get_logger().info(f'Track armed status service: {self._track_status_service_name}')
+        self.get_logger().info(f'Tray vector topic: {self._tray_vector_topic}')
+        self.get_logger().info(f'Motion service root: {self._motion_service_root}')
         self.get_logger().info(
-            'Startup defaults: '
+            'Startup settings: '
             f'wait={self._tray_vector_watch_timeout_sec:.0f}s, '
             f'fixed_speed={self._post_stop_movel_speed_mm_s:.0f} mm/s, '
             f'ee_angle={self._ee_final_pose_angle_deg:.0f} deg, '
@@ -1172,6 +1267,65 @@ class RelMovLMiniNode(Node):
             return False, v_percent, mapping_source
         return True, v_percent, mapping_source
 
+    def _send_do(self, index: int, status: int, time_ms: int = 0) -> bool:
+        if not self._wait_for_service(self._do_client, 'DO'):
+            return False
+
+        request = DO.Request()
+        request.index = int(index)
+        request.status = int(status)
+        request.time = int(time_ms)
+        label = f'DO(index={request.index},status={request.status},time={request.time})'
+        response = self._call_service(
+            self._do_client,
+            request,
+            label,
+            timeout_sec=4.0,
+        )
+        return response is not None and int(getattr(response, 'res', -1)) >= 0
+
+    def _wait_settling_time(self, settling_time_sec: float, label: str) -> bool:
+        wait_sec = max(0.0, float(settling_time_sec))
+        if wait_sec <= 1e-6:
+            return True
+        self._set_action_text(f'{label}: settling for {wait_sec:.1f}s...')
+        deadline = time.monotonic() + wait_sec
+        while rclpy.ok():
+            if self._is_cancel_requested():
+                self._set_action_text('Sequence cancelled during gripper-open settling wait.')
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return True
+            time.sleep(min(0.02, remaining))
+        self._set_action_text('ROS shutdown during gripper-open settling wait.')
+        return False
+
+    def _gripper_release_open_and_settle(self) -> bool:
+        self._set_action_text(
+            'Static tray release: disable close/suction and hold gripper open...'
+        )
+        if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_SUCTION_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_OPEN_INDEX, 1):
+            return False
+        return self._wait_settling_time(
+            TRAY_RELEASE_OPEN_SETTLE_SEC,
+            'Static tray release gripper open',
+        )
+
+    def _gripper_release_neutral(self) -> bool:
+        self._set_action_text(
+            'Static tray release cleanup: neutral gripper outputs...'
+        )
+        if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_OPEN_INDEX, 0):
+            return False
+        return self._send_do(GRIPPER_DO_SUCTION_INDEX, 0)
+
     def _wait_for_tcp_xyz_goal(
         self,
         goal_xyz_mm: tuple[float, float, float],
@@ -1301,9 +1455,9 @@ class RelMovLMiniNode(Node):
 
     def _tray_vector_watchdog_worker(self, generation: int) -> None:
         while rclpy.ok():
-            if self.count_publishers(TRAY_VECTOR_TOPIC) <= 0:
+            if self.count_publishers(self._tray_vector_topic) <= 0:
                 self._reset_runtime_state(
-                    f'No tray node detected on "{TRAY_VECTOR_TOPIC}". Node reset.'
+                    f'No tray node detected on "{self._tray_vector_topic}". Node reset.'
                 )
                 return
             with self._lock:
@@ -1449,8 +1603,42 @@ class RelMovLMiniNode(Node):
             if not intercept_ok:
                 return
 
+            follow_translation_mm = self._vector_norm3(
+                (
+                    follow_goal[0] - intercept_goal[0],
+                    follow_goal[1] - intercept_goal[1],
+                    follow_goal[2] - intercept_goal[2],
+                )
+            )
+            zup_translation_mm = self._vector_norm3(
+                (
+                    post_follow_goal[0] - follow_goal[0],
+                    post_follow_goal[1] - follow_goal[1],
+                    post_follow_goal[2] - follow_goal[2],
+                )
+            )
+            release_without_follow_motion = (
+                release_grip_enabled
+                and follow_translation_mm <= TRAY_RELEASE_NO_MOTION_TOLERANCE_MM
+            )
+            zup_without_motion = zup_translation_mm <= TRAY_RELEASE_NO_MOTION_TOLERANCE_MM
+
             follow_mdis = self._build_release_follow_mdis() if release_grip_enabled else None
-            if release_grip_enabled:
+            if release_without_follow_motion:
+                self._set_action_text(
+                    'Static tray release: waiting for intercept pose before opening gripper...'
+                )
+                if not self._wait_for_tcp_xyz_goal(
+                    (intercept_goal[0], intercept_goal[1], intercept_goal[2])
+                ):
+                    return
+                if not self._gripper_release_open_and_settle():
+                    return
+                follow_ok = True
+                follow_v = 0
+                follow_map = 'static_release'
+                follow_cmd = 'DO+settle'
+            elif release_grip_enabled:
                 follow_ok, follow_v, follow_map = self._send_movelio_goal(
                     follow_goal,
                     intercept_goal,
@@ -1471,7 +1659,22 @@ class RelMovLMiniNode(Node):
                 return
 
             zup_mdis = self._build_release_post_follow_mdis() if release_grip_enabled else None
-            if release_grip_enabled:
+            if release_grip_enabled and zup_without_motion:
+                if not release_without_follow_motion:
+                    self._set_action_text(
+                        'Static tray release cleanup: waiting for follow pose before neutral gripper outputs...'
+                    )
+                    if not self._wait_for_tcp_xyz_goal(
+                        (follow_goal[0], follow_goal[1], follow_goal[2])
+                    ):
+                        return
+                if not self._gripper_release_neutral():
+                    return
+                zup_ok = True
+                zup_v = 0
+                zup_map = 'static_release'
+                zup_cmd = 'DO'
+            elif release_grip_enabled:
                 zup_ok, zup_v, zup_map = self._send_movelio_goal(
                     post_follow_goal,
                     follow_goal,
@@ -1602,7 +1805,7 @@ class RelMovLMiniNode(Node):
 
         response.success = armed
         if armed:
-            response.message = f'Track armed: waiting for "{TRAY_VECTOR_TOPIC}". {action_text}'
+            response.message = f'Track armed: waiting for "{self._tray_vector_topic}". {action_text}'
         elif busy:
             response.message = f'Track busy but not armed. {action_text}'
         else:
@@ -1622,7 +1825,7 @@ class RelMovLMiniNode(Node):
 
         return self.run_tray_sequence(
             tray_vector_watch_timeout_sec,
-            FIXED_EE_INTERCEPT_SPEED_MM_S,
+            post_stop_movel_speed_mm_s,
             post_stop_x_offset_mm,
             post_stop_y_offset_mm,
             post_stop_z_offset_mm,
@@ -1862,6 +2065,118 @@ class RelMovLMiniNode(Node):
             )
             return float(self._tray_preview_length_mm), float(self._tray_preview_width_mm)
 
+    @staticmethod
+    def _clamp_float(value: object, lower: float, upper: float, default: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(default)
+        return max(float(lower), min(float(upper), numeric))
+
+    def is_headless(self) -> bool:
+        return bool(self._headless)
+
+    def runtime_settings_path(self) -> Path:
+        return self._runtime_settings_path
+
+    def load_runtime_settings(self, path: str | Path | None = None, *, require_complete: bool = False) -> bool:
+        settings_path = Path(path).expanduser() if path is not None else self._runtime_settings_path
+        if not settings_path.exists():
+            self.get_logger().info(f'Tray intercept runtime settings not found: {settings_path}')
+            return False
+        try:
+            with settings_path.open('r', encoding='utf-8') as infile:
+                payload = json.load(infile)
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to read tray intercept runtime settings "{settings_path}": {exc}')
+            return False
+        if not isinstance(payload, dict):
+            self.get_logger().warn(f'Tray intercept runtime settings "{settings_path}" is not a JSON object.')
+            return False
+        if require_complete:
+            missing_keys = [
+                key for key in TRAY_INTERCEPT_RUNTIME_REQUIRED_KEYS
+                if key not in payload or payload.get(key) is None
+            ]
+            if missing_keys:
+                self.get_logger().error(
+                    f'Tray intercept runtime settings "{settings_path}" missing required key(s): '
+                    f'{", ".join(missing_keys)}'
+                )
+                return False
+
+        with self._lock:
+            self._tray_watch_tf_only_mode = bool(payload.get('tf_only_mode', self._tray_watch_tf_only_mode))
+            self._tray_vector_watch_timeout_sec = self._clamp_float(
+                payload.get('tray_vector_wait_timeout_sec', self._tray_vector_watch_timeout_sec),
+                TRAY_VECTOR_WATCH_TIMEOUT_MIN,
+                TRAY_VECTOR_WATCH_TIMEOUT_MAX,
+                self._tray_vector_watch_timeout_sec,
+            )
+            self._post_stop_movel_speed_mm_s = self._clamp_float(
+                payload.get('ee_intercept_speed_mm_s', self._post_stop_movel_speed_mm_s),
+                LINEAR_SPEED_MM_S_MIN,
+                LINEAR_SPEED_MM_S_MAX,
+                self._post_stop_movel_speed_mm_s,
+            )
+            self._ee_final_pose_angle_deg = self._clamp_float(
+                payload.get('ee_final_pose_angle_deg', self._ee_final_pose_angle_deg),
+                EE_FINAL_POSE_ANGLE_MIN_DEG,
+                EE_FINAL_POSE_ANGLE_MAX_DEG,
+                self._ee_final_pose_angle_deg,
+            )
+            self._post_stop_x_offset_mm = self._clamp_float(
+                payload.get('tray_intercept_x_offset_mm', self._post_stop_x_offset_mm),
+                POST_STOP_X_OFFSET_MIN,
+                POST_STOP_X_OFFSET_MAX,
+                self._post_stop_x_offset_mm,
+            )
+            self._post_stop_y_offset_mm = self._clamp_float(
+                payload.get('tray_intercept_y_offset_mm', self._post_stop_y_offset_mm),
+                POST_STOP_Y_OFFSET_MIN,
+                POST_STOP_Y_OFFSET_MAX,
+                self._post_stop_y_offset_mm,
+            )
+            self._post_stop_z_offset_mm = self._clamp_float(
+                payload.get('tray_standoff_z_mm', self._post_stop_z_offset_mm),
+                POST_STOP_Z_OFFSET_MIN,
+                POST_STOP_Z_OFFSET_MAX,
+                self._post_stop_z_offset_mm,
+            )
+            self._command_hysteresis_sec = self._clamp_float(
+                payload.get('command_hysteresis_sec', self._command_hysteresis_sec),
+                COMMAND_HYSTERESIS_MIN_SEC,
+                COMMAND_HYSTERESIS_MAX_SEC,
+                self._command_hysteresis_sec,
+            )
+            self._follow_distance_mm = self._clamp_float(
+                payload.get('follow_distance_mm', self._follow_distance_mm),
+                FOLLOW_DISTANCE_MIN,
+                FOLLOW_DISTANCE_MAX,
+                self._follow_distance_mm,
+            )
+            self._post_follow_z_up_mm = self._clamp_float(
+                payload.get('post_follow_z_up_mm', self._post_follow_z_up_mm),
+                POST_FOLLOW_Z_UP_MIN,
+                POST_FOLLOW_Z_UP_MAX,
+                self._post_follow_z_up_mm,
+            )
+            self._release_grip_enabled = bool(payload.get('release_grip_enabled', self._release_grip_enabled))
+            self._tray_preview_length_mm = self._clamp_float(
+                payload.get('preview_tray_length_mm', self._tray_preview_length_mm),
+                TRAY_PREVIEW_LENGTH_MIN_MM,
+                TRAY_PREVIEW_LENGTH_MAX_MM,
+                self._tray_preview_length_mm,
+            )
+            self._tray_preview_width_mm = self._clamp_float(
+                payload.get('preview_tray_width_mm', self._tray_preview_width_mm),
+                TRAY_PREVIEW_WIDTH_MIN_MM,
+                TRAY_PREVIEW_WIDTH_MAX_MM,
+                self._tray_preview_width_mm,
+            )
+        self.get_logger().info(f'Loaded tray intercept runtime settings: {settings_path}')
+        return True
+
     def run_tray_sequence(
         self,
         tray_vector_watch_timeout_sec: float,
@@ -1874,9 +2189,9 @@ class RelMovLMiniNode(Node):
         tf_only_mode: bool,
         ee_final_pose_angle_deg: float | None = None,
     ) -> bool:
-        if self.count_publishers(TRAY_VECTOR_TOPIC) <= 0:
+        if self.count_publishers(self._tray_vector_topic) <= 0:
             self._reset_runtime_state(
-                f'No tray node detected on "{TRAY_VECTOR_TOPIC}". Node reset.'
+                f'No tray node detected on "{self._tray_vector_topic}". Node reset.'
             )
             return False
 
@@ -1937,12 +2252,12 @@ class RelMovLMiniNode(Node):
             )
             if tf_only_mode:
                 self._snapshot.action_text = (
-                    f'Troubleshoot mode armed... waiting for "{TRAY_VECTOR_TOPIC}" '
+                    f'Troubleshoot mode armed... waiting for "{self._tray_vector_topic}" '
                     f'for {watch_timeout_sec:.0f}s (TF preview only).'
                 )
             else:
                 self._snapshot.action_text = (
-                    f'Tray sequence armed... waiting for "{TRAY_VECTOR_TOPIC}" '
+                    f'Tray sequence armed... waiting for "{self._tray_vector_topic}" '
                     f'for {watch_timeout_sec:.0f}s.'
                 )
 
@@ -2239,7 +2554,7 @@ class RelMovLMiniGui:
         self._closed = False
         self._last_preview_signature: tuple | None = None
         self._preview_canvas_transform: dict[str, object] | None = None
-        self._runtime_settings_path = RUNTIME_SETTINGS_PATH
+        self._runtime_settings_path = self.node.runtime_settings_path()
         self._runtime_settings_save_after_id: str | None = None
         self._suspend_runtime_settings_events = False
         self._fetch_tray_size_inflight = False
@@ -3279,8 +3594,21 @@ class RelMovLMiniGui:
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = RelMovLMiniNode()
-    executor = SingleThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
+    if node.is_headless():
+        node.get_logger().info('Tray intercept running in headless service mode.')
+        try:
+            executor.spin()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            executor.remove_node(node)
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+        return
+
     stop_event = threading.Event()
 
     def spin() -> None:

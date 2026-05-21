@@ -12,6 +12,7 @@
 #include <Eigen/Geometry>
 #include <opencv2/aruco.hpp>
 #include <aruco_perception/msg/marker_detections.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -25,6 +26,7 @@ class ArucoDetectorNode : public rclcpp::Node
 {
 public:
   ArucoDetectorNode();
+  ~ArucoDetectorNode() override;
 
 private:
   using ImageMsg = sensor_msgs::msg::Image;
@@ -55,8 +57,13 @@ private:
   void renderNoCameraTopicsOverlay();
   static void onMouseThunk(int event, int x, int y, int flags, void *userdata);
   void onMouse(int event, int x, int y, int flags);
+  void processOverlayWindowEvents();
+  void requestShutdownFromWindowClose();
   void processPendingReset();
   void resetDetectorState();
+  void configureCameraSubscriptions();
+  rcl_interfaces::msg::SetParametersResult handleParameterUpdate(
+    const std::vector<rclcpp::Parameter> &parameters);
 
   std::optional<double> depthAt(const cv::Mat &depth, int u, int v) const;
   std::optional<Eigen::Vector3d> centerPointFromDepth(
@@ -82,6 +89,7 @@ private:
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
   rclcpp::Subscription<CameraInfoMsg>::SharedPtr info_sub_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<aruco_perception::msg::MarkerDetections>::SharedPtr detections_pub_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -132,5 +140,6 @@ private:
   cv::Rect reset_button_rect_{12, 12, 170, 40};
   bool reset_button_pressed_{false};
   bool reset_requested_{false};
+  bool overlay_window_close_requested_{false};
 };
 }  // namespace aruco_perception

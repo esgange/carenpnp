@@ -833,46 +833,6 @@ namespace parseTool
         ss << "GetCurrentCommandID()";
         return ss.str();
     }
-    std::string parserServoJRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Request> request)
-    {
-        std::string stringOrder = "ServoJ(";
-        char cmdCoordinate[100];
-        sprintf(cmdCoordinate, "%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f", request->a, request->b, request->c, request->d, request->e,
-                request->f);
-        stringOrder = stringOrder + cmdCoordinate;
-        if (!(request->param_value.empty() || request->param_value[0].empty()))
-        {
-            for (size_t i = 0; i < request->param_value.size(); i++)
-            {
-                stringOrder = stringOrder + "," + std::string(request->param_value[i]);
-            }
-        }
-
-        stringOrder = stringOrder + ")";
-
-        return stringOrder;
-    }
-
-    std::string parserServoPRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Request> request)
-    {
-        std::string stringOrder = "ServoP(";
-        char cmdCoordinate[100];
-        sprintf(cmdCoordinate, "%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f", request->a, request->b, request->c, request->d, request->e,
-                request->f);
-        stringOrder = stringOrder + cmdCoordinate;
-        if (!(request->param_value.empty() || request->param_value[0].empty()))
-        {
-            for (size_t i = 0; i < request->param_value.size(); i++)
-            {
-                stringOrder = stringOrder + "," + std::string(request->param_value[i]);
-            }
-        }
-
-        stringOrder = stringOrder + ")";
-
-        return stringOrder;
-    }
-
     std::string parserCircleRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::Circle::Request> request)
     {
         std::stringstream ss;

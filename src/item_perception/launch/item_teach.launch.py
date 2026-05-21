@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -20,7 +21,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -100,6 +100,7 @@ def generate_launch_description():
     depth_exposure_min_us = ParameterValue(LaunchConfiguration("depth_exposure_min_us"), value_type=int)
     depth_exposure_max_us = ParameterValue(LaunchConfiguration("depth_exposure_max_us"), value_type=int)
     bin_teach_dir = LaunchConfiguration("bin_teach_dir")
+    profiles_dir = LaunchConfiguration("profiles_dir")
     motion_service_root = LaunchConfiguration("motion_service_root")
     bin_roi_move_speed_percent = ParameterValue(
         LaunchConfiguration("bin_roi_move_speed_percent"),
@@ -110,7 +111,11 @@ def generate_launch_description():
         _ros_domain_action(),
         DeclareLaunchArgument(
             "params_file",
-            default_value=_repo_path("src", "item_perception", "config", "item_teach.yaml"),
+            default_value=os.path.join(
+                get_package_share_directory("item_perception"),
+                "config",
+                "item_teach.yaml",
+            ),
         ),
         DeclareLaunchArgument(
             "color_topic",
@@ -134,11 +139,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "calibration_parent_frame",
-            default_value="Link6",
+            default_value="base_link",
         ),
         DeclareLaunchArgument(
             "calibration_child_frame",
-            default_value="calibrated_camera_link",
+            default_value="bin_calibrated_link",
         ),
         DeclareLaunchArgument(
             "calibration_dir",
@@ -189,6 +194,10 @@ def generate_launch_description():
             default_value=_repo_path("teach", "bin_teach"),
         ),
         DeclareLaunchArgument(
+            "profiles_dir",
+            default_value=_repo_path("teach", "item_teach"),
+        ),
+        DeclareLaunchArgument(
             "motion_service_root",
             default_value="/dobot_bringup_ros2/srv",
         ),
@@ -223,6 +232,7 @@ def generate_launch_description():
                     "depth_exposure_min_us": depth_exposure_min_us,
                     "depth_exposure_max_us": depth_exposure_max_us,
                     "bin_teach_dir": bin_teach_dir,
+                    "profiles_dir": profiles_dir,
                     "motion_service_root": motion_service_root,
                     "bin_roi_move_speed_percent": bin_roi_move_speed_percent,
                 },

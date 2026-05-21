@@ -11,6 +11,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 BIN_CAMERA_COLOR_TOPIC = "/bin_camera/color/image_raw"
 BIN_CAMERA_DEPTH_TOPIC = "/bin_camera/depth/image_raw"
 BIN_CAMERA_INFO_TOPIC = "/bin_camera/color/camera_info"
+BIN_CAMERA_CONTROL_SERVICE_ROOT = "/bin_camera"
 
 
 def _workspace_root() -> Path:
@@ -19,7 +20,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -73,11 +73,17 @@ def generate_launch_description():
     item_name = LaunchConfiguration("item_name")
     bin_teach_dir = LaunchConfiguration("bin_teach_dir")
     runtime_root = LaunchConfiguration("runtime_root")
+    runtime_settings_path = LaunchConfiguration("runtime_settings_path")
     profile_dir = LaunchConfiguration("profile_dir")
     model_root = LaunchConfiguration("model_root")
     depth_topic = LaunchConfiguration("depth_topic")
     camera_info_topic = LaunchConfiguration("camera_info_topic")
     overlay_topic = LaunchConfiguration("overlay_topic")
+    camera_control_service_root = LaunchConfiguration("camera_control_service_root")
+    color_exposure_min_us = LaunchConfiguration("color_exposure_min_us")
+    color_exposure_max_us = LaunchConfiguration("color_exposure_max_us")
+    depth_exposure_min_us = LaunchConfiguration("depth_exposure_min_us")
+    depth_exposure_max_us = LaunchConfiguration("depth_exposure_max_us")
     sam2_checkpoint = LaunchConfiguration("sam2_checkpoint")
     sam2_config = LaunchConfiguration("sam2_config")
     yolo_base_model = LaunchConfiguration("yolo_base_model")
@@ -87,6 +93,7 @@ def generate_launch_description():
     display_scale = LaunchConfiguration("display_scale")
     live_view_enabled = LaunchConfiguration("live_view_enabled")
     overlay_enabled = LaunchConfiguration("overlay_enabled")
+    clear_runtime_on_start = LaunchConfiguration("clear_runtime_on_start")
     python_executable = LaunchConfiguration("python_executable")
 
     return LaunchDescription([
@@ -97,14 +104,26 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("color_topic", default_value=BIN_CAMERA_COLOR_TOPIC),
         DeclareLaunchArgument("joint_states_topic", default_value="/joint_states_robot"),
-        DeclareLaunchArgument("item_name", default_value="item"),
+        DeclareLaunchArgument("item_name", default_value=""),
         DeclareLaunchArgument("bin_teach_dir", default_value=_repo_path("teach", "bin_teach")),
-        DeclareLaunchArgument("runtime_root", default_value=_repo_path("teach", "bins_yolo", "runtime")),
-        DeclareLaunchArgument("profile_dir", default_value=_repo_path("teach", "bins_yolo", "profiles")),
-        DeclareLaunchArgument("model_root", default_value=_repo_path("teach", "bins_yolo", "models")),
+        DeclareLaunchArgument(
+            "runtime_root",
+            default_value=_repo_path("config", "item_perception_yolo", "item_teach_yolo_runtime"),
+        ),
+        DeclareLaunchArgument(
+            "runtime_settings_path",
+            default_value=_repo_path("config", "item_perception_yolo", "item_teach_yolo_runtime_settings.yaml"),
+        ),
+        DeclareLaunchArgument("profile_dir", default_value=_repo_path("teach", "item_teach_yolo")),
+        DeclareLaunchArgument("model_root", default_value=_repo_path("teach", "item_teach_yolo")),
         DeclareLaunchArgument("depth_topic", default_value=BIN_CAMERA_DEPTH_TOPIC),
         DeclareLaunchArgument("camera_info_topic", default_value=BIN_CAMERA_INFO_TOPIC),
         DeclareLaunchArgument("overlay_topic", default_value="bin_overlay"),
+        DeclareLaunchArgument("camera_control_service_root", default_value=BIN_CAMERA_CONTROL_SERVICE_ROOT),
+        DeclareLaunchArgument("color_exposure_min_us", default_value="1"),
+        DeclareLaunchArgument("color_exposure_max_us", default_value="100"),
+        DeclareLaunchArgument("depth_exposure_min_us", default_value="1"),
+        DeclareLaunchArgument("depth_exposure_max_us", default_value="32000"),
         DeclareLaunchArgument(
             "sam2_checkpoint",
             default_value=_repo_path("third_party", "sam2", "checkpoints", "sam2.1_hiera_tiny.pt"),
@@ -120,6 +139,7 @@ def generate_launch_description():
         DeclareLaunchArgument("display_scale", default_value="1.0"),
         DeclareLaunchArgument("live_view_enabled", default_value="true"),
         DeclareLaunchArgument("overlay_enabled", default_value="true"),
+        DeclareLaunchArgument("clear_runtime_on_start", default_value="true"),
         DeclareLaunchArgument(
             "python_executable",
             default_value=_repo_path(".venv", "bin", "python"),
@@ -138,11 +158,17 @@ def generate_launch_description():
                     "item_name": item_name,
                     "bin_teach_dir": bin_teach_dir,
                     "runtime_root": runtime_root,
+                    "runtime_settings_path": runtime_settings_path,
                     "profile_dir": profile_dir,
                     "model_root": model_root,
                     "depth_topic": depth_topic,
                     "camera_info_topic": camera_info_topic,
                     "overlay_topic": overlay_topic,
+                    "camera_control_service_root": camera_control_service_root,
+                    "color_exposure_min_us": ParameterValue(color_exposure_min_us, value_type=int),
+                    "color_exposure_max_us": ParameterValue(color_exposure_max_us, value_type=int),
+                    "depth_exposure_min_us": ParameterValue(depth_exposure_min_us, value_type=int),
+                    "depth_exposure_max_us": ParameterValue(depth_exposure_max_us, value_type=int),
                     "sam2_checkpoint": sam2_checkpoint,
                     "sam2_config": sam2_config,
                     "yolo_base_model": yolo_base_model,
@@ -152,6 +178,7 @@ def generate_launch_description():
                     "display_scale": ParameterValue(display_scale, value_type=float),
                     "live_view_enabled": ParameterValue(live_view_enabled, value_type=bool),
                     "overlay_enabled": ParameterValue(overlay_enabled, value_type=bool),
+                    "clear_runtime_on_start": ParameterValue(clear_runtime_on_start, value_type=bool),
                 },
             ],
         ),

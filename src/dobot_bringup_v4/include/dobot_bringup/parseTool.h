@@ -102,8 +102,6 @@
 #include <dobot_msgs_v4/srv/mov_l.hpp>
 #include <dobot_msgs_v4/srv/rel_joint_mov_j.hpp>
 #include <dobot_msgs_v4/srv/get_current_command_id.hpp>
-#include <dobot_msgs_v4/srv/servo_j.hpp>
-#include <dobot_msgs_v4/srv/servo_p.hpp>
 
 namespace parseTool
 {
@@ -281,10 +279,6 @@ namespace parseTool
     std::string parserrelJointMovJRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::RelJointMovJ::Request> request);
 
     std::string parserGetCurrentCommandIdRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::GetCurrentCommandId::Request> request);
-
-    std::string parserServoJRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Request> request);
-
-    std::string parserServoPRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Request> request);
 
     std::string parserCircleRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::Circle::Request> request);
 

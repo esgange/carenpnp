@@ -38,7 +38,6 @@ def workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -239,11 +238,11 @@ class ItemDetectYoloNode(Node):
 
         self.profiles_dir = resolve_path(
             self.declare_parameter(
-                "profiles_dir", str(workspace_path("teach", "bins_yolo", "profiles"))
+                "profiles_dir", str(workspace_path("teach", "item_teach_yolo"))
             ).value)
         self.model_root = resolve_path(
             self.declare_parameter(
-                "model_root", str(workspace_path("teach", "bins_yolo", "models"))
+                "model_root", str(workspace_path("teach", "item_teach_yolo"))
             ).value)
         self.color_topic = self.declare_parameter("color_topic", "/robot_camera/color/image_raw").value
         self.depth_topic = self.declare_parameter("depth_topic", "/robot_camera/depth/image_raw").value
@@ -347,7 +346,7 @@ class ItemDetectYoloNode(Node):
         self.selected_pose = None
         self.peak_pixel = None
         if self.profiles_dir.exists():
-            for path in sorted(self.profiles_dir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True):
+            for path in self.profile_yaml_paths():
                 profile = self.load_profile(path)
                 if profile is not None:
                     self.profiles.append(profile)
@@ -358,6 +357,21 @@ class ItemDetectYoloNode(Node):
             self.status = f"No YOLO profiles in {self.profiles_dir}"
             return
         self.select_profile(0)
+
+    def profile_yaml_paths(self) -> List[Path]:
+        patterns = ("*.yaml", "*/*.yaml", "profiles/*.yaml", "models/*/*.yaml")
+        paths: List[Path] = []
+        seen = set()
+        for pattern in patterns:
+            for path in self.profiles_dir.glob(pattern):
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                paths.append(path)
+        return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
 
     def load_profile(self, path: Path) -> Optional[ItemProfile]:
         try:

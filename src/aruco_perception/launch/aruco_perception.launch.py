@@ -14,7 +14,6 @@ def repo_path(*parts: str) -> str:
       (path / "src").exists() and
       (
         (path / "README.md").exists()
-        or (path / "docker-compose.yml").exists()
         or (path / "src" / "dobot_msgs_v4").exists()
       )
     )
@@ -86,6 +85,8 @@ def generate_launch_description():
                             description="Directory to search for calibration YAMLs."),
       DeclareLaunchArgument("calibration_file", default_value="",
                             description="Explicit calibration YAML path (overrides discovery)."),
+      DeclareLaunchArgument("calibration_file_prefix", default_value="axab_calibration_eyeonhand_",
+                            description="Filename prefix used when auto-discovering calibration YAMLs."),
       DeclareLaunchArgument("show_overlay_window", default_value="true",
                             description="Show the detector's standalone OpenCV overlay window."),
       DeclareLaunchArgument("publish_overlay", default_value="true",
@@ -111,6 +112,7 @@ def launch_setup(context, *args, **kwargs):
   child_frame = LaunchConfiguration("child_frame").perform(context)
   calibration_dir = os.path.expanduser(LaunchConfiguration("calibration_dir").perform(context))
   explicit_file = os.path.expanduser(LaunchConfiguration("calibration_file").perform(context))
+  calibration_file_prefix = LaunchConfiguration("calibration_file_prefix").perform(context).strip()
   show_overlay_window = LaunchConfiguration("show_overlay_window")
   publish_overlay = LaunchConfiguration("publish_overlay")
   overlay_rate_hz = LaunchConfiguration("overlay_rate_hz")
@@ -133,10 +135,10 @@ def launch_setup(context, *args, **kwargs):
           msg
         )
     else:
-      selected_file = find_latest_calibration(calibration_dir)
+      selected_file = find_latest_calibration(calibration_dir, calibration_file_prefix)
       if not selected_file:
         msg = (
-          "[aruco_perception.launch] No non-empty calibration YAML found in "
+          f"[aruco_perception.launch] No non-empty calibration YAML matching {calibration_file_prefix!r} found in "
           f"{calibration_dir}. Provide one via calibration_file:=<path>."
         )
         show_missing_calibration_dialog(msg)
@@ -178,7 +180,7 @@ def launch_setup(context, *args, **kwargs):
   return nodes
 
 
-def find_latest_calibration(calibration_dir: str) -> str:
+def find_latest_calibration(calibration_dir: str, filename_prefix: str) -> str:
   try:
     base = Path(calibration_dir).expanduser()
     if not base.exists() or not base.is_dir():
@@ -188,7 +190,7 @@ def find_latest_calibration(calibration_dir: str) -> str:
       if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
         continue
       name = path.name
-      if name.startswith("axab_calibration_eyeonhand_"):
+      if name.startswith(filename_prefix):
         yaml_files.append(path)
     if not yaml_files:
       return ""

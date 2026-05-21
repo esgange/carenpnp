@@ -15,6 +15,7 @@ setup(
             'share/' + package_name + '/launch',
             [
                 'launch/camera_launcher.launch.py',
+                'launch/camera_headless.launch.py',
             ],
         ),
         (

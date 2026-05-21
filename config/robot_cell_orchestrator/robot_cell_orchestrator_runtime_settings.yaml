@@ -1,0 +1,7 @@
+schema_version: 1
+step_mode_enabled: false
+tray_seek_stability_sec: 1.0
+tray_intercept_x_offset_mm: 0.0
+tray_intercept_y_offset_mm: 0.0
+tray_ee_angle_deg: 0.0
+window_geometry: 1392x1016

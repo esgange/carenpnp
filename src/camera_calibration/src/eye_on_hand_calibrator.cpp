@@ -93,6 +93,15 @@ EyeOnHandCalibrator::EyeOnHandCalibrator()
   gripper_frame_ = this->declare_parameter<std::string>("gripper_frame", "Link6");
   camera_frame_ = this->declare_parameter<std::string>("camera_frame", "camera_link");
   target_frame_ = this->declare_parameter<std::string>("target_frame", "tag_frame");
+  max_target_age_sec_ = this->declare_parameter<double>("max_target_age_sec", 1.5);
+  calibration_name_ = this->declare_parameter<std::string>("calibration_name", "cr10_orbbec335");
+  tracking_base_frame_ = this->declare_parameter<std::string>(
+    "tracking_base_frame", "camera_color_optical_frame");
+  tracking_marker_frame_ = this->declare_parameter<std::string>(
+    "tracking_marker_frame", "charuco_target");
+  freehand_robot_movement_ = this->declare_parameter<bool>("freehand_robot_movement", true);
+  move_group_namespace_ = this->declare_parameter<std::string>("move_group_namespace", "/");
+  move_group_ = this->declare_parameter<std::string>("move_group", "manipulator");
   min_samples_ = this->declare_parameter<int>("min_samples", 8);
   const std::string requested_mode =
     this->declare_parameter<std::string>("calibration_mode", "eye_on_hand");
@@ -129,10 +138,11 @@ EyeOnHandCalibrator::EyeOnHandCalibrator()
 
   RCLCPP_INFO(get_logger(), "Writing calibration output to: %s", output_path_.c_str());
   RCLCPP_INFO(get_logger(),
-              "Using mode=%s frames base=%s, gripper=%s, camera=%s, target=%s (min_samples=%d)",
+              "Using mode=%s frames base=%s, gripper=%s, camera=%s, target=%s "
+              "(min_samples=%d, max_target_age=%.2fs)",
               calibration_mode_.c_str(),
               base_frame_.c_str(), gripper_frame_.c_str(),
-              camera_frame_.c_str(), target_frame_.c_str(), min_samples_);
+              camera_frame_.c_str(), target_frame_.c_str(), min_samples_, max_target_age_sec_);
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -243,6 +253,24 @@ bool EyeOnHandCalibrator::fetchTransforms(PoseSample &sample, std::string &reaso
              "): " + ex.what();
     RCLCPP_WARN(get_logger(), "%s", reason.c_str());
     return false;
+  }
+
+  if (max_target_age_sec_ > 0.0)
+  {
+    const rclcpp::Time target_stamp(t_camera_target.header.stamp);
+    const double target_age_sec = (this->now() - target_stamp).seconds();
+    if (target_stamp.nanoseconds() == 0 || !std::isfinite(target_age_sec) ||
+        target_age_sec > max_target_age_sec_)
+    {
+      std::ostringstream msg;
+      msg << "Target TF is stale for camera->target (" << camera_frame_ << " -> " << target_frame_
+          << "). Age " << std::fixed << std::setprecision(3) << target_age_sec
+          << "s exceeds " << max_target_age_sec_
+          << "s. Keep all 4 calibration markers visible before taking a sample.";
+      reason = msg.str();
+      RCLCPP_WARN(get_logger(), "%s", reason.c_str());
+      return false;
+    }
   }
 
   geometry_msgs::msg::PoseStamped ee_pose;
@@ -405,11 +433,25 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
 
   Eigen::Quaterniond q(rotation);
   q.normalize();
-  (void)camera_frame;
   (void)transform_parent_frame;
   (void)sample_count;
+  const std::string calibration_type = isEyeToHandMode() ? "eye_on_base" : "eye_in_hand";
+  const std::string tracking_base_frame =
+    tracking_base_frame_.empty() ? camera_frame : tracking_base_frame_;
+  const std::string tracking_marker_frame =
+    tracking_marker_frame_.empty() ? target_frame_ : tracking_marker_frame_;
 
   out << std::fixed << std::setprecision(12);
+  out << "parameters:\n";
+  out << "  name: " << calibration_name_ << "\n";
+  out << "  calibration_type: " << calibration_type << "\n";
+  out << "  robot_base_frame: " << base_frame_ << "\n";
+  out << "  robot_effector_frame: " << gripper_frame_ << "\n";
+  out << "  tracking_base_frame: " << tracking_base_frame << "\n";
+  out << "  tracking_marker_frame: " << tracking_marker_frame << "\n";
+  out << "  freehand_robot_movement: " << (freehand_robot_movement_ ? "true" : "false") << "\n";
+  out << "  move_group_namespace: " << move_group_namespace_ << "\n";
+  out << "  move_group: " << move_group_ << "\n";
   out << "transform:\n";
   out << "  translation:\n";
   out << "    x: " << translation.x() << "\n";

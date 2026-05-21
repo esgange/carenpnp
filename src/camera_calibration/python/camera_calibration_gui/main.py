@@ -13,11 +13,13 @@ from python_qt_binding import QtCore, QtGui, QtWidgets
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_services_default
 from rclpy.time import Time
 from geometry_msgs.msg import TransformStamped
 from dobot_msgs_v4.msg import ToolVectorActual
-from dobot_msgs_v4.srv import InverseKin, MovJ, SetTool, Stop, Tool
+from dobot_msgs_v4.srv import InverseKin, MovJ, Stop
+from rcl_interfaces.srv import SetParameters
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -38,6 +40,7 @@ class GoalPose:
 
 CALIB_MODE_EYE_ON_HAND = "eye_on_hand"
 CALIB_MODE_EYE_TO_HAND = "eye_to_hand"
+TAG_FRAME_MAX_AGE_SEC = 1.5
 
 
 def workspace_root() -> Path:
@@ -45,7 +48,6 @@ def workspace_root() -> Path:
     return (
       (path / "src").exists() and
       ((path / "README.md").exists() or
-       (path / "docker-compose.yml").exists() or
        (path / "src" / "dobot_msgs_v4").exists())
     )
 
@@ -85,10 +87,40 @@ def workspace_path(*parts: str) -> Path:
 
 
 def normalize_calibration_mode(value):
-  mode = str(value or "").strip().lower()
-  if mode == CALIB_MODE_EYE_TO_HAND:
+  mode = str(value or "").strip().lower().replace("-", "_")
+  if mode in (CALIB_MODE_EYE_TO_HAND, "eyetohand"):
     return CALIB_MODE_EYE_TO_HAND
   return CALIB_MODE_EYE_ON_HAND
+
+
+def default_camera_prefix_for_mode(mode):
+  return "bin_camera" if normalize_calibration_mode(mode) == CALIB_MODE_EYE_TO_HAND else "robot_camera"
+
+
+def default_camera_frame_for_mode(mode, camera_prefix=None):
+  if normalize_calibration_mode(mode) == CALIB_MODE_EYE_TO_HAND:
+    prefix = normalize_camera_prefix(camera_prefix, mode)
+    return f"{prefix}_color_optical_frame"
+  return "camera_link"
+
+
+def normalize_camera_prefix(value, mode=CALIB_MODE_EYE_ON_HAND):
+  prefix = str(value or "").strip().strip("/")
+  return prefix or default_camera_prefix_for_mode(mode)
+
+
+def normalize_camera_frame(value, mode=CALIB_MODE_EYE_ON_HAND, camera_prefix=None):
+  frame = str(value or "").strip().strip("/")
+  return frame or default_camera_frame_for_mode(mode, camera_prefix)
+
+
+def camera_topics_for_prefix(prefix):
+  normalized = normalize_camera_prefix(prefix)
+  return (
+    f"/{normalized}/color/image_raw",
+    f"/{normalized}/depth/image_raw",
+    f"/{normalized}/color/camera_info",
+  )
 
 
 def calibration_mode_filename_token(mode):
@@ -123,20 +155,6 @@ def default_output_path(mode=CALIB_MODE_EYE_ON_HAND):
   except Exception:
     pass
   return str(calib_dir / calibration_filename_for_mode(mode))
-
-
-def is_standard_calibration_filename_for_mode(name, mode):
-  return name.startswith(f"axab_calibration_{calibration_mode_filename_token(mode)}_") and name.endswith(".yaml")
-
-
-def normalize_output_path_setting(path_text, mode=CALIB_MODE_EYE_ON_HAND):
-  raw_text = str(path_text or "").strip()
-  if not raw_text:
-    return default_output_path(mode)
-  path = Path(raw_text).expanduser()
-  if not is_standard_calibration_filename_for_mode(path.name, mode):
-    return default_output_path(mode)
-  return str(path)
 
 
 def rpy_deg_to_quaternion(roll_deg, pitch_deg, yaw_deg):
@@ -723,6 +741,9 @@ class CalibGui(QtWidgets.QWidget):
     self.align_in_flight = False
     self.generated_goals = []
     self.auto_running = False
+    self.manual_sample_count = 0
+    self.manual_capture_in_flight = False
+    self.manual_compute_in_flight = False
     self.auto_state = "idle"
     self.auto_goal_index = 0
     self.auto_capture_retry = 0
@@ -753,9 +774,9 @@ class CalibGui(QtWidgets.QWidget):
     self.calibration_mode.addItem("Eye-to-Hand", CALIB_MODE_EYE_TO_HAND)
     self.base_frame = QtWidgets.QLineEdit("base_link")
     self.gripper_frame = QtWidgets.QLineEdit("Link6")
-    self.camera_frame = QtWidgets.QLineEdit("camera_link")
+    self.camera_prefix = QtWidgets.QLineEdit(default_camera_prefix_for_mode(CALIB_MODE_EYE_ON_HAND))
+    self.camera_frame = QtWidgets.QLineEdit(default_camera_frame_for_mode(CALIB_MODE_EYE_ON_HAND))
     self.target_frame = QtWidgets.QLineEdit("tag_frame")
-    self.output_path = QtWidgets.QLineEdit(default_output_path())
     self.min_samples = QtWidgets.QSpinBox()
     self.min_samples.setMinimum(3)
     self.min_samples.setMaximum(1000)
@@ -785,22 +806,18 @@ class CalibGui(QtWidgets.QWidget):
     self.min_base_z_mm.setSingleStep(10.0)
     self.min_base_z_mm.setValue(200.0)
     self.min_base_z_mm.setSuffix(" mm")
-    self.tag_tool_offset = QtWidgets.QLineEdit("0,0,0,0,0,0")
-    self.apply_tool_btn = QtWidgets.QPushButton("Apply Tag Tool")
-
     form.addRow("Calibration mode", self.calibration_mode)
     form.addRow("Base frame", self.base_frame)
     form.addRow("Gripper frame", self.gripper_frame)
+    form.addRow("Camera topic prefix", self.camera_prefix)
     form.addRow("Camera frame", self.camera_frame)
     form.addRow("Target frame", self.target_frame)
-    form.addRow("Output YAML path", self.output_path)
     form.addRow("Minimum samples", self.min_samples)
     form.addRow("Min tag distance", self.min_tag_distance_mm)
     form.addRow("Max tag distance", self.max_tag_distance_mm)
     form.addRow("Max tilt from tag Z", self.max_tilt_deg)
     form.addRow("Look up bias", self.look_up_bias_deg)
     form.addRow("Min base Z height", self.min_base_z_mm)
-    form.addRow("Tag tool offset", self.tag_tool_offset)
     layout.addLayout(form)
 
     button_layout = QtWidgets.QHBoxLayout()
@@ -816,7 +833,6 @@ class CalibGui(QtWidgets.QWidget):
 
     action_layout = QtWidgets.QHBoxLayout()
     self.add_btn = QtWidgets.QPushButton("Generate Pose")
-    action_layout.addWidget(self.apply_tool_btn)
     self.save_btn = QtWidgets.QPushButton("Save YAML")
     action_layout.addWidget(self.add_btn)
     action_layout.addWidget(self.save_btn)
@@ -845,8 +861,7 @@ class CalibGui(QtWidgets.QWidget):
     self.start_btn.clicked.connect(self.start_automation)
     self.stop_btn.clicked.connect(self.stop_calibrator)
     self.align_btn.clicked.connect(self.align_to_tag)
-    self.add_btn.clicked.connect(self.generate_goal_poses)
-    self.apply_tool_btn.clicked.connect(self.apply_tag_tool_offset)
+    self.add_btn.clicked.connect(self.handle_add_button_clicked)
     self.save_btn.clicked.connect(self.save_yaml)
 
   def log(self, text):
@@ -885,45 +900,48 @@ class CalibGui(QtWidgets.QWidget):
     mode = self._current_calibration_mode()
     eye_to_hand = mode == CALIB_MODE_EYE_TO_HAND
     self.align_btn.setEnabled((not self.auto_running) and (not self.align_in_flight) and (not eye_to_hand))
+    self.add_btn.setText("Get Sample" if eye_to_hand else "Generate Pose")
+    if not self.auto_running:
+      self.add_btn.setEnabled(not (self.manual_capture_in_flight or self.manual_compute_in_flight))
     if eye_to_hand:
       self.align_btn.setToolTip("Align is only used for eye-on-hand mode.")
-      self.min_tag_distance_mm.setToolTip("Visibility gate: minimum camera-to-tag distance for sample capture.")
-      self.max_tag_distance_mm.setToolTip("Visibility gate: maximum camera-to-tag distance for sample capture.")
-      self.max_tilt_deg.setToolTip("Visibility gate: maximum tag tilt for sample capture.")
-      self.look_up_bias_deg.setToolTip("Eye-to-hand generator ignores look-up bias.")
+      self.add_btn.setToolTip("Capture the current hand-dragged pose as a calibration sample.")
+      self.start_btn.setEnabled(False)
+      self.start_btn.setToolTip("Eye-to-hand manual mode uses Get Sample instead of generated robot motion.")
+      for widget in (
+        self.min_tag_distance_mm,
+        self.max_tag_distance_mm,
+        self.max_tilt_deg,
+        self.look_up_bias_deg,
+        self.min_base_z_mm,
+      ):
+        widget.setEnabled(False)
+        widget.setToolTip("Used only for eye-on-hand pose generation; ignored for eye-to-hand samples.")
     else:
       self.align_btn.setToolTip("Move to the closest IK-valid camera-centered view of the target.")
-      self.min_tag_distance_mm.setToolTip("")
-      self.max_tag_distance_mm.setToolTip("")
-      self.max_tilt_deg.setToolTip("")
-      self.look_up_bias_deg.setToolTip("")
-
-  @staticmethod
-  def _parse_tool_offset_values(raw_text):
-    text = str(raw_text or "").replace("{", "").replace("}", "").strip()
-    if not text:
-      return None
-    tokens = [token.strip() for token in text.split(",")]
-    if len(tokens) != 6:
-      return None
-    values = []
-    for token in tokens:
-      try:
-        values.append(float(token))
-      except ValueError:
-        return None
-    return values
+      self.add_btn.setToolTip("Generate robot goal poses for automatic capture.")
+      self.start_btn.setToolTip("")
+      for widget in (
+        self.min_tag_distance_mm,
+        self.max_tag_distance_mm,
+        self.max_tilt_deg,
+        self.look_up_bias_deg,
+        self.min_base_z_mm,
+      ):
+        widget.setEnabled(not self.auto_running)
+        widget.setToolTip("")
 
   def _on_calibration_mode_changed(self, *_):
     mode = self._current_calibration_mode()
     self.ros_if.apply_calibration_mode_tool(mode)
-    output_name = Path(self.output_path.text().strip()).expanduser().name
-    if not is_standard_calibration_filename_for_mode(output_name, mode):
-      self.output_path.setText(default_output_path(mode))
+    self._set_camera_prefix_for_mode(mode, log_change=True)
+    self._set_camera_frame_for_mode(mode, log_change=True)
     if self.generated_goals and (not self.auto_running):
       self.generated_goals = []
       self.start_btn.setEnabled(False)
       self.log("Calibration mode changed: cleared generated poses.")
+    if mode == CALIB_MODE_EYE_TO_HAND:
+      self.start_btn.setEnabled(False)
     self._save_setting(
       "calibration_mode",
       "Calibration mode",
@@ -931,9 +949,66 @@ class CalibGui(QtWidgets.QWidget):
       display_value=self.calibration_mode.currentText(),
       emit_log=True,
     )
-    self._save_setting("output_path", "Output YAML path", self.output_path.text().strip(), emit_log=False)
     self._update_window_title()
     self._update_mode_dependent_ui()
+
+  def _set_camera_prefix_for_mode(self, mode, log_change):
+    prefix = default_camera_prefix_for_mode(mode)
+    if self.camera_prefix.text().strip().strip("/") == prefix:
+      return
+    self.camera_prefix.setText(prefix)
+    if log_change:
+      self.log(f"[ui] Camera topic prefix default for {mode}: {prefix}")
+      self._log_camera_prefix_launch_note(prefix)
+      success, detail = self.ros_if.set_aruco_camera_prefix(prefix)
+      prefix_text = "OK" if success else "ERROR"
+      self.log(f"[camera_prefix] {prefix_text}: {detail}")
+
+  def _set_camera_frame_for_mode(self, mode, log_change):
+    frame = default_camera_frame_for_mode(mode, self.camera_prefix.text())
+    if self.camera_frame.text().strip().strip("/") == frame:
+      return
+    self.camera_frame.setText(frame)
+    if log_change:
+      self.log(f"[ui] Raw camera frame default for {mode}: {frame}")
+      success, detail = self.ros_if.set_calibration_camera_frame(frame)
+      prefix_text = "OK" if success else "ERROR"
+      self.log(f"[camera_frame] {prefix_text}: {detail}")
+
+  def _log_camera_prefix_launch_note(self, prefix):
+    active_prefix = self.ros_if.get_default_camera_prefix()
+    normalized = normalize_camera_prefix(prefix, self._current_calibration_mode())
+    color_topic, depth_topic, camera_info_topic = camera_topics_for_prefix(normalized)
+    self.log(
+      f"[ui] Prefix {normalized} maps to {color_topic}, {depth_topic}, {camera_info_topic}."
+    )
+    if normalized == active_prefix:
+      self.log("[ui] Prefix matches the active ArUco stream.")
+
+  def _on_camera_prefix_changed(self):
+    prefix = normalize_camera_prefix(self.camera_prefix.text(), self._current_calibration_mode())
+    if prefix != self.camera_prefix.text().strip():
+      self.camera_prefix.setText(prefix)
+    self._log_camera_prefix_launch_note(prefix)
+    success, detail = self.ros_if.set_aruco_camera_prefix(prefix)
+    prefix_text = "OK" if success else "ERROR"
+    self.log(f"[camera_prefix] {prefix_text}: {detail}")
+    if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
+      self._set_camera_frame_for_mode(CALIB_MODE_EYE_TO_HAND, log_change=True)
+
+  def _on_camera_frame_changed(self):
+    frame = normalize_camera_frame(
+      self.camera_frame.text(),
+      self._current_calibration_mode(),
+      self.camera_prefix.text(),
+    )
+    if frame != self.camera_frame.text().strip():
+      self.camera_frame.setText(frame)
+    self._save_setting("camera_frame", "Camera frame", frame, display_value=frame, emit_log=True)
+    success, detail = self.ros_if.set_calibration_camera_frame(frame)
+    prefix_text = "OK" if success else "ERROR"
+    self.log(f"[camera_frame] {prefix_text}: {detail}")
+
 
   def _settings_key(self, name):
     return f"ui/{name}"
@@ -1008,17 +1083,9 @@ class CalibGui(QtWidgets.QWidget):
     )
     self.base_frame.setText(self._read_text_setting("base_frame", self.base_frame.text()))
     self.gripper_frame.setText(self._read_text_setting("gripper_frame", self.gripper_frame.text()))
-    self.camera_frame.setText(self._read_text_setting("camera_frame", self.camera_frame.text()))
+    self.camera_prefix.setText(self.ros_if.get_default_camera_prefix())
+    self.camera_frame.setText(self.ros_if.get_default_camera_frame())
     self.target_frame.setText(self._read_text_setting("target_frame", self.target_frame.text()))
-    self.output_path.setText(
-      normalize_output_path_setting(
-        self._read_text_setting("output_path", self.output_path.text()),
-        self._current_calibration_mode(),
-      )
-    )
-    self.tag_tool_offset.setText(
-      self._read_text_setting("tag_tool_offset", self.tag_tool_offset.text())
-    )
 
     self.min_samples.setValue(
       self._read_int_setting(
@@ -1077,17 +1144,10 @@ class CalibGui(QtWidgets.QWidget):
     self.gripper_frame.editingFinished.connect(
       partial(self._save_line_edit_setting, "gripper_frame", "Gripper frame", self.gripper_frame)
     )
-    self.camera_frame.editingFinished.connect(
-      partial(self._save_line_edit_setting, "camera_frame", "Camera frame", self.camera_frame)
-    )
+    self.camera_frame.editingFinished.connect(self._on_camera_frame_changed)
+    self.camera_prefix.editingFinished.connect(self._on_camera_prefix_changed)
     self.target_frame.editingFinished.connect(
       partial(self._save_line_edit_setting, "target_frame", "Target frame", self.target_frame)
-    )
-    self.output_path.editingFinished.connect(
-      partial(self._save_line_edit_setting, "output_path", "Output YAML path", self.output_path)
-    )
-    self.tag_tool_offset.editingFinished.connect(
-      partial(self._save_line_edit_setting, "tag_tool_offset", "Tag tool offset", self.tag_tool_offset)
     )
 
     self.min_samples.valueChanged.connect(
@@ -1131,8 +1191,6 @@ class CalibGui(QtWidgets.QWidget):
     self._save_setting("gripper_frame", "Gripper frame", self.gripper_frame.text().strip(), emit_log=log_changes)
     self._save_setting("camera_frame", "Camera frame", self.camera_frame.text().strip(), emit_log=log_changes)
     self._save_setting("target_frame", "Target frame", self.target_frame.text().strip(), emit_log=log_changes)
-    self._save_setting("output_path", "Output YAML path", self.output_path.text().strip(), emit_log=log_changes)
-    self._save_setting("tag_tool_offset", "Tag tool offset", self.tag_tool_offset.text().strip(), emit_log=log_changes)
 
     min_samples_value, min_samples_display = self._format_numeric_widget_value(self.min_samples)
     self._save_setting(
@@ -1188,10 +1246,14 @@ class CalibGui(QtWidgets.QWidget):
     self.log(f"[ui] Calibration mode = {self.calibration_mode.currentText()} ({self._current_calibration_mode()})")
     self.log(f"[ui] Base frame = {self.base_frame.text().strip()}")
     self.log(f"[ui] Gripper frame = {self.gripper_frame.text().strip()}")
+    self.log(f"[ui] Camera topic prefix = {self.camera_prefix.text().strip()}")
     self.log(f"[ui] Camera frame = {self.camera_frame.text().strip()}")
     self.log(f"[ui] Target frame = {self.target_frame.text().strip()}")
-    self.log(f"[ui] Output YAML path = {self.output_path.text().strip()}")
-    self.log(f"[ui] Tag tool offset = {self.tag_tool_offset.text().strip()}")
+    color_topic, depth_topic, camera_info_topic = self.ros_if.get_camera_topics()
+    self.log(f"[ui] Active color topic = {color_topic}")
+    self.log(f"[ui] Active depth topic = {depth_topic}")
+    self.log(f"[ui] Active camera info topic = {camera_info_topic}")
+    self.log(f"[ui] Output YAML path = {default_output_path(self._current_calibration_mode())} (auto)")
     self.log(f"[ui] Minimum samples = {int(self.min_samples.value())}")
     self.log(f"[ui] Min tag distance = {float(self.min_tag_distance_mm.value()):.2f} mm")
     self.log(f"[ui] Max tag distance = {float(self.max_tag_distance_mm.value()):.2f} mm")
@@ -1221,17 +1283,15 @@ class CalibGui(QtWidgets.QWidget):
       self.calibration_mode,
       self.base_frame,
       self.gripper_frame,
+      self.camera_prefix,
       self.camera_frame,
       self.target_frame,
-      self.output_path,
-      self.tag_tool_offset,
       self.min_samples,
       self.min_tag_distance_mm,
       self.max_tag_distance_mm,
       self.max_tilt_deg,
       self.look_up_bias_deg,
       self.min_base_z_mm,
-      self.apply_tool_btn,
       self.add_btn,
       self.save_btn,
     ]:
@@ -1245,10 +1305,8 @@ class CalibGui(QtWidgets.QWidget):
     if self.calib_process is not None:
       return True
 
-    output_path = normalize_output_path_setting(self.output_path.text(), self._current_calibration_mode())
-    if output_path != self.output_path.text().strip():
-      self.output_path.setText(output_path)
-      self._save_setting("output_path", "Output YAML path", output_path, emit_log=False)
+    output_path = default_output_path(self._current_calibration_mode())
+    self.log(f"Auto output YAML path: {output_path}")
 
     cmd = [
       "ros2",
@@ -1267,9 +1325,9 @@ class CalibGui(QtWidgets.QWidget):
       "-p",
       f"target_frame:={self.target_frame.text()}",
       "-p",
-      f"output_path:={output_path}",
-      "-p",
       f"min_samples:={self.min_samples.value()}",
+      "-p",
+      "max_target_age_sec:=1.5",
     ]
     self.log("Starting calibrator...")
     try:
@@ -1289,15 +1347,9 @@ class CalibGui(QtWidgets.QWidget):
     mode = self._current_calibration_mode()
     self.ros_if.apply_calibration_mode_tool(mode)
     if mode == CALIB_MODE_EYE_TO_HAND:
-      values = self._parse_tool_offset_values(self.tag_tool_offset.text())
-      if values is None:
-        self.log("Eye-to-hand requires valid tag tool offset: x,y,z,rx,ry,rz")
-        return
-      success, detail = self.ros_if.apply_tag_tool_offset(values)
-      if not success:
-        self.log(f"[tag_tool] ERROR: {detail}")
-        return
-      self.log(f"[tag_tool] OK: {detail}")
+      self.log("Eye-to-hand is in manual mode. Drag the robot, then click Get Sample.")
+      self.start_btn.setEnabled(False)
+      return
     if self.auto_running:
       self.log("Auto calibration is already running.")
       return
@@ -1371,8 +1423,12 @@ class CalibGui(QtWidgets.QWidget):
         self.calib_process.kill()
     finally:
       self.calib_process = None
+      self.manual_capture_in_flight = False
+      self.manual_compute_in_flight = False
+      self.manual_sample_count = 0
       self.stop_btn.setEnabled(self.auto_running)
       self.log("Calibrator stopped.")
+      self._update_mode_dependent_ui()
 
   def stop_calibrator(self, *_):
     self._stop_calibrator(clear_generated_goals=True)
@@ -1409,7 +1465,7 @@ class CalibGui(QtWidgets.QWidget):
     self._persist_all_ui_settings(log_changes=False)
     self.ros_if.apply_calibration_mode_tool(self._current_calibration_mode())
     if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
-      self.log("Align is disabled in eye-to-hand mode. Use Generate Pose + Start.")
+      self.log("Align is disabled in eye-to-hand manual mode. Drag the robot, then click Get Sample.")
       return
     if self.auto_running:
       self.log("Cannot align while auto calibration is running.")
@@ -1540,6 +1596,8 @@ class CalibGui(QtWidgets.QWidget):
     # Process exited on its own; mirror UI state and close GUI so launch shuts down cleanly.
     self.log("Calibrator process exited; closing GUI.")
     self.auto_running = False
+    self.manual_capture_in_flight = False
+    self.manual_compute_in_flight = False
     self.calib_process = None
     self.stop_btn.setEnabled(False)
     QtWidgets.QApplication.instance().quit()
@@ -1587,49 +1645,32 @@ class CalibGui(QtWidgets.QWidget):
       return False
     return True
 
-  def _check_eye_to_hand_visibility_gate(self, log_rejections):
+  def _check_tag_visibility_gate(self, log_rejections):
     mode = self._current_calibration_mode()
-    if mode != CALIB_MODE_EYE_TO_HAND:
-      return True, "visibility gate disabled for eye-on-hand mode"
-
     camera_frame = self.camera_frame.text().strip() or "camera_link"
     target_frame = self.target_frame.text().strip() or "tag_frame"
-    pose = self.ros_if.lookup_pose_mm(camera_frame, target_frame, timeout_sec=0.08)
+    pose = self.ros_if.lookup_pose_mm_with_age(camera_frame, target_frame, timeout_sec=0.08)
     if pose is None:
       message = f"Cannot resolve TF '{camera_frame}' -> '{target_frame}'."
       if log_rejections:
         self.log(f"[visibility] {message}")
       return False, message
 
-    tx, ty, tz, qx, qy, qz, qw = pose
-    distance_mm = math.sqrt((tx * tx) + (ty * ty) + (tz * tz))
-    min_distance_mm = float(self.min_tag_distance_mm.value())
-    max_distance_mm = float(self.max_tag_distance_mm.value())
-    if distance_mm < min_distance_mm or distance_mm > max_distance_mm:
+    _tx, _ty, _tz, _qx, _qy, _qz, _qw, age_sec = pose
+    if not math.isfinite(age_sec) or age_sec > TAG_FRAME_MAX_AGE_SEC:
+      age_text = "unknown" if not math.isfinite(age_sec) else f"{max(0.0, age_sec):.3f}s"
       message = (
-        f"Tag distance {distance_mm:.1f} mm outside range "
-        f"[{min_distance_mm:.1f}, {max_distance_mm:.1f}] mm."
+        f"Tag TF is stale (age {age_text}, max {TAG_FRAME_MAX_AGE_SEC:.2f}s). "
+        "All 4 calibration markers must be visible."
       )
       if log_rejections:
         self.log(f"[visibility] {message}")
       return False, message
 
-    tag_z_axis = vec_normalize(quaternion_rotate_vector((qx, qy, qz, qw), (0.0, 0.0, 1.0)))
-    if tag_z_axis is None:
-      message = "Tag orientation is invalid."
-      if log_rejections:
-        self.log(f"[visibility] {message}")
-      return False, message
-
-    tilt_deg = angle_between_vectors_deg(tag_z_axis, (0.0, 0.0, -1.0))
-    max_tilt = float(self.max_tilt_deg.value())
-    if tilt_deg > max_tilt:
-      message = f"Tag tilt {tilt_deg:.1f} deg exceeds max {max_tilt:.1f} deg."
-      if log_rejections:
-        self.log(f"[visibility] {message}")
-      return False, message
-
-    return True, f"distance={distance_mm:.1f} mm, tilt={tilt_deg:.1f} deg"
+    detail = f"all 4 markers visible, tf_age={max(0.0, age_sec):.3f}s"
+    if mode == CALIB_MODE_EYE_TO_HAND:
+      detail += "; distance/tilt gates ignored in manual eye-to-hand"
+    return True, detail
 
   def _dispatch_next_auto_move(self):
     if self.auto_goal_index >= len(self.generated_goals):
@@ -1692,10 +1733,11 @@ class CalibGui(QtWidgets.QWidget):
     if self.auto_state == "settling":
       if time.monotonic() < self.auto_settle_deadline:
         return
-      if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
-        visible, visibility_detail = self._check_eye_to_hand_visibility_gate(log_rejections=True)
-        if not visible:
-          goal_no = self.auto_goal_index + 1
+      mode = self._current_calibration_mode()
+      visible, visibility_detail = self._check_tag_visibility_gate(log_rejections=True)
+      if not visible:
+        goal_no = self.auto_goal_index + 1
+        if mode == CALIB_MODE_EYE_TO_HAND:
           self.log(
             f"[auto] Skip goal {goal_no}/{len(self.generated_goals)}: "
             "tag visibility gate failed."
@@ -1704,7 +1746,21 @@ class CalibGui(QtWidgets.QWidget):
           self.auto_capture_retry = 0
           self.auto_state = "dispatch_move"
           return
-        self.log(f"[visibility] OK: {visibility_detail}")
+        if self.auto_capture_retry < 3:
+          self.auto_capture_retry += 1
+          self.log(
+            f"[auto] Waiting at goal {goal_no}/{len(self.generated_goals)}: "
+            f"{visibility_detail}"
+          )
+          self.auto_settle_deadline = time.monotonic() + 1.0
+          self.auto_state = "settling"
+          return
+        self._finish_automation(
+          False,
+          f"Sample capture blocked at goal {goal_no}: {visibility_detail}",
+        )
+        return
+      self.log(f"[visibility] OK: {visibility_detail}")
       self.auto_capture_retry += 1
       self.auto_state = "waiting_capture"
       dispatched = self._call_trigger_async("add_sample", self._on_add_sample_done)
@@ -1788,6 +1844,106 @@ class CalibGui(QtWidgets.QWidget):
     self._set_controls_during_auto(False)
     self.stop_btn.setEnabled(self.calib_process is not None)
 
+  @staticmethod
+  def _parse_sample_total(message):
+    match = re.search(r"Total:\s*(\d+)", str(message or ""))
+    if match is None:
+      return None
+    try:
+      return int(match.group(1))
+    except ValueError:
+      return None
+
+  def handle_add_button_clicked(self):
+    if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
+      self.get_manual_eye_to_hand_sample()
+      return
+    self.generate_goal_poses()
+
+  def get_manual_eye_to_hand_sample(self):
+    self._persist_all_ui_settings(log_changes=False)
+    self.ros_if.apply_calibration_mode_tool(CALIB_MODE_EYE_TO_HAND)
+    if self.auto_running:
+      self.log("Cannot manually capture while auto calibration is running.")
+      return
+    if self.manual_capture_in_flight or self.manual_compute_in_flight:
+      self.log("Manual capture/compute is already in progress.")
+      return
+
+    visible, visibility_detail = self._check_tag_visibility_gate(log_rejections=True)
+    if not visible:
+      self.log("Sample not added: visibility gate failed.")
+      return
+
+    if self.calib_process is None:
+      self.manual_sample_count = 0
+      self._set_save_yaml_ready(False)
+      if not self.start_calibrator():
+        return
+
+    self._set_save_yaml_ready(False)
+    self.manual_capture_in_flight = True
+    self.add_btn.setEnabled(False)
+    self.log(f"[manual] Capturing sample {self.manual_sample_count + 1}: {visibility_detail}")
+    dispatched = self._call_trigger_async("add_sample", self._on_manual_add_sample_done)
+    if not dispatched:
+      self.manual_capture_in_flight = False
+      self.add_btn.setEnabled(True)
+      self.log("Failed to call add_sample for manual capture.")
+
+  def _on_manual_add_sample_done(self, success, message):
+    self.manual_capture_in_flight = False
+    prefix = "OK" if success else "ERROR"
+    self.log(f"[add_sample] {prefix}: {message}")
+    if not success:
+      self._update_mode_dependent_ui()
+      return
+
+    parsed_total = self._parse_sample_total(message)
+    if parsed_total is not None:
+      self.manual_sample_count = parsed_total
+    else:
+      self.manual_sample_count += 1
+
+    required = int(self.min_samples.value())
+    if self.manual_sample_count < required:
+      remaining = required - self.manual_sample_count
+      self.log(
+        f"[manual] {self.manual_sample_count}/{required} samples collected. "
+        f"Need {remaining} more before computing."
+      )
+      self._update_mode_dependent_ui()
+      return
+
+    self.log(
+      f"[manual] {self.manual_sample_count}/{required} samples collected. "
+      "Computing updated calibration TF..."
+    )
+    self.manual_compute_in_flight = True
+    self.add_btn.setEnabled(False)
+    dispatched = self._call_trigger_async("compute_calibration", self._on_manual_compute_done)
+    if not dispatched:
+      self.manual_compute_in_flight = False
+      self._update_mode_dependent_ui()
+      self.log("Failed to call compute_calibration after manual sample.")
+
+  def _on_manual_compute_done(self, success, message):
+    self.manual_compute_in_flight = False
+    prefix = "OK" if success else "ERROR"
+    self.log(f"[compute_calibration] {prefix}: {message}")
+    message_lc = str(message or "").lower()
+    tf_broadcasted = ("broadcasted static tf" in message_lc) and ("calibrated_camera_link" in message_lc)
+    if success and tf_broadcasted:
+      self._set_save_yaml_ready(True)
+      self.log("[manual] Updated calibration TF is live. Add more samples to refine, or Save YAML if satisfied.")
+    elif success:
+      self._set_save_yaml_ready(False)
+      self.log("[ui] Save YAML not highlighted: compute succeeded but TF broadcast was not confirmed.")
+    else:
+      self._set_save_yaml_ready(False)
+      self.log("[manual] Calibration compute failed. Add another sample or inspect TF visibility.")
+    self._update_mode_dependent_ui()
+
   def generate_goal_poses(self):
     self._persist_all_ui_settings(log_changes=False)
     self._set_save_yaml_ready(False)
@@ -1811,6 +1967,12 @@ class CalibGui(QtWidgets.QWidget):
       self.log("Minimum samples must be > 0.")
       return None
 
+    mode = self._current_calibration_mode()
+    eye_to_hand = mode == CALIB_MODE_EYE_TO_HAND
+    if eye_to_hand:
+      self.log("Eye-to-hand is manual. Drag the robot, then click Get Sample.")
+      return None
+
     min_distance_mm = float(self.min_tag_distance_mm.value())
     max_distance_mm = float(self.max_tag_distance_mm.value())
     max_tilt_deg = float(self.max_tilt_deg.value())
@@ -1820,18 +1982,6 @@ class CalibGui(QtWidgets.QWidget):
       self.log("Invalid distance limits: min distance must be smaller than max distance.")
       return None
 
-    mode = self._current_calibration_mode()
-    eye_to_hand = mode == CALIB_MODE_EYE_TO_HAND
-    if eye_to_hand:
-      values = self._parse_tool_offset_values(self.tag_tool_offset.text())
-      if values is None:
-        self.log("Eye-to-hand requires valid tag tool offset: x,y,z,rx,ry,rz")
-        return None
-      success, detail = self.ros_if.apply_tag_tool_offset(values)
-      if not success:
-        self.log(f"[tag_tool] ERROR: {detail}")
-        return None
-      self.log(f"[tag_tool] OK: {detail}")
     parent_frame = self.base_frame.text().strip() or "base_link"
     if parent_frame != "base_link":
       self.log(
@@ -1841,25 +1991,23 @@ class CalibGui(QtWidgets.QWidget):
     target_frame = self.target_frame.text().strip() or "tag_frame"
     tag_pose = None
     gripper_to_camera_pose = identity_transform_pose_mm()
-    if not eye_to_hand:
-      tag_pose = self.ros_if.lookup_pose_mm(parent_frame, target_frame)
-      if tag_pose is None:
-        self.log(
-          f"Cannot resolve TF '{parent_frame}' -> '{target_frame}'. "
-          "Need a valid tag transform before generating look-at poses."
-        )
-        return None
-      gripper_to_camera_pose = self._lookup_gripper_to_camera_pose()
-      if gripper_to_camera_pose is None:
-        return None
-    else:
-      visible, visibility_message = self._check_eye_to_hand_visibility_gate(log_rejections=False)
-      if not visible:
-        self.log(
-          "Eye-to-hand needs a visible tag before pose generation. "
-          f"Current visibility check failed: {visibility_message}"
-        )
-        return None
+    visible, visibility_message = self._check_tag_visibility_gate(log_rejections=False)
+    if not visible:
+      self.log(
+        "Eye-on-hand needs all 4 markers visible before pose generation. "
+        f"Current visibility check failed: {visibility_message}"
+      )
+      return None
+    tag_pose = self.ros_if.lookup_pose_mm(parent_frame, target_frame)
+    if tag_pose is None:
+      self.log(
+        f"Cannot resolve TF '{parent_frame}' -> '{target_frame}'. "
+        "Need a valid tag transform before generating look-at poses."
+      )
+      return None
+    gripper_to_camera_pose = self._lookup_gripper_to_camera_pose()
+    if gripper_to_camera_pose is None:
+      return None
 
     ik_ready = self.ros_if.ensure_ik_ready(timeout_sec=0.25)
     if not ik_ready:
@@ -1873,16 +2021,10 @@ class CalibGui(QtWidgets.QWidget):
     skipped_by_height = 0
 
     goals = []
-    if eye_to_hand:
-      self.log(
-        f"IK pre-check enabled (eye-to-hand): generating {sample_count} local sweep poses, "
-        "then refilling only failed/missing poses."
-      )
-    else:
-      self.log(
-        f"IK pre-check enabled: generating {sample_count} poses first, "
-        "then refilling only failed/missing poses."
-      )
+    self.log(
+      f"IK pre-check enabled: generating {sample_count} poses first, "
+      "then refilling only failed/missing poses."
+    )
     seen_goal_keys = set()
     max_refill_rounds = 8
 
@@ -1892,37 +2034,25 @@ class CalibGui(QtWidgets.QWidget):
         break
 
       ik_rounds_used = round_idx + 1
-      if eye_to_hand:
-        batch, skip_h = build_eye_to_hand_goal_pose_sequence(
-          seed_pose,
-          missing,
-          min_base_z_mm,
-          sequence_offset=round_idx * 409,
-        )
-        skipped_by_height += skip_h
-      else:
-        batch, skip_d, skip_t, skip_h = build_goal_pose_sequence(
-          seed_pose,
-          tag_pose,
-          gripper_to_camera_pose,
-          missing,
-          min_distance_mm,
-          max_distance_mm,
-          max_tilt_deg,
-          look_up_bias_deg,
-          min_base_z_mm,
-          sequence_offset=round_idx * 409,
-        )
-        skipped_by_distance += skip_d
-        skipped_by_tilt += skip_t
-        skipped_by_height += skip_h
+      batch, skip_d, skip_t, skip_h = build_goal_pose_sequence(
+        seed_pose,
+        tag_pose,
+        gripper_to_camera_pose,
+        missing,
+        min_distance_mm,
+        max_distance_mm,
+        max_tilt_deg,
+        look_up_bias_deg,
+        min_base_z_mm,
+        sequence_offset=round_idx * 409,
+      )
+      skipped_by_distance += skip_d
+      skipped_by_tilt += skip_t
+      skipped_by_height += skip_h
 
       if not batch:
         if round_idx == 0:
-          if eye_to_hand:
-            self.log("Failed to generate eye-to-hand sweep poses from current TCP.")
-          else:
-            self.log("Failed to generate poses: invalid seed/tag geometry.")
+          self.log("Failed to generate poses: invalid seed/tag geometry.")
           return None
         self.log(f"No additional candidates available in refill round {ik_rounds_used}.")
         break
@@ -1965,37 +2095,22 @@ class CalibGui(QtWidgets.QWidget):
       return None
 
     if log_preview:
-      if eye_to_hand:
-        self.log(
-          f"Generated {len(goals)} eye-to-hand goal pose frame(s) under parent '{parent_frame}'. "
-          "Visibility is checked at capture time before each sample."
-        )
-      else:
-        self.log(
-          f"Generated {len(goals)} camera-centered goal pose frame(s) under parent '{parent_frame}'. "
-          f"The camera frame is aimed at '{target_frame}' for each pose."
-        )
+      self.log(
+        f"Generated {len(goals)} camera-centered goal pose frame(s) under parent '{parent_frame}'. "
+        f"The camera frame is aimed at '{target_frame}' for each pose."
+      )
       if len(goals) < sample_count:
-        if eye_to_hand:
-          self.log(
-            f"Requested {sample_count}, but only {len(goals)} satisfied safety limits "
-            f"(local sweep + min z {min_base_z_mm:.0f} mm)."
-          )
-        else:
-          self.log(
-            f"Requested {sample_count}, but only {len(goals)} satisfied safety limits "
-            f"(min/max distance {min_distance_mm:.0f}/{max_distance_mm:.0f} mm, "
-            f"max tilt {max_tilt_deg:.1f} deg, look up {look_up_bias_deg:.1f} deg, "
-            f"min z {min_base_z_mm:.0f} mm)."
-          )
+        self.log(
+          f"Requested {sample_count}, but only {len(goals)} satisfied safety limits "
+          f"(min/max distance {min_distance_mm:.0f}/{max_distance_mm:.0f} mm, "
+          f"max tilt {max_tilt_deg:.1f} deg, look up {look_up_bias_deg:.1f} deg, "
+          f"min z {min_base_z_mm:.0f} mm)."
+        )
       if ik_rejected:
         self.log(f"IK pre-check rejected {ik_rejected} pose(s) out of {ik_checked}.")
       if ik_rounds_used:
         self.log(f"IK refill rounds used: {ik_rounds_used}.")
-      if eye_to_hand:
-        if skipped_by_height:
-          self.log(f"Filtered out candidates: low_z={skipped_by_height}.")
-      elif skipped_by_distance or skipped_by_tilt or skipped_by_height:
+      if skipped_by_distance or skipped_by_tilt or skipped_by_height:
         self.log(
           f"Filtered out candidates: distance={skipped_by_distance}, "
           f"tilt={skipped_by_tilt}, low_z={skipped_by_height}."
@@ -2053,16 +2168,6 @@ class CalibGui(QtWidgets.QWidget):
     future = client.call_async(Trigger.Request())
     future.add_done_callback(done_callback)
 
-  def apply_tag_tool_offset(self):
-    self._persist_all_ui_settings(log_changes=False)
-    values = self._parse_tool_offset_values(self.tag_tool_offset.text())
-    if values is None:
-      self.log("Invalid tag tool offset. Expected six comma-separated values: x,y,z,rx,ry,rz")
-      return
-    success, detail = self.ros_if.apply_tag_tool_offset(values)
-    prefix = "OK" if success else "ERROR"
-    self.log(f"[tag_tool] {prefix}: {detail}")
-
   def save_yaml(self):
     self._persist_all_ui_settings(log_changes=False)
     self._call_trigger("save_calibration")
@@ -2089,6 +2194,39 @@ class RosInterface(Node):
     self._default_calibration_mode = normalize_calibration_mode(
       self.declare_parameter("calibration_mode", CALIB_MODE_EYE_ON_HAND).value
     )
+    self._default_camera_prefix = normalize_camera_prefix(
+      self.declare_parameter(
+        "camera_prefix",
+        default_camera_prefix_for_mode(self._default_calibration_mode),
+      ).value,
+      self._default_calibration_mode,
+    )
+    self._default_camera_frame = normalize_camera_frame(
+      self.declare_parameter(
+        "camera_frame",
+        default_camera_frame_for_mode(self._default_calibration_mode, self._default_camera_prefix),
+      ).value,
+      self._default_calibration_mode,
+      self._default_camera_prefix,
+    )
+    self._color_topic = str(
+      self.declare_parameter(
+        "color_topic",
+        f"/{self._default_camera_prefix}/color/image_raw",
+      ).value
+    )
+    self._depth_topic = str(
+      self.declare_parameter(
+        "depth_topic",
+        f"/{self._default_camera_prefix}/depth/image_raw",
+      ).value
+    )
+    self._camera_info_topic = str(
+      self.declare_parameter(
+        "camera_info_topic",
+        f"/{self._default_camera_prefix}/color/camera_info",
+      ).value
+    )
     self._auto_move_speed_l = int(self.declare_parameter("auto_move_speed_l", 35).value)
     self._auto_move_acc_l = int(self.declare_parameter("auto_move_acc_l", 35).value)
     self._ik_user = str(self.declare_parameter("ik_user", "0").value)
@@ -2102,8 +2240,14 @@ class RosInterface(Node):
     self._movj_client = self.create_client(MovJ, f"{self._motion_service_root}/MovJ")
     self._stop_motion_client = self.create_client(Stop, f"{self._motion_service_root}/Stop")
     self._ik_client = self.create_client(InverseKin, f"{self._motion_service_root}/InverseKin")
-    self._tool_client = self.create_client(Tool, f"{self._motion_service_root}/Tool")
-    self._set_tool_client = self.create_client(SetTool, f"{self._motion_service_root}/SetTool")
+    self._aruco_set_parameters_client = self.create_client(
+      SetParameters,
+      "/aruco_perception/set_parameters",
+    )
+    self._calibration_perception_set_parameters_client = self.create_client(
+      SetParameters,
+      "/calibration_perception/set_parameters",
+    )
     self.apply_calibration_mode_tool(self._default_calibration_mode)
 
     self.create_subscription(
@@ -2132,6 +2276,90 @@ class RosInterface(Node):
   def get_default_calibration_mode(self):
     return self._default_calibration_mode
 
+  def get_default_camera_prefix(self):
+    return self._default_camera_prefix
+
+  def get_default_camera_frame(self):
+    return self._default_camera_frame
+
+  def get_camera_topics(self):
+    return self._color_topic, self._depth_topic, self._camera_info_topic
+
+  def _call_set_parameters(self, client, parameters, unavailable_message, timeout_sec=1.5):
+    if not client.wait_for_service(timeout_sec=timeout_sec):
+      return False, unavailable_message
+
+    req = SetParameters.Request()
+    req.parameters = [
+      Parameter(name, Parameter.Type.STRING, value).to_parameter_msg()
+      for name, value in parameters
+    ]
+    future = client.call_async(req)
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while rclpy.ok() and (not future.done()) and time.monotonic() < deadline:
+      rclpy.spin_once(self, timeout_sec=0.01)
+    if not future.done():
+      return False, "Timed out updating parameters."
+
+    try:
+      res = future.result()
+    except Exception as exc:
+      return False, f"SetParameters call failed: {exc}"
+
+    failures = [result.reason for result in res.results if not result.successful]
+    if failures:
+      return False, "; ".join(reason or "parameter rejected" for reason in failures)
+    return True, "parameters updated"
+
+  def set_aruco_camera_prefix(self, prefix, timeout_sec=1.5):
+    normalized = normalize_camera_prefix(prefix, self._default_calibration_mode)
+    color_topic, depth_topic, camera_info_topic = camera_topics_for_prefix(normalized)
+    success, detail = self._call_set_parameters(
+      self._aruco_set_parameters_client,
+      [
+        ("color_topic", color_topic),
+        ("depth_topic", depth_topic),
+        ("camera_info_topic", camera_info_topic),
+      ],
+      "Service unavailable: /aruco_perception/set_parameters. "
+      f"Launch will use camera_prefix:={normalized} on restart.",
+      timeout_sec=timeout_sec,
+    )
+    if not success:
+      return False, detail
+
+    self._default_camera_prefix = normalized
+    self._color_topic = color_topic
+    self._depth_topic = depth_topic
+    self._camera_info_topic = camera_info_topic
+    return (
+      True,
+      f"ArUco stream updated to {normalized}: "
+      f"{color_topic}, {depth_topic}, {camera_info_topic}",
+    )
+
+  def set_calibration_camera_frame(self, camera_frame, timeout_sec=1.5):
+    frame = normalize_camera_frame(camera_frame, self._default_calibration_mode, self._default_camera_prefix)
+    aruco_success, aruco_detail = self._call_set_parameters(
+      self._aruco_set_parameters_client,
+      [("camera_frame", frame)],
+      "Service unavailable: /aruco_perception/set_parameters.",
+      timeout_sec=timeout_sec,
+    )
+    perception_success, perception_detail = self._call_set_parameters(
+      self._calibration_perception_set_parameters_client,
+      [("parent_frame", frame)],
+      "Service unavailable: /calibration_perception/set_parameters.",
+      timeout_sec=timeout_sec,
+    )
+    if aruco_success and perception_success:
+      self._default_camera_frame = frame
+      return True, f"ArUco/tag frame parent updated to {frame}."
+    return (
+      False,
+      f"ArUco: {aruco_detail}; calibration_perception: {perception_detail}",
+    )
+
   def ensure_motion_ready(self, timeout_sec=0.5):
     return self._movj_client.wait_for_service(timeout_sec=timeout_sec)
 
@@ -2141,62 +2369,13 @@ class RosInterface(Node):
   def clear_ik_joint_cache(self):
     self._ik_joint_solution_cache.clear()
 
-  def set_active_ik_tool(self, tool_value):
-    self._active_ik_tool = str(tool_value)
-
-  def apply_calibration_mode_tool(self, calibration_mode):
-    mode = normalize_calibration_mode(calibration_mode)
-    if mode == CALIB_MODE_EYE_TO_HAND:
-      self._active_ik_tool = "1"
-      return
+  def apply_calibration_mode_tool(self, _calibration_mode):
     self._active_ik_tool = str(self._ik_tool)
 
   @staticmethod
   def _is_nonzero_tool_value(tool_value):
     text = str(tool_value or "").strip().lower()
     return text not in ("", "0", "false", "off", "no")
-
-  def apply_tag_tool_offset(self, values):
-    if values is None or len(values) != 6:
-      return False, "Expected six tool offset values."
-    if not self._set_tool_client.wait_for_service(timeout_sec=0.5):
-      return False, f"Service unavailable: {self._motion_service_root}/SetTool"
-    if not self._tool_client.wait_for_service(timeout_sec=0.5):
-      return False, f"Service unavailable: {self._motion_service_root}/Tool"
-
-    set_req = SetTool.Request()
-    set_req.index = 1
-    set_req.value = "{" + ",".join(f"{float(v):.3f}" for v in values) + "}"
-    set_future = self._set_tool_client.call_async(set_req)
-    deadline = time.monotonic() + 2.0
-    while rclpy.ok() and (not set_future.done()) and time.monotonic() < deadline:
-      rclpy.spin_once(self, timeout_sec=0.01)
-    if not set_future.done():
-      return False, "SetTool timeout."
-    try:
-      set_res = set_future.result()
-    except Exception as exc:
-      return False, f"SetTool call failed: {exc}"
-    if int(getattr(set_res, "res", -1)) != 0:
-      return False, f"SetTool rejected (res={set_res.res})."
-
-    tool_req = Tool.Request()
-    tool_req.index = 1
-    tool_future = self._tool_client.call_async(tool_req)
-    deadline = time.monotonic() + 2.0
-    while rclpy.ok() and (not tool_future.done()) and time.monotonic() < deadline:
-      rclpy.spin_once(self, timeout_sec=0.01)
-    if not tool_future.done():
-      return False, "Tool activation timeout."
-    try:
-      tool_res = tool_future.result()
-    except Exception as exc:
-      return False, f"Tool activation failed: {exc}"
-    if int(getattr(tool_res, "res", -1)) != 0:
-      return False, f"Tool activation rejected (res={tool_res.res})."
-
-    self._active_ik_tool = "1"
-    return True, "Tool 1 offset applied and activated."
 
   def get_cached_ik_joint_solution(self, goal_pose):
     return self._ik_joint_solution_cache.get(goal_pose_key(goal_pose))
@@ -2341,6 +2520,12 @@ class RosInterface(Node):
       return None
 
   def lookup_pose_mm(self, parent_frame, child_frame, timeout_sec=0.15):
+    pose = self.lookup_pose_mm_with_age(parent_frame, child_frame, timeout_sec)
+    if pose is None:
+      return None
+    return pose[:7]
+
+  def lookup_pose_mm_with_age(self, parent_frame, child_frame, timeout_sec=0.15):
     timeout_ns = int(max(0.01, float(timeout_sec)) * 1e9)
     try:
       tf_msg = self._tf_buffer.lookup_transform(
@@ -2349,6 +2534,10 @@ class RosInterface(Node):
         Time(),
         timeout=Duration(nanoseconds=timeout_ns),
       )
+      stamp = Time.from_msg(tf_msg.header.stamp)
+      age_sec = float("inf")
+      if stamp.nanoseconds != 0:
+        age_sec = (self.get_clock().now() - stamp).nanoseconds / 1e9
       return (
         float(tf_msg.transform.translation.x) * 1000.0,
         float(tf_msg.transform.translation.y) * 1000.0,
@@ -2357,6 +2546,7 @@ class RosInterface(Node):
         float(tf_msg.transform.rotation.y),
         float(tf_msg.transform.rotation.z),
         float(tf_msg.transform.rotation.w),
+        float(age_sec),
       )
     except TransformException as exc:
       self.get_logger().warn(

@@ -107,6 +107,52 @@ constexpr int kTeachFixedOutlierSensitivity = 50;
 constexpr bool kTeachFixedDetectBlackToWhite = true;
 constexpr bool kTeachFixedTraceOutToIn = false;
 
+bool isOpenCvWindowClosed(const std::string &window_name)
+{
+  static bool window_was_visible = false;
+  static const auto first_check_time = std::chrono::steady_clock::now();
+
+  double visible = -1.0;
+  try
+  {
+    visible = cv::getWindowProperty(window_name, cv::WND_PROP_VISIBLE);
+  }
+  catch (const cv::Exception &)
+  {
+    return window_was_visible;
+  }
+
+  if (visible >= 1.0)
+  {
+    window_was_visible = true;
+    return false;
+  }
+
+  const double age_sec = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - first_check_time).count();
+
+  // Some OpenCV HighGUI backends briefly report WND_PROP_VISIBLE == 0 while
+  // the window is still being mapped. Do not treat that startup state as a
+  // user close. Once the window was visible, visible < 1 means it was closed.
+  if (!window_was_visible && age_sec < 2.0)
+  {
+    return false;
+  }
+
+  return window_was_visible && visible < 1.0;
+}
+
+void destroyOpenCvWindowQuietly(const std::string &window_name)
+{
+  try
+  {
+    cv::destroyWindow(window_name);
+  }
+  catch (const cv::Exception &)
+  {
+  }
+}
+
 double remapOutlierSensitivityToFitRange(int outlier_sensitivity)
 {
   const int clamped = std::clamp(outlier_sensitivity, 1, 100);
@@ -317,7 +363,7 @@ std::string makeFilenameSafeItemName(const std::string &item_name)
     safe_name.pop_back();
   }
 
-  return safe_name.empty() ? "item" : safe_name;
+  return safe_name;
 }
 
 std::string normalizeDetectionModeToken(const std::string &mode_text)
@@ -5507,23 +5553,14 @@ public:
 	    depth_exposure_us_ = 0;
 	    use_calibration_ = declare_parameter<bool>("use_calibration", true);
     publish_static_calibration_tf_ = declare_parameter<bool>("publish_static_calibration_tf", true);
-    calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "Link6");
-    const std::string requested_calibration_child_frame =
-      declare_parameter<std::string>("calibration_child_frame", "calibrated_camera_link");
-    calibration_child_frame_ = "calibrated_camera_link";
-    if (requested_calibration_child_frame != calibration_child_frame_)
-    {
-      RCLCPP_WARN(
-        get_logger(),
-        "calibration_child_frame is fixed to %s for item_teach. Ignoring requested value '%s'.",
-        calibration_child_frame_.c_str(),
-        requested_calibration_child_frame.c_str());
-    }
+    calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "base_link");
+    calibration_child_frame_ = declare_parameter<std::string>(
+      "calibration_child_frame", "bin_calibrated_link");
     calibration_dir_ = declare_parameter<std::string>("calibration_dir", defaultCalibrationDir());
     calibration_file_ = declare_parameter<std::string>("calibration_file", "");
     auto_discover_calibration_ = declare_parameter<bool>("auto_discover_calibration", true);
     const std::string requested_item_tf_parent_frame =
-      declare_parameter<std::string>("item_tf_parent_frame", "calibrated_camera_link");
+      declare_parameter<std::string>("item_tf_parent_frame", calibration_child_frame_);
     item_tf_parent_frame_ = calibration_child_frame_;
     if (requested_item_tf_parent_frame != item_tf_parent_frame_)
     {
@@ -5671,7 +5708,7 @@ public:
   ~ItemTeachNode() override
   {
     saveRuntimeSettingsToFile(true);
-    cv::destroyWindow(kWindowName);
+    destroyOpenCvWindowQuietly(kWindowName);
   }
 
 private:
@@ -5712,6 +5749,7 @@ private:
     std::string label;
     std::string path;
     std::string bin_name;
+    std::string teach_date;
     int image_width {0};
     int image_height {0};
     std::vector<cv::Point2f> roi_points;
@@ -5815,14 +5853,46 @@ private:
       {kAdaptiveDepthTrimFactorTrackbar, cv::Rect(track_x, y, track_w, track_h), &adaptive_depth_trim_max_factor_tenths_, kAdaptiveDepthTrimFactorMinTenths, kAdaptiveDepthTrimFactorMaxTenths}); y += gap;
     sliders_.push_back(
       {kAdaptiveDepthTrimHeightTrackbar, cv::Rect(track_x, y, track_w, track_h), &adaptive_depth_trim_max_height_mm_, kAdaptiveDepthTrimHeightMinMm, kAdaptiveDepthTrimHeightMaxMm}); y += gap;
-    sliders_.push_back(
-      {kBlobToleranceTrackbar, cv::Rect(track_x, y, track_w, track_h), &blob_tolerance_percent_, kBlobToleranceMinPercent, kBlobToleranceMaxPercent});
-    layoutSlidersForCurrentStage();
+	    sliders_.push_back(
+	      {kBlobToleranceTrackbar, cv::Rect(track_x, y, track_w, track_h), &blob_tolerance_percent_, kBlobToleranceMinPercent, kBlobToleranceMaxPercent});
+	    layoutSlidersForCurrentStage();
+	  }
+
+  void processWindowEvents(int key)
+  {
+    handleKeypress(key);
+    if (isOpenCvWindowClosed(kWindowName))
+    {
+      requestShutdownFromWindowClose();
+    }
   }
 
-  void advanceViewMode()
+  void requestShutdownFromWindowClose()
   {
-    switch (view_mode_)
+    if (window_close_requested_)
+    {
+      return;
+    }
+    window_close_requested_ = true;
+    RCLCPP_INFO(get_logger(), "item_teach window closed; shutting down.");
+    saveRuntimeSettingsToFile(true);
+    if (render_timer_)
+    {
+      render_timer_->cancel();
+    }
+    if (camera_exposure_timer_)
+    {
+      camera_exposure_timer_->cancel();
+    }
+    if (rclcpp::ok())
+    {
+      rclcpp::shutdown();
+    }
+  }
+
+	  void advanceViewMode()
+	  {
+	    switch (view_mode_)
     {
       case ViewMode::kBinarized:
         view_mode_ = ViewMode::kRgb;
@@ -5905,6 +5975,7 @@ private:
       case TeachStage::kPosePerception:
       default:
         return
+          hasValidItemName() &&
           hasValidRoiPoints(roi_points_) &&
           hasDepthPlaneReference() &&
           filledPoseReferenceSlotCount() > 0;
@@ -6494,14 +6565,24 @@ private:
       entry.bin_name.clear();
     }
 
-    const std::string file_label = path.stem().string();
-    if (!entry.bin_name.empty() && entry.bin_name != file_label)
+    try
     {
-      entry.label = entry.bin_name + "/" + file_label;
+      entry.teach_date = bin["teach_date"] ? bin["teach_date"].as<std::string>() : "";
     }
-    else
+    catch (const std::exception &)
     {
-      entry.label = file_label;
+      entry.teach_date.clear();
+    }
+
+    const std::string file_label = path.stem().string();
+    entry.label = entry.bin_name.empty() ? file_label : entry.bin_name;
+    if (!entry.teach_date.empty())
+    {
+      entry.label += " | " + entry.teach_date;
+    }
+    else if (!entry.bin_name.empty() && entry.bin_name != file_label)
+    {
+      entry.label += " | " + file_label;
     }
 
     const YAML::Node image = bin["image"];
@@ -7219,7 +7300,7 @@ private:
           continue;
         }
         const std::string filename = p.filename().string();
-        if (filename.rfind("axab_calibration_eyeonhand_", 0) != 0)
+        if (filename.rfind("axab_calibration_eyetohand_", 0) != 0)
         {
           continue;
         }
@@ -7917,6 +7998,29 @@ private:
     return selected_pose;
   }
 
+  static std::optional<YAML::Node> loadEmbeddedToolTeachNode(const std::filesystem::path &profile_path)
+  {
+    std::error_code fs_error;
+    if (profile_path.empty() || !std::filesystem::exists(profile_path, fs_error))
+    {
+      return std::nullopt;
+    }
+    try
+    {
+      const YAML::Node root = YAML::LoadFile(profile_path.string());
+      const YAML::Node tool_teach = root["tool_teach"];
+      if (tool_teach && tool_teach.IsMap())
+      {
+        return YAML::Clone(tool_teach);
+      }
+    }
+    catch (const std::exception &)
+    {
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
   void saveSettingsToFile()
   {
     persistActivePoseReferenceSlot();
@@ -7961,8 +8065,27 @@ private:
     }
 
     const std::string item_name = sanitizeItemName();
+    if (item_name.empty())
+    {
+      save_status_message_ = "Enter item name";
+      save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
+      return;
+    }
+    if (makeFilenameSafeItemName(item_name).empty())
+    {
+      save_status_message_ = "Item name needs letters or numbers";
+      save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
+      return;
+    }
     const DateStamp date_stamp = currentDateStamp();
     depth_exposure_us_ = 0;
+    const std::filesystem::path dated_profile_path =
+      std::filesystem::path(profiles_dir_) /
+      ("item_" + makeFilenameSafeItemName(item_name) +
+       (active_bin_name_.empty() ? "" : "_bin_" + makeFilenameSafeItemName(active_bin_name_)) +
+       "_" + date_stamp.compact_date + ".yaml");
+    const std::optional<YAML::Node> preserved_tool_teach =
+      loadEmbeddedToolTeachNode(dated_profile_path);
 
     YAML::Emitter out;
     out << YAML::BeginMap;
@@ -8132,6 +8255,10 @@ private:
     }
     out << YAML::EndMap;
     out << YAML::EndMap;
+    if (preserved_tool_teach.has_value())
+    {
+      out << YAML::Key << "tool_teach" << YAML::Value << *preserved_tool_teach;
+    }
     out << YAML::EndMap;
 
     std::error_code fs_error;
@@ -8142,12 +8269,6 @@ private:
       save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
       return;
     }
-
-    const std::filesystem::path dated_profile_path =
-      std::filesystem::path(profiles_dir_) /
-      ("item_" + makeFilenameSafeItemName(item_name) +
-       (active_bin_name_.empty() ? "" : "_bin_" + makeFilenameSafeItemName(active_bin_name_)) +
-       "_" + date_stamp.compact_date + ".yaml");
 
     std::ofstream dated_file(dated_profile_path);
     if (!dated_file.is_open())
@@ -8591,7 +8712,13 @@ private:
     {
       trimmed.pop_back();
     }
-    return trimmed.empty() ? "item" : trimmed;
+    return trimmed;
+  }
+
+  bool hasValidItemName() const
+  {
+    const std::string item_name = sanitizeItemName();
+    return !item_name.empty() && !makeFilenameSafeItemName(item_name).empty();
   }
 
   std::string buttonDisplayText(const UiButton &button) const
@@ -8832,13 +8959,16 @@ private:
       name_edit_active_ ? cv::Scalar(134, 205, 236) : cv::Scalar(91, 98, 108),
       2);
     const std::string item_name_text = sanitizeItemName();
+    const bool show_name_placeholder = item_name_text.empty() && !name_edit_active_;
+    const std::string item_name_display_text =
+      show_name_placeholder ? "Enter item name" : item_name_text;
     cv::putText(
       panel,
-      fit_text(item_name_text, name_box_rect_.width - 20, 0.60, 1),
+      fit_text(item_name_display_text, name_box_rect_.width - 20, 0.60, 1),
       cv::Point(name_box_rect_.x + 10, name_box_rect_.y + 27),
       cv::FONT_HERSHEY_DUPLEX,
       0.60,
-      cv::Scalar(240, 242, 246),
+      show_name_placeholder ? cv::Scalar(150, 156, 164) : cv::Scalar(240, 242, 246),
       1,
       cv::LINE_AA);
     if (name_edit_active_)
@@ -9334,7 +9464,7 @@ private:
       rendered_window_size_ = window_size;
     }
     cv::imshow(kWindowName, combined);
-    handleKeypress(cv::waitKey(1));
+    processWindowEvents(cv::waitKey(1));
     saveRuntimeSettingsToFile(false);
 
     if (publish_overlay_)
@@ -9926,7 +10056,7 @@ private:
       rendered_window_size_ = window_size;
     }
     cv::imshow(kWindowName, combined);
-    handleKeypress(cv::waitKey(1));
+    processWindowEvents(cv::waitKey(1));
     saveRuntimeSettingsToFile(false);
     publishItemPoses(current_header, depth_for_pose_m, current_camera_info, pose_estimate_);
 
@@ -10074,7 +10204,7 @@ private:
 	  std::string camera_control_service_root_ {"/robot_camera"};
 	  std::string latest_saved_profile_path_;
   std::string save_status_message_ {"Saved"};
-  std::string item_name_ {"item"};
+  std::string item_name_;
   rclcpp::Time save_status_deadline_ {0, 0, RCL_ROS_TIME};
   bool use_calibration_ {true};
   bool publish_static_calibration_tf_ {true};
@@ -10111,10 +10241,11 @@ private:
   bool focus_black_mask_ {false};
   bool detection_use_depth_ {false};
   bool freeze_latched_ {false};
-	  bool name_edit_active_ {false};
-	  bool runtime_settings_dirty_ {false};
-	  bool camera_exposure_dirty_ {true};
-	  rclcpp::Time last_runtime_settings_save_time_ {0, 0, RCL_ROS_TIME};
+		  bool name_edit_active_ {false};
+		  bool runtime_settings_dirty_ {false};
+		  bool camera_exposure_dirty_ {true};
+		  bool window_close_requested_ {false};
+		  rclcpp::Time last_runtime_settings_save_time_ {0, 0, RCL_ROS_TIME};
 	  rclcpp::Time last_camera_exposure_attempt_time_ {0, 0, RCL_ROS_TIME};
 	  int last_applied_color_exposure_us_ {-1};
 	  int last_applied_depth_exposure_us_ {-1};

@@ -75,26 +75,7 @@ ament_target_dependencies(item_detect
 )
 target_link_libraries(item_detect yaml-cpp ${OpenCV_LIBS})
 
-add_executable(item_detect_eyetohand src/item_detect_eyetohand_node.cpp)
-target_include_directories(item_detect_eyetohand PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(item_detect_eyetohand
-  geometry_msgs
-  rclcpp
-  nav_msgs
-  sensor_msgs
-  std_srvs
-  orbbec_camera_msgs
-  visualization_msgs
-  dobot_msgs_v4
-  cv_bridge
-  tf2_ros
-  OpenCV
-)
-target_link_libraries(item_detect_eyetohand yaml-cpp ${OpenCV_LIBS})
-
-install(TARGETS bin_teach item_teach item_detect item_detect_eyetohand
+install(TARGETS bin_teach item_teach item_detect
   DESTINATION lib/${PROJECT_NAME})
 
 

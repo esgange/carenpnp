@@ -13,7 +13,6 @@ def _workspace_root() -> Path:
             (path / 'src').exists() and
             (
                 (path / 'README.md').exists()
-                or (path / 'docker-compose.yml').exists()
                 or (path / 'src' / 'dobot_msgs_v4').exists()
             )
         )

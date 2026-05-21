@@ -15,7 +15,6 @@ def _workspace_root() -> Path:
             (path / "src").exists() and
             (
                 (path / "README.md").exists()
-                or (path / "docker-compose.yml").exists()
                 or (path / "src" / "dobot_msgs_v4").exists()
             )
         )
@@ -197,7 +196,7 @@ def generate_launch_description():
             "output_dir",
             default_value=bin_teach_dir,
         ),
-        DeclareLaunchArgument("bin_name", default_value="bin"),
+        DeclareLaunchArgument("bin_name", default_value=""),
         DeclareLaunchArgument("show_aruco_overlay", default_value="false"),
         DeclareLaunchArgument("publish_aruco_overlay", default_value="true"),
         DeclareLaunchArgument("aruco_overlay_rate_hz", default_value="10.0"),

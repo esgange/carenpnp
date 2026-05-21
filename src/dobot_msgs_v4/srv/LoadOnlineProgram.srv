@@ -1,0 +1,11 @@
+string qqc_id
+string bin_teach_file
+string item_teach_file
+string tray_teach_file
+float64 tray_x_mm
+float64 tray_y_mm
+float64 tray_rz_deg
+---
+bool success
+string message
+string[] runtime_files

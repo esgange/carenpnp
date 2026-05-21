@@ -35,6 +35,8 @@
 #include <QWidget>
 
 #include <builtin_interfaces/msg/time.hpp>
+#include <aruco_perception/msg/marker_detections.hpp>
+#include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/qos.hpp>
@@ -56,6 +58,7 @@
 namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
+using MarkerDetectionsMsg = aruco_perception::msg::MarkerDetections;
 using TransformStampedMsg = geometry_msgs::msg::TransformStamped;
 
 std::chrono::steady_clock::time_point steadyNow()
@@ -105,7 +108,7 @@ std::string sanitizeName(const std::string &text)
   {
     token.pop_back();
   }
-  return token.empty() ? "robot_platform_1" : token;
+  return token.empty() ? "platform_teach" : token;
 }
 
 std::filesystem::path expandUserPath(const std::string &raw)
@@ -237,6 +240,20 @@ struct BoardLookup
   StabilityStatus stability;
 };
 
+struct MarkerObservation
+{
+  int64_t id {0};
+  geometry_msgs::msg::Pose pose;
+};
+
+struct MarkerDetectionFrame
+{
+  std::string frame_id;
+  builtin_interfaces::msg::Time stamp;
+  std::chrono::steady_clock::time_point received;
+  std::vector<MarkerObservation> markers;
+};
+
 class PlatformTeachNode : public rclcpp::Node
 {
 public:
@@ -247,23 +264,26 @@ public:
     static_broadcaster_(std::make_shared<tf2_ros::StaticTransformBroadcaster>(this)),
     dynamic_broadcaster_(std::make_shared<tf2_ros::TransformBroadcaster>(this))
   {
-    platform_name_ = declare_parameter<std::string>("platform_name", "robot_platform_1");
+    platform_name_ = declare_parameter<std::string>("platform_name", "Platform teach");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
-    camera_frame_ = declare_parameter<std::string>("camera_frame", "calibrated_camera_link");
+    camera_frame_ = declare_parameter<std::string>("camera_frame", "bin_calibrated_link");
     observed_board_frame_ = declare_parameter<std::string>("observed_board_frame", "platform_board_observed");
     marker_prefix_ = declare_parameter<std::string>("marker_prefix", "aruco_marker");
     marker_ids_ = declare_parameter<std::vector<int64_t>>(
       "marker_ids", std::vector<int64_t>{1, 2, 3, 4});
-    color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
+    color_topic_ = declare_parameter<std::string>("color_topic", "/bin_camera/color/image_raw");
     overlay_topic_ = declare_parameter<std::string>("overlay_topic", "/aruco_overlay");
+    detections_topic_ = declare_parameter<std::string>("detections_topic", "/aruco_detections");
     use_aruco_overlay_ = declare_parameter<bool>("use_aruco_overlay", true);
     lookup_timeout_sec_ = declare_parameter<double>("lookup_timeout", 0.15);
+    max_marker_age_sec_ = declare_parameter<double>("max_marker_age_sec", 1.5);
     stability_window_sec_ = declare_parameter<double>("stability_window_sec", 1.0);
     stability_translation_tolerance_m_ = declare_parameter<double>(
       "stability_translation_tolerance_m", 0.001);
     stability_rotation_tolerance_deg_ = declare_parameter<double>(
       "stability_rotation_tolerance_deg", 1.0);
     delete_existing_on_save_ = declare_parameter<bool>("delete_existing_on_save", true);
+    max_marker_age_sec_ = std::max(0.0, max_marker_age_sec_);
     stability_window_sec_ = std::max(0.1, stability_window_sec_);
     stability_translation_tolerance_m_ = std::max(0.0001, stability_translation_tolerance_m_);
     stability_rotation_tolerance_deg_ = std::max(0.1, stability_rotation_tolerance_deg_);
@@ -280,6 +300,10 @@ public:
       overlay_topic_,
       rclcpp::QoS(5),
       [this](const ImageMsg::SharedPtr msg) { overlayCallback(*msg); });
+    detections_sub_ = create_subscription<MarkerDetectionsMsg>(
+      detections_topic_,
+      rclcpp::SensorDataQoS(),
+      [this](const MarkerDetectionsMsg::SharedPtr msg) { detectionsCallback(*msg); });
 
     loadExistingCalibrationIfAvailable();
 
@@ -499,14 +523,17 @@ private:
   std::vector<int64_t> marker_ids_;
   std::string color_topic_;
   std::string overlay_topic_;
+  std::string detections_topic_;
   bool use_aruco_overlay_{true};
   double lookup_timeout_sec_{0.15};
+  double max_marker_age_sec_{1.5};
   double stability_window_sec_{1.0};
   double stability_translation_tolerance_m_{0.001};
   double stability_rotation_tolerance_deg_{1.0};
   bool delete_existing_on_save_{true};
   std::filesystem::path platform_calibration_dir_;
   std::string platform_calibration_file_;
+  std::optional<MarkerDetectionFrame> latest_detection_frame_;
 
   mutable tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -520,6 +547,7 @@ private:
   std::set<std::string> unsupported_image_encodings_;
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr overlay_sub_;
+  rclcpp::Subscription<MarkerDetectionsMsg>::SharedPtr detections_sub_;
   std::deque<BoardPoseSample> board_pose_history_;
   std::optional<rclcpp::Time> last_observed_stamp_;
   std::optional<StabilityStatus> latest_stability_;
@@ -535,6 +563,19 @@ private:
     return tf2::Transform(
       q,
       tf2::Vector3(msg.translation.x, msg.translation.y, msg.translation.z));
+  }
+
+  static tf2::Transform poseToTf2Transform(const geometry_msgs::msg::Pose &msg)
+  {
+    tf2::Quaternion q(msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w);
+    if (q.length2() < 1e-12)
+    {
+      q = tf2::Quaternion(0.0, 0.0, 0.0, 1.0);
+    }
+    q.normalize();
+    return tf2::Transform(
+      q,
+      tf2::Vector3(msg.position.x, msg.position.y, msg.position.z));
   }
 
   void resetStabilityHistory()
@@ -624,6 +665,39 @@ private:
     return *latest_stability_;
   }
 
+  bool isDetectionFrameFresh(const MarkerDetectionFrame &frame) const
+  {
+    if (max_marker_age_sec_ <= 0.0)
+    {
+      return true;
+    }
+    const double age_sec = secondsSince(frame.received);
+    return std::isfinite(age_sec) && age_sec <= max_marker_age_sec_;
+  }
+
+  std::vector<MarkerObservation> selectBoardMarkers(
+    const MarkerDetectionFrame &frame,
+    std::vector<int64_t> &missing_ids) const
+  {
+    std::vector<MarkerObservation> selected;
+    selected.reserve(marker_ids_.size());
+    missing_ids.clear();
+    for (const auto id : marker_ids_)
+    {
+      const auto found = std::find_if(
+        frame.markers.begin(),
+        frame.markers.end(),
+        [id](const MarkerObservation &marker) { return marker.id == id; });
+      if (found == frame.markers.end())
+      {
+        missing_ids.push_back(id);
+        continue;
+      }
+      selected.push_back(*found);
+    }
+    return selected;
+  }
+
   bool lookupObservedBoard(BoardLookup &lookup, std::string &reason)
   {
     if (marker_ids_.empty())
@@ -633,33 +707,37 @@ private:
       return false;
     }
 
-    std::vector<TransformStampedMsg> marker_transforms;
-    marker_transforms.reserve(marker_ids_.size());
-    lookup.missing_marker_ids.clear();
-
-    for (const auto id : marker_ids_)
+    if (!latest_detection_frame_.has_value())
     {
-      const std::string child_frame = marker_prefix_ + "_" + std::to_string(id);
-      try
-      {
-        marker_transforms.push_back(tf_buffer_.lookupTransform(
-          camera_frame_,
-          child_frame,
-          tf2::TimePointZero,
-          tf2::durationFromSec(std::max(0.0, lookup_timeout_sec_))));
-      }
-      catch (const tf2::TransformException &)
-      {
-        lookup.missing_marker_ids.push_back(id);
-      }
+      resetStabilityHistory();
+      lookup.visible_marker_count = 0;
+      lookup.missing_marker_ids = marker_ids_;
+      reason = "No current " + detections_topic_ + " frame yet.";
+      return false;
     }
 
-    lookup.visible_marker_count = static_cast<int>(marker_transforms.size());
-    if (marker_transforms.size() != marker_ids_.size())
+    const MarkerDetectionFrame frame = *latest_detection_frame_;
+    if (!isDetectionFrameFresh(frame))
+    {
+      resetStabilityHistory();
+      lookup.visible_marker_count = 0;
+      lookup.missing_marker_ids = marker_ids_;
+      reason = "Latest " + detections_topic_ + " frame is stale: " +
+        formatDouble(secondsSince(frame.received), 2) + "s > " +
+        formatDouble(max_marker_age_sec_, 1) + "s.";
+      return false;
+    }
+
+    lookup.missing_marker_ids.clear();
+    const std::vector<MarkerObservation> marker_observations =
+      selectBoardMarkers(frame, lookup.missing_marker_ids);
+
+    lookup.visible_marker_count = static_cast<int>(marker_observations.size());
+    if (marker_observations.size() != marker_ids_.size())
     {
       resetStabilityHistory();
       reason =
-        "Waiting for marker TFs in " + camera_frame_ + ": visible " +
+        "Waiting for " + detections_topic_ + " markers in " + frame.frame_id + ": visible " +
         std::to_string(lookup.visible_marker_count) + "/" +
         std::to_string(marker_ids_.size());
       if (!lookup.missing_marker_ids.empty())
@@ -671,18 +749,19 @@ private:
     }
 
     TransformStampedMsg base_to_camera;
+    const std::string source_frame = frame.frame_id.empty() ? camera_frame_ : frame.frame_id;
     try
     {
       base_to_camera = tf_buffer_.lookupTransform(
         base_frame_,
-        camera_frame_,
+        source_frame,
         tf2::TimePointZero,
         tf2::durationFromSec(std::max(0.0, lookup_timeout_sec_)));
     }
     catch (const tf2::TransformException &ex)
     {
       resetStabilityHistory();
-      reason = "Missing TF " + base_frame_ + " -> " + camera_frame_ + ": " + ex.what();
+      reason = "Missing TF " + base_frame_ + " -> " + source_frame + ": " + ex.what();
       return false;
     }
 
@@ -696,12 +775,10 @@ private:
     double sum_qy = 0.0;
     double sum_qz = 0.0;
     double sum_qw = 0.0;
-    builtin_interfaces::msg::Time newest_marker_stamp;
-    int64_t newest_marker_ns = 0;
 
-    for (const auto &marker_tf : marker_transforms)
+    for (const auto &marker : marker_observations)
     {
-      const tf2::Transform camera_T_marker = toTf2Transform(marker_tf.transform);
+      const tf2::Transform camera_T_marker = poseToTf2Transform(marker.pose);
       const tf2::Transform base_T_marker = base_T_camera * camera_T_marker;
       const tf2::Vector3 origin = base_T_marker.getOrigin();
       tf2::Quaternion q = base_T_marker.getRotation();
@@ -727,16 +804,9 @@ private:
       sum_qy += q.y();
       sum_qz += q.z();
       sum_qw += q.w();
-
-      const rclcpp::Time marker_stamp(marker_tf.header.stamp);
-      if (marker_stamp.nanoseconds() > newest_marker_ns)
-      {
-        newest_marker_ns = marker_stamp.nanoseconds();
-        newest_marker_stamp = marker_tf.header.stamp;
-      }
     }
 
-    const double inv_count = 1.0 / static_cast<double>(marker_transforms.size());
+    const double inv_count = 1.0 / static_cast<double>(marker_observations.size());
     tf2::Quaternion avg_q(sum_qx * inv_count, sum_qy * inv_count, sum_qz * inv_count, sum_qw * inv_count);
     if (avg_q.length2() < 1e-12)
     {
@@ -744,9 +814,9 @@ private:
     }
     avg_q.normalize();
 
-    if (newest_marker_ns > 0)
+    if (rclcpp::Time(frame.stamp).nanoseconds() > 0)
     {
-      lookup.transform.header.stamp = newest_marker_stamp;
+      lookup.transform.header.stamp = frame.stamp;
     }
     else
     {
@@ -990,6 +1060,30 @@ private:
       latest_overlay_qimage_ = image;
       latest_overlay_received_monotonic_ = steadyNow();
     }
+  }
+
+  void detectionsCallback(const MarkerDetectionsMsg &msg)
+  {
+    MarkerDetectionFrame frame;
+    frame.frame_id = msg.header.frame_id.empty() ? camera_frame_ : msg.header.frame_id;
+    frame.stamp = msg.image_stamp;
+    if (rclcpp::Time(frame.stamp).nanoseconds() == 0)
+    {
+      frame.stamp = msg.header.stamp;
+    }
+    frame.received = steadyNow();
+
+    const size_t count = std::min(msg.ids.size(), msg.poses.size());
+    frame.markers.reserve(count);
+    for (size_t index = 0; index < count; ++index)
+    {
+      MarkerObservation marker;
+      marker.id = static_cast<int64_t>(msg.ids[index]);
+      marker.pose = msg.poses[index];
+      frame.markers.push_back(marker);
+    }
+
+    latest_detection_frame_ = std::move(frame);
   }
 
   QImage imageMsgToQImage(const ImageMsg &msg, const std::string &source_name)

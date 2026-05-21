@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -20,7 +22,10 @@ CONFIG_PATH = Path('config/camera_bringup/orbbec_cameras.yaml')
 SCAN_TIMEOUT_SEC = 8.0
 CAMERA_COUNT = 2
 AUTO_LAUNCH_DELAY_MS = 600
-LAUNCH_STARTUP_GRACE_MS = 5500
+PROCESS_STOP_TIMEOUT_SEC = 3.0
+PROCESS_TERMINAL_PID_WAIT_SEC = 2.0
+CAMERA_READY_TIMEOUT_SEC = 15.0
+ROS_TOPIC_QUERY_TIMEOUT_SEC = 3.0
 
 DEFAULT_ORBBEC_LAUNCH_ARGS = {
     'device_preset': 'High Accuracy',
@@ -70,6 +75,85 @@ def workspace_path(*parts: str) -> Path:
                 return parent.parent.joinpath(*parts)
 
     return Path.cwd().resolve().joinpath(*parts)
+
+
+def workspace_root() -> Path:
+    return workspace_path()
+
+
+def shell_join(args: list[str]) -> str:
+    return ' '.join(shlex.quote(str(arg)) for arg in args)
+
+
+def ros_sourced_shell_command(cmd: list[str]) -> str:
+    root = shlex.quote(str(workspace_root()))
+    return (
+        'set -e; '
+        f'ROOT="${{DOBOT_PICKN_PLACE_ROOT:-{root}}}"; '
+        'cd "$ROOT"; '
+        'if [ -f /opt/ros/humble/setup.bash ]; then source /opt/ros/humble/setup.bash; fi; '
+        'if [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi; '
+        'if [ -f "$ROOT/third_party/.venv/bin/activate" ]; then source "$ROOT/third_party/.venv/bin/activate"; fi; '
+        f'exec {shell_join(cmd)}'
+    )
+
+
+def visible_terminal_command(title: str, shell_command: str) -> list[str] | None:
+    if shutil.which('gnome-terminal'):
+        return [
+            'gnome-terminal',
+            '--wait',
+            '--title',
+            title,
+            '--',
+            'bash',
+            '-lc',
+            shell_command,
+        ]
+    if shutil.which('xfce4-terminal'):
+        return [
+            'xfce4-terminal',
+            '--disable-server',
+            '--title',
+            title,
+            '--command',
+            f'bash -lc {shlex.quote(shell_command)}',
+        ]
+    if shutil.which('xterm'):
+        return ['xterm', '-T', title, '-e', 'bash', '-lc', shell_command]
+    if shutil.which('konsole'):
+        return [
+            'konsole',
+            '--nofork',
+            '--workdir',
+            str(workspace_root()),
+            '-p',
+            f'tabtitle={title}',
+            '-e',
+            'bash',
+            '-lc',
+            shell_command,
+        ]
+    if shutil.which('mate-terminal'):
+        return [
+            'mate-terminal',
+            '--disable-factory',
+            '--title',
+            title,
+            '--',
+            'bash',
+            '-lc',
+            shell_command,
+        ]
+    return None
+
+
+def safe_process_label(text: str) -> str:
+    chars = [ch.lower() if ch.isalnum() else '_' for ch in text]
+    label = ''.join(chars).strip('_')
+    while '__' in label:
+        label = label.replace('__', '_')
+    return label[:64] or 'process'
 
 
 def _load_yaml(path: Path) -> dict:
@@ -229,10 +313,18 @@ class CameraLauncherApp:
         self.running_var = tk.StringVar(value='Cameras stopped')
 
         self.launch_processes: list[subprocess.Popen] = []
+        self.launch_process_groups: dict[int, int | None] = {}
         self.process_labels: dict[int, str] = {}
+        self.process_pairs: dict[int, dict[str, str]] = {}
+        self.ready_process_pids: set[int] = set()
+        self.pending_launch_pairs: list[dict[str, str]] = []
+        self.sequential_device_num = 1
+        self.sequential_launch_failures: list[str] = []
+        self.process_poll_active = False
         self.detected_serials: list[str] = []
         self.scanning = False
         self.launching = False
+        self.launch_stop_requested = False
         self.closing = False
 
         self.scan_button = None
@@ -472,11 +564,18 @@ class CameraLauncherApp:
         launchable = self._has_launchable_camera_data()
         errors = self._mapping_errors()
         running = self._any_process_running()
+        starting = self._any_process_starting()
 
-        if self.launching:
+        if self.launching and starting:
+            self.status_var.set('Launching cameras one at a time; waiting for current camera topics...')
+        elif self.launching and running:
+            self.status_var.set('Camera verified; preparing next configured camera...')
+        elif self.launching:
             self.status_var.set('Checking configured cameras...')
+        elif starting:
+            self.status_var.set('Waiting for camera topics...')
         elif running:
-            self.status_var.set('Camera launch processes are running')
+            self.status_var.set('Camera launch verified')
         elif complete:
             self.status_var.set('Camera data ready')
         elif launchable:
@@ -488,7 +587,9 @@ class CameraLauncherApp:
 
         save_state = tk.NORMAL if not errors and not running and not self.launching else tk.DISABLED
         launch_state = tk.NORMAL if launchable and not running and not self.launching else tk.DISABLED
-        stop_state = tk.NORMAL if running else tk.DISABLED
+        # Keep Stop available even when no tracked camera is running so the operator
+        # always has an obvious close/cleanup action.
+        stop_state = tk.NORMAL
 
         if self.save_button is not None:
             self.save_button.configure(state=save_state)
@@ -689,6 +790,7 @@ class CameraLauncherApp:
         if not auto and not self._save_config():
             return
 
+        self.launch_stop_requested = False
         self.launching = True
         self.running_var.set('Checking configured cameras...')
         self.scan_status_var.set('Checking connected cameras before launch...')
@@ -709,7 +811,9 @@ class CameraLauncherApp:
         pairs: list[dict[str, str]],
         auto: bool,
     ) -> None:
-        if self.closing:
+        if self.closing or self.launch_stop_requested:
+            self.launching = False
+            self._update_ui_state()
             return
 
         self.detected_serials = serials
@@ -739,21 +843,39 @@ class CameraLauncherApp:
             warnings.append('Unconfigured slot(s):')
             warnings.extend(f'  {self._slot_label(pair)}' for pair in unconfigured)
         if missing_connected:
-            warnings.append('Configured camera(s) not detected:')
+            warnings.append('Configured camera(s) not connected:')
             warnings.extend(f'  {self._slot_label(pair)}' for pair in missing_connected)
 
         if not launch_pairs:
             self.launching = False
             self.running_var.set('No configured cameras running')
-            self.status_var.set('No configured cameras detected')
-            if warnings:
-                messagebox.showwarning('No configured cameras detected', '\n'.join(warnings))
+            self.status_var.set('No camera connected')
+            if serials:
+                message = 'No configured cameras are connected. No camera nodes were launched.'
             else:
-                messagebox.showwarning('No configured cameras detected', 'No configured cameras were detected.')
+                message = 'No camera connected. No camera nodes were launched.'
+            if warnings:
+                message = message + '\n\n' + '\n'.join(warnings)
+            messagebox.showwarning('No camera connected', message)
+            self._append_scan_text('\n' + message + '\n')
             self._update_ui_state()
+            self.status_var.set('No camera connected')
             return
 
-        if warnings:
+        if missing_connected:
+            connected_lines = '\n'.join(f'  {self._slot_label(pair)}' for pair in launch_pairs)
+            missing_lines = '\n'.join(f'  {self._slot_label(pair)}' for pair in missing_connected)
+            camera_word = 'camera is' if len(launch_pairs) == 1 else 'cameras are'
+            message = (
+                f'Only {len(launch_pairs)} configured {camera_word} connected.\n\n'
+                f'Connected and will launch:\n{connected_lines}\n\n'
+                f'Missing and will not launch:\n{missing_lines}'
+            )
+            if unconfigured:
+                message += '\n\n' + '\n'.join(warnings[: 1 + len(unconfigured)])
+            messagebox.showwarning('Partial camera startup', message)
+            self._append_scan_text('\n' + message + '\n')
+        elif warnings:
             messagebox.showwarning(
                 'Partial camera startup',
                 '\n'.join(warnings) + '\n\nLaunching detected configured camera(s).',
@@ -761,47 +883,423 @@ class CameraLauncherApp:
 
         self._launch_camera_pairs(launch_pairs)
 
-    def _launch_camera_pairs(self, pairs: list[dict[str, str]]) -> None:
-        orbbec_launch_args = _orbbec_launch_cli_args(self.config_path)
-        launched: list[subprocess.Popen] = []
-        device_num = max(1, len(pairs))
+    def _managed_terminal_shell_command(
+        self,
+        shell_command: str,
+        pid_file: Path,
+        display_command: str,
+        label: str,
+    ) -> str:
+        quoted_label = shlex.quote(label)
+        return (
+            'set -e; '
+            'printf "========================================\\n"; '
+            f'printf "RUNNING CAMERA NODE: %s\\n" {quoted_label}; '
+            'printf "========================================\\n\\n"; '
+            f'printf "Command: %s\\n\\n" {shlex.quote(display_command)}; '
+            f'printf "This terminal belongs to %s. Keep it open while the camera is running.\\n\\n" {quoted_label}; '
+            f'echo $$ > {shlex.quote(str(pid_file))}; '
+            f'{shell_command}'
+        )
+
+    def _runtime_process_pid_file(self, label: str) -> Path:
+        pid_dir = workspace_path('runtime', 'orbbec_camera_launcher_pids')
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        filename = f'{safe_process_label(label)}_{time.monotonic_ns()}.pid'
+        return pid_dir / filename
+
+    def _wait_for_managed_process_group(
+        self,
+        pid_file: Path,
+        terminal_process: subprocess.Popen,
+    ) -> int | None:
+        deadline = time.monotonic() + PROCESS_TERMINAL_PID_WAIT_SEC
+        while time.monotonic() < deadline:
+            try:
+                if pid_file.exists():
+                    text = pid_file.read_text(encoding='utf-8').strip()
+                    if text:
+                        pid = int(text)
+                        return os.getpgid(pid) if hasattr(os, 'getpgid') else None
+            except (OSError, ValueError, ProcessLookupError):
+                return None
+            if terminal_process.poll() is not None:
+                break
+            time.sleep(0.05)
+        return None
+
+    def _capture_process_group(self, process: subprocess.Popen) -> int | None:
+        if not hasattr(os, 'getpgid'):
+            return None
         try:
-            for pair in pairs:
-                command = [
-                    'ros2',
-                    'launch',
-                    'orbbec_camera',
-                    'gemini_330_series.launch.py',
-                    f'camera_name:={pair["camera_name"]}',
-                    f'serial_number:={pair["serial_number"]}',
-                    f'device_num:={device_num}',
-                    *orbbec_launch_args,
-                ]
-                process = subprocess.Popen(command, preexec_fn=os.setsid)
-                launched.append(process)
-                self.process_labels[process.pid] = self._slot_label(pair)
-                self._append_scan_text(
-                    f'\nLaunched {pair["camera_name"]} with SN {pair["serial_number"]}.\n'
-                )
-        except Exception as exc:  # noqa: BLE001
-            for process in launched:
-                self._terminate_process(process)
-            messagebox.showerror('Launch failed', f'Failed to launch cameras:\n{exc}')
-            self.launch_processes = []
-            self.process_labels = {}
-            self.launching = False
-            self._update_ui_state()
+            return os.getpgid(process.pid)
+        except ProcessLookupError:
+            return None
+        except Exception:
+            return None
+
+    def _start_visible_terminal_process(
+        self,
+        label: str,
+        shell_command: str,
+        display_command: str,
+    ) -> tuple[subprocess.Popen, int | None] | None:
+        terminal_title = f'Orbbec Camera - {label}'
+        pid_file = self._runtime_process_pid_file(label)
+        managed_command = self._managed_terminal_shell_command(shell_command, pid_file, display_command, label)
+        terminal_cmd = visible_terminal_command(terminal_title, managed_command)
+        if terminal_cmd is None:
+            message = (
+                'No supported terminal emulator found; refusing to launch hidden camera process. '
+                'Install gnome-terminal, xterm, xfce4-terminal, konsole, or mate-terminal.'
+            )
+            self._append_scan_text(f'\nCamera launch skipped: {message}\n')
+            return None
+        try:
+            process = subprocess.Popen(
+                terminal_cmd,
+                cwd=str(workspace_root()),
+                env=os.environ.copy(),
+                start_new_session=hasattr(os, 'setsid'),
+            )
+            pgid = self._wait_for_managed_process_group(pid_file, process)
+            return process, pgid or self._capture_process_group(process)
+        except Exception as exc:
+            self._append_scan_text(f'\nFailed to open terminal for {label}: {exc}\n')
+            return None
+        finally:
+            try:
+                pid_file.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+    def _launch_camera_pairs(self, pairs: list[dict[str, str]]) -> None:
+        # Launch one camera at a time. The next camera starts only after the
+        # current camera publishes the required color/depth topics.
+        self.pending_launch_pairs = list(pairs)
+        self.sequential_device_num = max(1, len(pairs))
+        self.sequential_launch_failures: list[str] = []
+        self._append_scan_text('\nLaunching connected configured cameras one at a time.\n')
+        self._launch_next_camera_pair()
+
+    def _launch_next_camera_pair(self) -> None:
+        if self.closing:
+            return
+        if self.launch_stop_requested:
+            self.pending_launch_pairs = []
+            self._finish_sequential_launch()
             return
 
-        self.launch_processes = launched
-        self.launching = False
+        pending = getattr(self, 'pending_launch_pairs', [])
+        if not pending:
+            self._finish_sequential_launch()
+            return
+
+        if self._any_process_running() and not self.launching:
+            self._append_scan_text('\nLaunch blocked because a camera node is already running.\n')
+            self._finish_sequential_launch()
+            return
+
+        pair = pending.pop(0)
+        self.pending_launch_pairs = pending
+        label = self._slot_label(pair)
+        orbbec_launch_args = _orbbec_launch_cli_args(self.config_path)
+        command = [
+            'ros2',
+            'launch',
+            'orbbec_camera',
+            'gemini_330_series.launch.py',
+            f'camera_name:={pair["camera_name"]}',
+            f'serial_number:={pair["serial_number"]}',
+            f'device_num:={getattr(self, "sequential_device_num", max(1, len(pending) + 1))}',
+            *orbbec_launch_args,
+        ]
+        display_command = shell_join(command)
+        shell_command = ros_sourced_shell_command(command)
+
+        self.running_var.set(f'Starting {label}...')
+        self.scan_status_var.set(f'Starting {label}; waiting for image topics...')
+        self._append_scan_text(
+            f'\nStarting {label} in its own terminal.\n'
+            f'Waiting for topics before launching the next camera:\n'
+            f'  /{pair["camera_name"]}/color/image_raw\n'
+            f'  /{pair["camera_name"]}/depth/image_raw\n'
+            f'Command: {display_command}\n'
+        )
+        self._update_ui_state()
+
+        started = self._start_visible_terminal_process(label, shell_command, display_command)
+        if started is None:
+            reason = (
+                f'{label}: could not start visible terminal. '
+                'Install gnome-terminal, xterm, xfce4-terminal, konsole, or mate-terminal.'
+            )
+            self.sequential_launch_failures.append(reason)
+            messagebox.showerror('Launch failed', reason)
+            self.pending_launch_pairs = []
+            self._finish_sequential_launch()
+            return
+
+        process, pgid = started
+        self.launch_processes.append(process)
+        self.launch_process_groups[process.pid] = pgid
+        self.process_labels[process.pid] = label
+        self.process_pairs[process.pid] = dict(pair)
         self._update_running_status()
         self._update_ui_state()
-        self.root.after(LAUNCH_STARTUP_GRACE_MS, lambda processes=launched: self._check_startup_status(processes))
-        self._poll_processes()
+        self._ensure_process_polling()
+        self._start_single_camera_launch_validation(process, pair)
+
+    def _finish_sequential_launch(self) -> None:
+        self.launching = False
+        failures = getattr(self, 'sequential_launch_failures', [])
+        if failures:
+            self._append_scan_text('\nCamera launch issue(s):\n' + '\n'.join(f'  {item}' for item in failures) + '\n')
+            if not self._any_process_running():
+                messagebox.showwarning('Camera launch completed with issues', '\n'.join(failures))
+        elif self._any_process_running():
+            self._append_scan_text('\nConfigured connected camera node(s) are running.\n')
+        else:
+            self._append_scan_text('\nNo camera nodes were launched.\n')
+        self._update_running_status()
+        self._update_ui_state()
+
+    def _start_single_camera_launch_validation(
+        self,
+        process: subprocess.Popen,
+        pair: dict[str, str],
+    ) -> None:
+        snapshot = (process, dict(pair))
+        thread = threading.Thread(target=self._single_camera_launch_validation_worker, args=snapshot, daemon=True)
+        thread.start()
+
+    def _single_camera_launch_validation_worker(
+        self,
+        process: subprocess.Popen,
+        pair: dict[str, str],
+    ) -> None:
+        pid = process.pid
+        label = self._slot_label(pair)
+        required = self._required_camera_topics(pair)
+        last_missing = set(required)
+        last_query_error = ''
+        deadline = time.monotonic() + CAMERA_READY_TIMEOUT_SEC
+
+        while not self.closing and time.monotonic() < deadline:
+            if not self._process_alive(process):
+                reason = f'launch process exited with code {process.poll()}'
+                self.root.after(0, lambda pid=pid, reason=reason: self._finish_single_camera_launch_validation(pid, False, reason))
+                return
+
+            return_code, topics, query_output = self._query_ros_topics()
+            if return_code not in (0, None):
+                last_query_error = query_output or f'ros2 topic list exited with code {return_code}'
+
+            missing = required - topics
+            last_missing = missing
+            if required and not missing:
+                self.root.after(0, lambda pid=pid: self._finish_single_camera_launch_validation(pid, True, ''))
+                return
+
+            time.sleep(0.5)
+
+        if self.closing:
+            return
+
+        reason = 'required topics did not appear'
+        if last_missing:
+            reason += ': ' + ', '.join(sorted(last_missing))
+        if last_query_error:
+            reason += f' ({last_query_error})'
+        self.root.after(0, lambda pid=pid, reason=reason: self._finish_single_camera_launch_validation(pid, False, reason))
+
+    def _finish_single_camera_launch_validation(self, pid: int, ready: bool, reason: str) -> None:
+        if self.closing or self.launch_stop_requested:
+            return
+
+        process = next((item for item in self.launch_processes if item.pid == pid), None)
+        label = self.process_labels.get(pid, f'camera process {pid}')
+
+        if ready and process is not None and self._process_alive(process):
+            self.ready_process_pids.add(pid)
+            self._append_scan_text(f'\n{label} is running. Required image topics are available.\n')
+            self.scan_status_var.set(f'{label} is running')
+            self._update_running_status()
+            self._update_ui_state()
+            self._launch_next_camera_pair()
+            return
+
+        failure = f'{label}: {reason or "camera did not become ready"}'
+        self.sequential_launch_failures.append(failure)
+        self._append_scan_text(f'\nCamera launch validation failed:\n  {failure}\n')
+        if process is not None:
+            pgid = self.launch_process_groups.pop(pid, None)
+            self._terminate_process(process, pgid)
+            self.launch_processes = [item for item in self.launch_processes if item.pid != pid]
+        self.process_labels.pop(pid, None)
+        self.process_pairs.pop(pid, None)
+        self.ready_process_pids.discard(pid)
+        self.scan_status_var.set(f'{label} failed; continuing with remaining camera(s)')
+        messagebox.showwarning('Camera launch failed', failure)
+        self._update_running_status()
+        self._update_ui_state()
+        self._launch_next_camera_pair()
+
+    def _required_camera_topics(self, pair: dict[str, str]) -> set[str]:
+        camera_name = pair.get('camera_name', '').strip()
+        if not camera_name:
+            return set()
+        return {
+            f'/{camera_name}/color/image_raw',
+            f'/{camera_name}/depth/image_raw',
+        }
+
+    def _query_ros_topics(self) -> tuple[int, set[str], str]:
+        command = ros_sourced_shell_command(['ros2', 'topic', 'list'])
+        try:
+            result = subprocess.run(
+                ['bash', '-lc', command],
+                check=False,
+                cwd=str(workspace_root()),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=ROS_TOPIC_QUERY_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            return -1, set(), 'ros2 topic list timed out'
+        except Exception as exc:  # noqa: BLE001
+            return -1, set(), f'Failed to run ros2 topic list: {exc}'
+
+        output = (result.stdout or '').strip()
+        error = (result.stderr or '').strip()
+        combined = '\n'.join(part for part in (output, error) if part).strip()
+        topics = {line.strip() for line in output.splitlines() if line.strip().startswith('/')}
+        return result.returncode, topics, combined
+
+    def _start_camera_launch_validation(self, processes: list[subprocess.Popen]) -> None:
+        snapshot = [(process, dict(self.process_pairs.get(process.pid, {}))) for process in processes]
+        thread = threading.Thread(target=self._camera_launch_validation_worker, args=(snapshot,), daemon=True)
+        thread.start()
+
+    def _camera_launch_validation_worker(
+        self,
+        launches: list[tuple[subprocess.Popen, dict[str, str]]],
+    ) -> None:
+        pending = {process.pid: (process, pair) for process, pair in launches}
+        failures: dict[int, str] = {}
+        last_missing: dict[int, set[str]] = {}
+        last_query_error = ''
+        deadline = time.monotonic() + CAMERA_READY_TIMEOUT_SEC
+
+        while pending and not self.closing and time.monotonic() < deadline:
+            for pid, (process, _pair) in list(pending.items()):
+                if not self._process_alive(process):
+                    failures[pid] = f'launch process exited with code {process.poll()}'
+                    pending.pop(pid, None)
+
+            if not pending:
+                break
+
+            return_code, topics, query_output = self._query_ros_topics()
+            if return_code not in (0, None):
+                last_query_error = query_output or f'ros2 topic list exited with code {return_code}'
+
+            ready: list[tuple[int, str]] = []
+            for pid, (_process, pair) in list(pending.items()):
+                required = self._required_camera_topics(pair)
+                missing = required - topics
+                last_missing[pid] = missing
+                if required and not missing:
+                    ready.append((pid, self._slot_label(pair)))
+                    pending.pop(pid, None)
+
+            if ready:
+                self.root.after(0, lambda ready_items=ready: self._mark_camera_launch_ready(ready_items))
+
+            if pending:
+                time.sleep(0.5)
+
+        if pending and not self.closing:
+            for pid, (_process, pair) in pending.items():
+                missing = sorted(last_missing.get(pid) or self._required_camera_topics(pair))
+                reason = 'required topics did not appear'
+                if missing:
+                    reason += ': ' + ', '.join(missing)
+                if last_query_error:
+                    reason += f' ({last_query_error})'
+                failures[pid] = reason
+
+        if failures and not self.closing:
+            self.root.after(0, lambda failed=dict(failures): self._finish_camera_launch_validation(failed))
+
+    def _mark_camera_launch_ready(self, ready_items: list[tuple[int, str]]) -> None:
+        messages = []
+        for pid, label in ready_items:
+            if pid not in self.process_pairs:
+                continue
+            self.ready_process_pids.add(pid)
+            messages.append(f'  {label}')
+        if messages:
+            self._append_scan_text('\nCamera topic validation passed:\n' + '\n'.join(messages) + '\n')
+            self.scan_status_var.set('Camera topics verified')
+            self._update_running_status()
+            self._update_ui_state()
+
+    def _finish_camera_launch_validation(self, failures: dict[int, str]) -> None:
+        if self.closing:
+            return
+
+        failed_lines = []
+        for pid, reason in failures.items():
+            process = next((item for item in self.launch_processes if item.pid == pid), None)
+            if process is None:
+                continue
+            label = self._process_label(process)
+            failed_lines.append(f'  {label}: {reason}')
+            pgid = self.launch_process_groups.pop(pid, None)
+            self._terminate_process(process, pgid)
+            self.launch_processes = [item for item in self.launch_processes if item.pid != pid]
+            self.process_labels.pop(pid, None)
+            self.process_pairs.pop(pid, None)
+            self.ready_process_pids.discard(pid)
+
+        if failed_lines:
+            self._append_scan_text('\nCamera launch validation failed:\n' + '\n'.join(failed_lines) + '\n')
+            messagebox.showwarning('Camera launch failed', '\n'.join(failed_lines))
+
+        self._update_running_status()
+        self._update_ui_state()
+
+    def _process_group_alive(self, pgid: int | None) -> bool:
+        if pgid is None or not hasattr(os, 'killpg'):
+            return False
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _process_alive(self, process: subprocess.Popen) -> bool:
+        return (
+            process.poll() is None
+            or self._process_group_alive(self.launch_process_groups.get(process.pid))
+        )
 
     def _running_processes(self) -> list[subprocess.Popen]:
-        return [process for process in self.launch_processes if process.poll() is None]
+        return [process for process in self.launch_processes if self._process_alive(process)]
+
+    def _ready_processes(self) -> list[subprocess.Popen]:
+        return [process for process in self._running_processes() if process.pid in self.ready_process_pids]
+
+    def _starting_processes(self) -> list[subprocess.Popen]:
+        return [process for process in self._running_processes() if process.pid not in self.ready_process_pids]
 
     def _process_label(self, process: subprocess.Popen) -> str:
         return self.process_labels.get(process.pid, f'camera process {process.pid}')
@@ -812,43 +1310,54 @@ class CameraLauncherApp:
             self.running_var.set('Cameras stopped')
             self.status_var.set('No camera launch processes are running')
             return
-        labels = ', '.join(self._process_label(process) for process in running)
-        self.running_var.set(f'{len(running)} camera process(es) running')
-        self.status_var.set(f'{len(running)} camera(s) running: {labels}')
-
-    def _check_startup_status(self, processes: list[subprocess.Popen]) -> None:
-        if self.closing:
+        ready = self._ready_processes()
+        starting = self._starting_processes()
+        if starting and ready:
+            ready_labels = ', '.join(self._process_label(process) for process in ready)
+            starting_labels = ', '.join(self._process_label(process) for process in starting)
+            self.running_var.set(f'{len(ready)} camera(s) verified, {len(starting)} starting')
+            self.status_var.set(f'Verified: {ready_labels}; waiting: {starting_labels}')
             return
-        failed = [process for process in processes if process.poll() is not None]
-        running = [process for process in processes if process.poll() is None]
-        if failed:
-            failed_lines = [
-                f'  {self._process_label(process)} exited with code {process.poll()}'
-                for process in failed
-            ]
-            self._append_scan_text('\nCamera launch failure detected:\n' + '\n'.join(failed_lines) + '\n')
-            self.launch_processes = [process for process in self.launch_processes if process.poll() is None]
-            self._update_running_status()
-            message = 'Camera launch failed:\n' + '\n'.join(failed_lines)
-            if running:
-                running_lines = [f'  {self._process_label(process)}' for process in running]
-                message += '\n\nStill running:\n' + '\n'.join(running_lines)
-            else:
-                message += '\n\nNo configured cameras are running.'
-            messagebox.showwarning('Camera launch status', message)
-            self._update_ui_state()
+        if starting:
+            labels = ', '.join(self._process_label(process) for process in starting)
+            self.running_var.set(f'{len(starting)} camera process(es) starting')
+            self.status_var.set(f'Waiting for camera topics: {labels}')
+            return
+        labels = ', '.join(self._process_label(process) for process in running)
+        self.running_var.set(f'{len(ready)} camera(s) verified')
+        self.status_var.set(f'{len(ready)} camera(s) verified: {labels}')
+
+    def _ensure_process_polling(self) -> None:
+        if self.process_poll_active:
+            return
+        self.process_poll_active = True
+        self.root.after(1000, self._poll_processes)
 
     def _poll_processes(self) -> None:
         if self.closing:
+            self.process_poll_active = False
             return
         stopped = [process for process in self.launch_processes if process.poll() is not None]
         if stopped:
-            stopped_lines = [
-                f'  {self._process_label(process)} exited with code {process.poll()}'
-                for process in stopped
-            ]
+            stopped_lines = []
+            for process in stopped:
+                label = self._process_label(process)
+                pgid = self.launch_process_groups.get(process.pid)
+                if self._process_group_alive(pgid):
+                    stopped_lines.append(
+                        f'  {label} launch terminal exited but camera nodes were still running; cleaning up'
+                    )
+                    self._terminate_process(process, pgid)
+                else:
+                    stopped_lines.append(f'  {label} exited with code {process.poll()}')
             self._append_scan_text('\nCamera process stopped:\n' + '\n'.join(stopped_lines) + '\n')
-            self.launch_processes = [process for process in self.launch_processes if process.poll() is None]
+            stopped_pids = {process.pid for process in stopped}
+            self.launch_processes = [process for process in self.launch_processes if process.pid not in stopped_pids]
+            for pid in stopped_pids:
+                self.launch_process_groups.pop(pid, None)
+                self.process_labels.pop(pid, None)
+                self.process_pairs.pop(pid, None)
+                self.ready_process_pids.discard(pid)
         running_count = len(self._running_processes())
         if running_count:
             self._update_running_status()
@@ -856,52 +1365,96 @@ class CameraLauncherApp:
         elif self.launch_processes or stopped:
             self.running_var.set('Cameras stopped')
             self.launch_processes = []
+            self.launch_process_groups = {}
             self.process_labels = {}
+            self.process_pairs = {}
+            self.ready_process_pids = set()
+            self.process_poll_active = False
             self._update_ui_state()
+        else:
+            self.process_poll_active = False
 
     def _any_process_running(self) -> bool:
-        return any(process.poll() is None for process in self.launch_processes)
+        return any(self._process_alive(process) for process in self.launch_processes)
+
+    def _any_process_starting(self) -> bool:
+        return any(
+            self._process_alive(process) and process.pid not in self.ready_process_pids
+            for process in self.launch_processes
+        )
 
     def _stop_cameras(self) -> None:
-        if not self.launch_processes:
+        self.launch_stop_requested = True
+        self.pending_launch_pairs = []
+        self.launching = False
+        if not self.launch_processes and not self._any_process_running():
+            self.running_var.set('Cameras stopped')
+            self._append_scan_text('\nNo camera nodes are currently running.\n')
             self._update_ui_state()
+            self.status_var.set('No camera nodes are currently running')
             return
         self.running_var.set('Stopping cameras...')
         for process in list(self.launch_processes):
-            self._terminate_process(process)
+            pgid = self.launch_process_groups.pop(process.pid, None)
+            self._terminate_process(process, pgid)
         self.launch_processes = []
+        self.launch_process_groups = {}
         self.process_labels = {}
+        self.process_pairs = {}
+        self.ready_process_pids = set()
         self.running_var.set('Cameras stopped')
-        self._append_scan_text('\nStopped camera launch processes.\n')
+        self._append_scan_text('\nStopped camera launch processes and child camera nodes.\n')
         self._update_ui_state()
 
-    def _terminate_process(self, process: subprocess.Popen) -> None:
-        if process.poll() is not None:
+    def _send_process_signal(
+        self,
+        process: subprocess.Popen,
+        pgid: int | None,
+        sig: signal.Signals,
+    ) -> bool:
+        if pgid is not None and hasattr(os, 'killpg'):
+            try:
+                os.killpg(pgid, sig)
+                return True
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            try:
+                process.send_signal(sig)
+                return True
+            except ProcessLookupError:
+                pass
+        return False
+
+    def _wait_process_or_group_stopped(
+        self,
+        process: subprocess.Popen,
+        pgid: int | None,
+        timeout_sec: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            parent_running = process.poll() is None
+            group_running = self._process_group_alive(pgid)
+            if not parent_running and not group_running:
+                return True
+            time.sleep(0.05)
+        return process.poll() is not None and not self._process_group_alive(pgid)
+
+    def _terminate_process(self, process: subprocess.Popen, pgid: int | None = None) -> None:
+        if process.poll() is not None and not self._process_group_alive(pgid):
             return
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGINT)
-        except Exception:
-            process.terminate()
 
-        deadline = time.monotonic() + 4.0
-        while process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.1)
+        self._send_process_signal(process, pgid, signal.SIGINT)
+        if self._wait_process_or_group_stopped(process, pgid, PROCESS_STOP_TIMEOUT_SEC):
+            return
 
-        if process.poll() is None:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except Exception:
-                process.terminate()
+        self._send_process_signal(process, pgid, signal.SIGTERM)
+        if self._wait_process_or_group_stopped(process, pgid, PROCESS_STOP_TIMEOUT_SEC):
+            return
 
-        deadline = time.monotonic() + 2.0
-        while process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.1)
-
-        if process.poll() is None:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except Exception:
-                process.kill()
+        self._send_process_signal(process, pgid, signal.SIGKILL)
+        self._wait_process_or_group_stopped(process, pgid, 1.0)
 
     def _on_close(self) -> None:
         self.closing = True
