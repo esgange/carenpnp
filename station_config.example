@@ -1,0 +1,25 @@
+# Copy this file to station_config and edit it for one robot-arm PC.
+#
+# The launch files read this file directly, and shell sessions can source it:
+#
+#   set -a
+#   source station_config
+#   set +a
+
+# Keep ROS 2 discovery and topics on this computer by default.
+ROS_LOCALHOST_ONLY=true
+
+# DOBOT controller connection.
+ROBOT_IP_ADDRESS=192.168.20.202
+ROBOT_TYPE=cr10
+
+# Per-arm identity used by the optional external bridge.
+BELT_ID=belt-a
+CELL_BRIDGE_ID=edge_01
+ROBOT_ARM_ID=arm_01
+ARM_NUMBER=1
+
+# Optional RabbitMQ bridge settings for a conveyor/master PC.
+RABBITMQ_URL=amqp://catarm-server:change-me-server-password@192.168.100.98:5672/%2Fcatarm
+RABBITMQ_EXCHANGE=catarm.events
+MESSAGE_SIGNING_KEY=change-me-message-signing-key

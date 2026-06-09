@@ -1,0 +1,19 @@
+tray_teach:
+  ros__parameters:
+    color_topic: /robot_camera/color/image_raw
+    depth_topic: /robot_camera/depth/image_raw
+    camera_info_topic: /robot_camera/color/camera_info
+    joint_states_topic: /joint_states_robot
+    overlay_topic: tray_overlay
+    publish_overlay: true
+    camera_control_service_root: /robot_camera
+    color_exposure_us: 0
+    depth_exposure_us: 0
+    color_exposure_percent: 0
+    depth_exposure_percent: 0
+    color_exposure_min_us: 1
+    color_exposure_max_us: 100
+    depth_exposure_min_us: 1
+    depth_exposure_max_us: 32000
+    display_scale: 1.0
+    trace_out_to_in: false

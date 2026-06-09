@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>obstacle_perception</name>
+  <version>0.0.1</version>
+  <description>Depth-based obstacle visualization anchored to the calibrated camera frame.</description>
+  <maintainer email="maintainer@example.com">maintainer</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <build_depend>rclcpp</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+  <build_depend>image_geometry</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>opencv2</build_depend>
+  <build_depend>message_filters</build_depend>
+  <build_depend>tf2</build_depend>
+  <build_depend>tf2_ros</build_depend>
+
+  <exec_depend>rclcpp</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>image_geometry</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>opencv2</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>aruco_perception</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,18 @@
+# Second-arm bridge overlay; same belt as station_01 but a different arm.
+# See station_01.yaml for the distributed-deployment note about
+# RABBITMQ_URL.
+
+belt_id: belt-a
+# edge_node_id stays as the external message envelope key for compatibility.
+edge_node_id: cell_bridge_02
+robot_arm_id: arm_02
+arm_number: 2
+
+rabbitmq_url: amqp://catarm-server:set-via-env@conveyor-host.invalid:5672/%2Fcatarm
+exchange_name: catarm.events
+
+runtime_dir: /workspaces/DOBOT_pickn_place/runtime
+robot_cell_orchestrator_validate_service: robot_cell_orchestrator/validate_online_program
+robot_cell_orchestrator_start_service: robot_cell_orchestrator/start_online
+robot_cell_orchestrator_place_service: robot_cell_orchestrator/place_online
+robot_cell_orchestrator_events_topic: robot_cell_orchestrator/events

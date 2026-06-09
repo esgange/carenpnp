@@ -1,0 +1,142 @@
+import os
+from pathlib import Path
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+def _workspace_root() -> Path:
+    def looks_like_root(path: Path) -> bool:
+        return (
+            (path / "src").exists() and
+            (
+                (path / "README.md").exists()
+                or (path / "src" / "dobot_msgs_v4").exists()
+            )
+        )
+
+    for name in ("DOBOT_PICKN_PLACE_ROOT", "DOBOT_WORKSPACE_ROOT"):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser().resolve()
+
+    for start in (Path.cwd(), Path(__file__).resolve()):
+        path = start.expanduser().resolve()
+        if path.is_file():
+            path = path.parent
+        for candidate in (path, *path.parents):
+            if looks_like_root(candidate):
+                return candidate
+    return Path.cwd().resolve()
+
+
+def _repo_path(*parts: str) -> str:
+    return str(_workspace_root().joinpath(*parts))
+
+def _ros_domain_action():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / 'src' / 'dobot_bringup_v4' / 'launch' / 'ros_domain.py',
+            parent / 'install' / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location('_dobot_ros_domain', helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.ros_domain_action()
+
+    raise RuntimeError('Could not find ros_domain.py helper for ROS_DOMAIN_ID')
+
+
+def generate_launch_description():
+    params_file = LaunchConfiguration("params_file")
+    color_topic = LaunchConfiguration("color_topic")
+    depth_topic = LaunchConfiguration("depth_topic")
+    camera_info_topic = LaunchConfiguration("camera_info_topic")
+    camera_control_service_root = LaunchConfiguration("camera_control_service_root")
+    color_exposure_min_us = ParameterValue(LaunchConfiguration("color_exposure_min_us"), value_type=int)
+    color_exposure_max_us = ParameterValue(LaunchConfiguration("color_exposure_max_us"), value_type=int)
+    depth_exposure_min_us = ParameterValue(LaunchConfiguration("depth_exposure_min_us"), value_type=int)
+    depth_exposure_max_us = ParameterValue(LaunchConfiguration("depth_exposure_max_us"), value_type=int)
+    profiles_dir = LaunchConfiguration("profiles_dir")
+
+    return LaunchDescription([
+        _ros_domain_action(),
+        DeclareLaunchArgument(
+            "params_file",
+            default_value=os.path.join(
+                get_package_share_directory("tray_perception"),
+                "config",
+                "tray_detector.yaml",
+            ),
+        ),
+        DeclareLaunchArgument(
+            "color_topic",
+            default_value="/robot_camera/color/image_raw",
+        ),
+        DeclareLaunchArgument(
+            "depth_topic",
+            default_value="/robot_camera/depth/image_raw",
+        ),
+        DeclareLaunchArgument(
+            "camera_info_topic",
+            default_value="/robot_camera/color/camera_info",
+        ),
+        DeclareLaunchArgument(
+            "camera_control_service_root",
+            default_value="/robot_camera",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "color_exposure_max_us",
+            default_value="100",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_min_us",
+            default_value="1",
+        ),
+        DeclareLaunchArgument(
+            "depth_exposure_max_us",
+            default_value="32000",
+        ),
+        DeclareLaunchArgument(
+            "profiles_dir",
+            default_value=_repo_path("teach", "tray_teach"),
+        ),
+        Node(
+            package="tray_perception",
+            executable="tray_teach_node",
+            name="tray_teach",
+            output="screen",
+            parameters=[
+                params_file,
+                {
+                    "color_topic": color_topic,
+                    "depth_topic": depth_topic,
+                    "camera_info_topic": camera_info_topic,
+                    "camera_control_service_root": camera_control_service_root,
+                    "color_exposure_min_us": color_exposure_min_us,
+                    "color_exposure_max_us": color_exposure_max_us,
+                    "depth_exposure_min_us": depth_exposure_min_us,
+                    "depth_exposure_max_us": depth_exposure_max_us,
+                    "profiles_dir": profiles_dir,
+                },
+            ],
+        ),
+    ])

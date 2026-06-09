@@ -1,0 +1,30 @@
+[project]
+name = "catrion-cell-external-bridge"
+version = "0.1.0"
+description = "Cell External Bridge: one RabbitMQ-to-Robot-Cell-Orchestrator bridge per robotic arm."
+# rclpy and the in-workspace `robot_cell_orchestrator` Python package are provided by
+# the ROS 2 Humble colcon overlay sourced in the station shell. They are
+# intentionally NOT listed here because pip cannot install them.
+dependencies = [
+  "aio-pika>=9.5",
+  "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+cell-external-bridge = "cell_external_bridge.robot_arm_controller:main"
+
+[build-system]
+requires = ["setuptools>=75,<81"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

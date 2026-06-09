@@ -1,0 +1,26 @@
+item_teach_yolo:
+  ros__parameters:
+    color_topic: /bin_camera/color/image_raw
+    joint_states_topic: /joint_states_robot
+    item_name: ""
+    saved_sessions_root: config/item_perception_yolo/item_teach_yolo_saved_sessions
+    depth_topic: /bin_camera/depth/image_raw
+    camera_info_topic: /bin_camera/color/camera_info
+    overlay_topic: bin_overlay
+    camera_control_service_root: /bin_camera
+    color_exposure_us: 0
+    depth_exposure_us: 0
+    color_exposure_percent: 0
+    depth_exposure_percent: 0
+    color_exposure_min_us: 1
+    color_exposure_max_us: 100
+    depth_exposure_min_us: 1
+    depth_exposure_max_us: 32000
+    sam2_config: configs/sam2.1/sam2.1_hiera_t.yaml
+    train_epochs: 80
+    train_imgsz: 640
+    train_device: cpu
+    display_scale: 1.0
+    live_view_enabled: true
+    overlay_enabled: true
+    clear_runtime_on_start: true
