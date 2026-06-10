@@ -1,23 +1,39 @@
 import json
 import math
 import os
+import re
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from tkinter import scrolledtext
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 
-from dobot_msgs_v4.msg import ToolVectorActual
-from dobot_msgs_v4.srv import DO, MovL, MovLIO, SetTool, Stop, Tool, TrayInterceptStart
+from dobot_msgs_v4.srv import (
+    DO,
+    GetAngle,
+    GetPose,
+    MovJ,
+    MovL,
+    MovLIO,
+    RobotMode,
+    SetTool,
+    Stop,
+    Tool,
+    TrayInterceptStart,
+)
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from std_srvs.srv import Trigger
+from std_msgs.msg import String
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
@@ -77,13 +93,17 @@ GRIPPER_DO_SERVICE_DEFAULT = f'{SERVICE_ROOT_DEFAULT}/DO'
 LINEAR_SPEED_MM_S_MIN = 50.0
 LINEAR_SPEED_MM_S_MAX = 350.0
 DEFAULT_ACC_PERCENT = 100
-PICK_DESCENT_SPEED_PERCENT = 6
+PICK_MOTION_SPEED_PERCENT_DEFAULT = 10
+PICK_MOTION_SPEED_PERCENT_MIN = 1
+PICK_MOTION_SPEED_PERCENT_MAX = 100
 FINAL_Z_UP_SPEED_PERCENT = 100
 TCP_FIELDS = ('x', 'y', 'z', 'rx', 'ry', 'rz')
+TCP_POSE_POLL_PERIOD_SEC = 0.1
 ITEM_POSE_TOPIC = 'bin_seek_pose'
+DI_STATUS_TOPIC_DEFAULT = '/dobot_bringup_ros2/DIStatus_200mS'
 ROBOT_GOAL_FRAME_DEFAULT = 'base_link'
 ROBOT_GRIPPER_FRAME_DEFAULT = 'Link6'
-CALIBRATED_CAMERA_FRAME_DEFAULT = 'calibrated_camera_link'
+CALIBRATED_CAMERA_FRAME_DEFAULT = 'arm_calibrated_camera_link'
 POST_STOP_MOVL_GOAL_DEBUG_FRAME_DEFAULT = 'item_goal_tcp'
 POST_STOP_MOVL_GOAL_NOMINAL_DEBUG_FRAME_DEFAULT = 'item_movel_goal_nominal_tcp'
 POST_STOP_MOVL_GOAL_TOOL_OFFSET_DEBUG_FRAME_DEFAULT = 'item_movel_goal_tool_offset'
@@ -108,9 +128,6 @@ APPROACH_Z_UP_DEFAULT = 200.0
 FINAL_Z_UP_MIN = 50.0
 FINAL_Z_UP_MAX = 300.0
 FINAL_Z_UP_DEFAULT = APPROACH_Z_UP_DEFAULT
-SETTLING_TIME_MIN_SEC = 0.1
-SETTLING_TIME_MAX_SEC = 1.0
-SETTLING_TIME_DEFAULT_SEC = 0.1
 TOOL_OFFSET_TRANSLATION_MIN_MM = -500.0
 TOOL_OFFSET_TRANSLATION_MAX_MM = 500.0
 TOOL_OFFSET_ROTATION_MIN_DEG = -180.0
@@ -119,14 +136,33 @@ COMMAND_HYSTERESIS_MIN_SEC = 0.1
 COMMAND_HYSTERESIS_MAX_SEC = 1.0
 COMMAND_HYSTERESIS_DEFAULT_SEC = 0.1
 LOCKED_MAX_SPEED_MM_S = POST_STOP_MOVL_SPEED_MAX
-TCP_GOAL_REACHED_TOLERANCE_MM = 5.0
-MANUAL_RELEASE_PULSE_MS = 500
+MANUAL_RELEASE_PULSE_MS = 300
+PICK_PURGE_EXHAUST_MS = 300
+SUCTION_STATUS_DI_INDEX = 1
+SUCTION_STATUS_BIT_INDEX = SUCTION_STATUS_DI_INDEX - 1
+DI_STATUS_FRESH_SAMPLE_TIMEOUT_SEC = 1.0
+TCP_RETRACT_GOAL_TOLERANCE_MM = 5.0
+TCP_RETRACT_STABILITY_SEC = 0.1
+TCP_RETRACT_PHASE_TIMEOUT_SEC = 30.0
+ROBOT_MODE_RUNNING = 7
+ROBOT_MODE_JOGGING = 11
+ROBOT_MODE_ENABLED = 5
+ROBOT_MODE_ERROR = 9
+ROBOT_MODE_PAUSED = 10
+REPICK_START_STABILITY_SEC_DEFAULT = 0.5
+REPICK_START_TIMEOUT_SEC = 30.0
+REPICK_JOINT_TOLERANCE_DEG = 1.0
+ACTION_EVENT_HISTORY_MAX = 500
+AUTO_REPICK_ON_FAILED_SUCTION_DEFAULT = True
 GOAL_TF_LOOKUP_TIMEOUT_SEC_DEFAULT = 0.2
 CAMERA_BIN_SAFE_MARGIN_MM_DEFAULT = 0.0
 START_SEQUENCE_SERVICE_DEFAULT = 'item_pick/start_sequence'
 TRACK_SERVICE_DEFAULT = 'item_pick/track'
 TRACK_STATUS_SERVICE_DEFAULT = 'item_pick/track_status'
 ITEM_SEEK_COMPLETE_SERVICE_DEFAULT = 'item_detect/seek_complete'
+ITEM_REPICK_SERVICE_DEFAULT = 'item_detect/repick'
+AUTO_REPICK_SERVICE_DEFAULT = 'item_pick/set_auto_repick'
+SELECTED_PROFILE_TOPIC_DEFAULT = 'item_detect/selected_profile'
 TOOL_OFFSET_PREVIEW_PARENT_FRAME_DEFAULT = 'Link6'
 TOOL_OFFSET_PREVIEW_FRAME_DEFAULT = 'item_pick_tool_offset_preview'
 TOOL_OFFSET_PREVIEW_AXIS_X_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_x_tip'
@@ -141,8 +177,10 @@ GOAL_TF_DIAG_AXIS_LENGTH_MM = 60.0
 GRIPPER_DO_CLOSE_INDEX = 1
 GRIPPER_DO_OPEN_INDEX = 2
 GRIPPER_DO_SUCTION_INDEX = 3
+GRIPPER_DO_EXHAUST_INDEX = 4
 MOVLIO_DO_MODE_PERCENT = 0
-MOVLIO_PICKUP_START_DISTANCE_PERCENT = 0
+MOVLIO_PICKUP_EXHAUST_OFF_DISTANCE_PERCENT = 0
+MOVLIO_PICKUP_SUCTION_ON_DISTANCE_PERCENT = 50
 ITEM_PICK_RUNTIME_REQUIRED_KEYS = (
     'schema_version',
     'tf_only_mode',
@@ -153,8 +191,7 @@ ITEM_PICK_RUNTIME_REQUIRED_KEYS = (
     'item_standoff_z_mm',
     'approach_z_up_mm',
     'final_z_up_mm',
-    'pre_pick_settling_time_sec',
-    'pick_settling_time_sec',
+    'pick_motion_speed_percent',
 )
 
 
@@ -463,6 +500,11 @@ class ItemPickNode(Node):
         super().__init__('item_pick')
         self._lock = threading.Lock()
         self._snapshot = ItemPickSnapshot()
+        self._action_event_seq = 1
+        self._action_events: deque[tuple[int, float, str]] = deque(
+            [(self._action_event_seq, time.time(), self._snapshot.action_text)],
+            maxlen=ACTION_EVENT_HISTORY_MAX,
+        )
         self._headless = bool(self.declare_parameter('headless', False).value)
         self._runtime_settings_path = Path(
             str(self.declare_parameter('runtime_settings_file', str(RUNTIME_SETTINGS_PATH)).value)
@@ -473,12 +515,28 @@ class ItemPickNode(Node):
         self._item_profile_state_path = Path(
             str(self.declare_parameter('item_profile_state_file', str(ITEM_PROFILE_STATE_PATH)).value)
         ).expanduser()
+        self._selected_profile_topic = str(
+            self.declare_parameter(
+                'selected_profile_topic',
+                SELECTED_PROFILE_TOPIC_DEFAULT,
+            ).value
+        ).strip() or SELECTED_PROFILE_TOPIC_DEFAULT
         self._motion_service_root = str(
             self.declare_parameter('motion_service_root', SERVICE_ROOT_DEFAULT).value
         ).strip().rstrip('/') or SERVICE_ROOT_DEFAULT
+        self._tcp_pose_user = int(float(self.declare_parameter('tcp_pose_user', 0).value))
+        self._tcp_pose_tool = int(float(self.declare_parameter('tcp_pose_tool', 0).value))
+        self._tcp_pose_request_in_flight = False
+        self._tcp_pose_warning_logged = False
         self._item_pose_topic = str(
             self.declare_parameter('item_pose_topic', ITEM_POSE_TOPIC).value
         ).strip() or ITEM_POSE_TOPIC
+        self._di_status_topic = str(
+            self.declare_parameter('di_status_topic', DI_STATUS_TOPIC_DEFAULT).value
+        ).strip() or DI_STATUS_TOPIC_DEFAULT
+        self._di_status_bits = 0
+        self._di_status_stamp: float | None = None
+        self._di_status_parse_warning_logged = False
         self._item_pose_seq = 0
         self._item_pose_watch_armed = False
         self._item_pose_watch_seq_floor = 0
@@ -503,6 +561,8 @@ class ItemPickNode(Node):
         self._cancel_requested = False
         self._manual_stop_inflight = False
         self._manual_release_inflight = False
+        self._repick_start_joints_deg: tuple[float, float, float, float, float, float] | None = None
+        self._pick_attempt = 0
         self._goal_tf_diagnose_inflight = False
         self._post_stop_movel_speed_mm_s = max(
             POST_STOP_MOVL_SPEED_MIN,
@@ -540,27 +600,17 @@ class ItemPickNode(Node):
         self._tool1_sync_status_text = 'Tool 1 not synced yet.'
         self._last_tool1_sync_signature: tuple[float, ...] | None = None
         self._tool_service_callback_group = ReentrantCallbackGroup()
-        self._pre_pick_settling_time_sec = max(
-            SETTLING_TIME_MIN_SEC,
+        self._pick_motion_speed_percent = max(
+            PICK_MOTION_SPEED_PERCENT_MIN,
             min(
-                SETTLING_TIME_MAX_SEC,
-                float(
-                    self.declare_parameter(
-                        'pre_pick_settling_time_sec',
-                        SETTLING_TIME_DEFAULT_SEC,
-                    ).value
-                ),
-            ),
-        )
-        self._pick_settling_time_sec = max(
-            SETTLING_TIME_MIN_SEC,
-            min(
-                SETTLING_TIME_MAX_SEC,
-                float(
-                    self.declare_parameter(
-                        'pick_settling_time_sec',
-                        SETTLING_TIME_DEFAULT_SEC,
-                    ).value
+                PICK_MOTION_SPEED_PERCENT_MAX,
+                int(
+                    float(
+                        self.declare_parameter(
+                            'pick_motion_speed_percent',
+                            PICK_MOTION_SPEED_PERCENT_DEFAULT,
+                        ).value
+                    )
                 ),
             ),
         )
@@ -597,6 +647,19 @@ class ItemPickNode(Node):
                 'camera_bin_safe_margin_mm',
                 CAMERA_BIN_SAFE_MARGIN_MM_DEFAULT,
             ).value),
+        )
+        self._repick_start_stability_sec = max(
+            0.0,
+            float(self.declare_parameter(
+                'repick_start_stability_sec',
+                REPICK_START_STABILITY_SEC_DEFAULT,
+            ).value),
+        )
+        self._auto_repick_on_failed_suction = bool(
+            self.declare_parameter(
+                'auto_repick_on_failed_suction',
+                AUTO_REPICK_ON_FAILED_SUCTION_DEFAULT,
+            ).value
         )
         self._post_stop_movel_goal_debug_frame_id = str(
             self.declare_parameter(
@@ -713,6 +776,18 @@ class ItemPickNode(Node):
                 ITEM_SEEK_COMPLETE_SERVICE_DEFAULT,
             ).value
         ).strip() or ITEM_SEEK_COMPLETE_SERVICE_DEFAULT
+        self._item_repick_service_name = str(
+            self.declare_parameter(
+                'item_repick_service',
+                ITEM_REPICK_SERVICE_DEFAULT,
+            ).value
+        ).strip() or ITEM_REPICK_SERVICE_DEFAULT
+        self._auto_repick_service_name = str(
+            self.declare_parameter(
+                'auto_repick_service',
+                AUTO_REPICK_SERVICE_DEFAULT,
+            ).value
+        ).strip() or AUTO_REPICK_SERVICE_DEFAULT
         self._gripper_do_service_name = str(
             self.declare_parameter(
                 'gripper_do_service',
@@ -720,8 +795,21 @@ class ItemPickNode(Node):
             ).value
         ).strip() or f'{self._motion_service_root}/DO'
 
+        self._mov_j_client = self.create_client(MovJ, f'{self._motion_service_root}/MovJ')
         self._mov_l_client = self.create_client(MovL, f'{self._motion_service_root}/MovL')
         self._mov_lio_client = self.create_client(MovLIO, f'{self._motion_service_root}/MovLIO')
+        self._get_angle_client = self.create_client(
+            GetAngle,
+            f'{self._motion_service_root}/GetAngle',
+        )
+        self._get_pose_client = self.create_client(
+            GetPose,
+            f'{self._motion_service_root}/GetPose',
+        )
+        self._robot_mode_client = self.create_client(
+            RobotMode,
+            f'{self._motion_service_root}/RobotMode',
+        )
         self._set_tool_client = self.create_client(
             SetTool,
             f'{self._motion_service_root}/SetTool',
@@ -738,6 +826,10 @@ class ItemPickNode(Node):
             Trigger,
             self._item_seek_complete_service_name,
         )
+        self._item_repick_client = self.create_client(
+            Trigger,
+            self._item_repick_service_name,
+        )
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._goal_tf_static_broadcaster = StaticTransformBroadcaster(self)
@@ -745,10 +837,27 @@ class ItemPickNode(Node):
         self._active_item_profile_key: str | None = None
         self._profile_state_mtime_ns: int | None = None
         self._active_profile_saved_tool_offsets: dict[str, float] | None = None
+        self._selected_profile_topic_received = False
+        self._announced_item_profile_key: str | None = None
+        self._selected_profile_announcement_generation = 0
+        self._applied_profile_announcement_generation = 0
         self._track_trigger_handler = None
         self._last_item_target: ItemPoseTarget | None = None
-        self.create_subscription(ToolVectorActual, 'dobot_msgs_v4/msg/ToolVectorActual', self._tcp_callback, 10)
+        self._tcp_pose_timer = self.create_timer(TCP_POSE_POLL_PERIOD_SEC, self._poll_tcp_pose)
         self.create_subscription(PoseStamped, self._item_pose_topic, self._item_pose_callback, 10)
+        self.create_subscription(String, self._di_status_topic, self._di_status_callback, 10)
+        selected_profile_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            String,
+            self._selected_profile_topic,
+            self._selected_profile_callback,
+            selected_profile_qos,
+        )
         self._start_sequence_service = self.create_service(
             TrayInterceptStart,
             self._start_sequence_service_name,
@@ -764,6 +873,11 @@ class ItemPickNode(Node):
             self._track_status_service_name,
             self._track_status_service_callback,
         )
+        self._auto_repick_service = self.create_service(
+            SetBool,
+            self._auto_repick_service_name,
+            self._auto_repick_service_callback,
+        )
         runtime_loaded = False
         if self._load_runtime_settings_on_start:
             runtime_loaded = self.load_runtime_settings(require_complete=self._headless)
@@ -774,15 +888,22 @@ class ItemPickNode(Node):
             )
         self._sync_profile_tool_offsets_from_state(force=True)
         self.get_logger().info(
-            'Item pick mode configured: MovL approach/descent/retract/final with explicit DO, '
-            'open-only pre-pick settle, suction-on descent, and pickup-depth settle.'
+            'Item pick mode configured: MovJ approach, queued MovLIO descent + immediate '
+            'MovL retract, DI1 confirmation, then MovL final Z-up.'
         )
         self.get_logger().info(f'Start item pick sequence service: {self._start_sequence_service_name}')
         self.get_logger().info(f'Track virtual-click service: {self._track_service_name}')
         self.get_logger().info(f'Track armed status service: {self._track_status_service_name}')
         self.get_logger().info(f'Item detect seek-complete service: {self._item_seek_complete_service_name}')
+        self.get_logger().info(f'Item detect repick service: {self._item_repick_service_name}')
+        self.get_logger().info(f'Auto Repick service: {self._auto_repick_service_name}')
         self.get_logger().info(f'Item pose topic: {self._item_pose_topic}')
+        self.get_logger().info(f'Item detect selected-profile topic: {self._selected_profile_topic}')
         self.get_logger().info(f'Motion service root: {self._motion_service_root}')
+        self.get_logger().info(
+            f'TCP pose service: {self._motion_service_root}/GetPose '
+            f'(user={self._tcp_pose_user}, tool={self._tcp_pose_tool})'
+        )
         self.get_logger().info(f'Gripper DO service: {self._gripper_do_service_name}')
         self.get_logger().info(
             'Startup settings: '
@@ -799,8 +920,7 @@ class ItemPickNode(Node):
             f'rz={self._tool_offset_rz_deg:.1f}), '
             f'approach_z={self._approach_z_up_mm:.0f} mm, '
             f'final_z_up={self._final_z_up_mm:.0f} mm, '
-            f'pre_pick_settle={self._pre_pick_settling_time_sec:.1f}s, '
-            f'pick_settle={self._pick_settling_time_sec:.1f}s'
+            f'pick_motion_speed={self._pick_motion_speed_percent}%'
         )
 
     def _reset_runtime_state_locked(self, reason: str) -> None:
@@ -810,8 +930,10 @@ class ItemPickNode(Node):
         self._item_pose_watch_seq_floor = self._item_pose_seq
         self._item_pose_watch_deadline_monotonic = 0.0
         self._cancel_requested = False
+        self._repick_start_joints_deg = None
+        self._pick_attempt = 0
         self._snapshot.busy = False
-        self._snapshot.action_text = reason
+        self._record_action_locked(reason)
 
     def _reset_runtime_state(self, reason: str) -> None:
         with self._lock:
@@ -829,15 +951,306 @@ class ItemPickNode(Node):
                 has_last_item=self._last_item_target is not None,
             )
 
-    def _tcp_callback(self, msg: ToolVectorActual) -> None:
+    def action_events_since(self, sequence: int) -> list[tuple[int, float, str]]:
         with self._lock:
-            self._snapshot.tcp_values['x'] = float(msg.x)
-            self._snapshot.tcp_values['y'] = float(msg.y)
-            self._snapshot.tcp_values['z'] = float(msg.z)
-            self._snapshot.tcp_values['rx'] = float(msg.rx)
-            self._snapshot.tcp_values['ry'] = float(msg.ry)
-            self._snapshot.tcp_values['rz'] = float(msg.rz)
+            return [
+                event
+                for event in self._action_events
+                if event[0] > int(sequence)
+            ]
+
+    def _record_action_locked(self, text: str) -> None:
+        normalized = str(text)
+        self._snapshot.action_text = normalized
+        if self._action_events and self._action_events[-1][2] == normalized:
+            return
+        self._action_event_seq += 1
+        self._action_events.append((self._action_event_seq, time.time(), normalized))
+
+    def _update_tcp_pose_cache(
+        self,
+        values: tuple[float, float, float, float, float, float],
+    ) -> None:
+        with self._lock:
+            self._snapshot.tcp_values['x'] = float(values[0])
+            self._snapshot.tcp_values['y'] = float(values[1])
+            self._snapshot.tcp_values['z'] = float(values[2])
+            self._snapshot.tcp_values['rx'] = float(values[3])
+            self._snapshot.tcp_values['ry'] = float(values[4])
+            self._snapshot.tcp_values['rz'] = float(values[5])
             self._snapshot.tcp_stamp = time.time()
+
+    def _poll_tcp_pose(self) -> None:
+        if self._tcp_pose_request_in_flight:
+            return
+        if not self._get_pose_client.service_is_ready():
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(
+                    f'TCP pose service is not ready: {self._motion_service_root}/GetPose'
+                )
+                self._tcp_pose_warning_logged = True
+            return
+
+        request = GetPose.Request()
+        request.user = self._tcp_pose_user
+        request.tool = self._tcp_pose_tool
+        self._tcp_pose_request_in_flight = True
+        future = self._get_pose_client.call_async(request)
+        future.add_done_callback(self._handle_tcp_pose_response)
+
+    def _handle_tcp_pose_response(self, future) -> None:
+        self._tcp_pose_request_in_flight = False
+        try:
+            response = future.result()
+        except Exception as exc:
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(f'GetPose call failed while caching TCP pose: {exc}')
+                self._tcp_pose_warning_logged = True
+            return
+        if response is None or int(getattr(response, 'res', -1)) < 0:
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(
+                    f'GetPose failed while caching TCP pose: '
+                    f'res={getattr(response, "res", None)}, '
+                    f'return={getattr(response, "robot_return", "")}'
+                )
+                self._tcp_pose_warning_logged = True
+            return
+        values = self._parse_six_values_from_robot_return(getattr(response, 'robot_return', ''))
+        if values is None:
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(
+                    f'Could not parse GetPose reply while caching TCP pose: '
+                    f'{getattr(response, "robot_return", "")}'
+                )
+                self._tcp_pose_warning_logged = True
+            return
+        self._tcp_pose_warning_logged = False
+        self._update_tcp_pose_cache(values)
+
+    def _di_status_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+            bits = int(payload.get('digital_input_bits', 0))
+        except Exception as exc:
+            with self._lock:
+                should_log = not self._di_status_parse_warning_logged
+                self._di_status_parse_warning_logged = True
+            if should_log:
+                self.get_logger().warn(
+                    f'Invalid DI status payload on "{self._di_status_topic}": {exc}'
+                )
+            return
+
+        with self._lock:
+            self._di_status_bits = bits
+            self._di_status_stamp = time.time()
+            self._di_status_parse_warning_logged = False
+
+    def _selected_profile_callback(self, msg: String) -> None:
+        normalized = self._normalize_profile_key(msg.data)
+        profile_key = normalized or None
+        with self._lock:
+            if (
+                self._selected_profile_topic_received
+                and profile_key == self._announced_item_profile_key
+            ):
+                return
+            self._selected_profile_topic_received = True
+            self._announced_item_profile_key = profile_key
+            self._selected_profile_announcement_generation += 1
+            busy = bool(self._snapshot.busy or self._item_pose_watch_armed)
+
+        if busy:
+            self.get_logger().info(
+                'Item detect selected profile changed while item pick is active; '
+                'settings update deferred until standby.'
+            )
+            return
+
+        active_profile_key, saved_offsets = self._sync_profile_tool_offsets_from_state(force=True)
+        profile_name = self._profile_display_name(active_profile_key)
+        if active_profile_key is None:
+            self.get_logger().info('Item detect reported no selected item teach.')
+        elif saved_offsets is None:
+            self.get_logger().warn(
+                f'Item detect selected "{profile_name}", but it has no saved EE/tool settings.'
+            )
+        else:
+            self.get_logger().info(
+                f'Loaded item pick settings for item detect teach "{profile_name}".'
+            )
+
+    def _suction_status_active_from_bits(self, bits: int) -> bool:
+        return bool(int(bits) & (1 << SUCTION_STATUS_BIT_INDEX))
+
+    def _wait_for_fresh_suction_status(
+        self,
+        not_before_sec: float,
+        timeout_sec: float = DI_STATUS_FRESH_SAMPLE_TIMEOUT_SEC,
+    ) -> tuple[bool | None, str]:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok():
+            if self._is_cancel_requested():
+                return None, f'Sequence cancelled while waiting for DI{SUCTION_STATUS_DI_INDEX} suction status.'
+            with self._lock:
+                stamp = self._di_status_stamp
+                bits = int(self._di_status_bits)
+            if stamp is not None and stamp >= float(not_before_sec):
+                active = self._suction_status_active_from_bits(bits)
+                if active:
+                    return True, f'Fresh DI{SUCTION_STATUS_DI_INDEX} sample is ACTIVE after retract.'
+                return False, f'Fresh DI{SUCTION_STATUS_DI_INDEX} sample is inactive after retract.'
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+
+        return (
+            False,
+            f'No fresh DI status received from "{self._di_status_topic}" within '
+            f'{float(timeout_sec):.1f}s after retract.',
+        )
+
+    @staticmethod
+    def _parse_robot_mode_code(raw_text: object) -> int | None:
+        values = re.findall(r'-?\d+', str(raw_text or ''))
+        if len(values) == 1:
+            return int(values[0])
+        return None
+
+    def _read_robot_mode_code(self, timeout_sec: float = 0.5) -> int | None:
+        timeout_sec = max(0.1, float(timeout_sec))
+        if not self._robot_mode_client.wait_for_service(timeout_sec=min(0.2, timeout_sec)):
+            return None
+
+        future = self._robot_mode_client.call_async(RobotMode.Request())
+        started = time.time()
+        while rclpy.ok() and not future.done():
+            if (time.time() - started) >= timeout_sec:
+                return None
+            time.sleep(0.02)
+
+        if not future.done():
+            return None
+        exception = future.exception()
+        if exception is not None:
+            return None
+        response = future.result()
+        if response is None or int(getattr(response, 'res', -1)) < 0:
+            return None
+        return self._parse_robot_mode_code(getattr(response, 'robot_return', ''))
+
+    def _wait_for_retract_motion_finished(
+        self,
+        *,
+        stable_sec: float = TCP_RETRACT_STABILITY_SEC,
+        timeout_sec: float = TCP_RETRACT_PHASE_TIMEOUT_SEC,
+    ) -> bool:
+        self._set_action_text(
+            'Retract command queued. Waiting for robot motion to finish...'
+        )
+        started = time.monotonic()
+        deadline = started + max(0.1, float(timeout_sec))
+        stable_since: float | None = None
+        saw_running = False
+        last_mode: int | None = None
+
+        while rclpy.ok():
+            if self._is_cancel_requested():
+                self._set_action_text('Sequence cancelled while waiting for retract completion.')
+                return False
+
+            mode = self._read_robot_mode_code(timeout_sec=0.5)
+            if mode is not None:
+                last_mode = mode
+                if mode in (ROBOT_MODE_RUNNING, ROBOT_MODE_JOGGING):
+                    saw_running = True
+                    stable_since = None
+                elif mode == ROBOT_MODE_ENABLED:
+                    if saw_running or (time.monotonic() - started) >= 1.0:
+                        if stable_since is None:
+                            stable_since = time.monotonic()
+                        elif (time.monotonic() - stable_since) >= max(0.0, float(stable_sec)):
+                            self._set_action_text(
+                                f'Retract motion complete; robot idle for {stable_sec:.1f}s.'
+                            )
+                            return True
+                    else:
+                        stable_since = None
+                elif mode in (ROBOT_MODE_ERROR, ROBOT_MODE_PAUSED):
+                    self._set_action_text(
+                        f'Robot mode {mode} while waiting for retract completion.'
+                    )
+                    return False
+                else:
+                    stable_since = None
+
+            if time.monotonic() >= deadline:
+                mode_text = 'unknown' if last_mode is None else str(last_mode)
+                self._set_action_text(
+                    f'Timed out waiting for retract completion '
+                    f'(last RobotMode={mode_text}, saw_running={saw_running}).'
+                )
+                return False
+            time.sleep(0.05)
+
+        self._set_action_text('ROS shutdown while waiting for retract completion.')
+        return False
+
+    def _wait_for_tcp_xyz_goal(
+        self,
+        goal_xyz_mm: tuple[float, float, float],
+        phase_label: str,
+        *,
+        stable_sec: float = 0.0,
+        timeout_sec: float = TCP_RETRACT_PHASE_TIMEOUT_SEC,
+    ) -> bool:
+        tolerance_mm = TCP_RETRACT_GOAL_TOLERANCE_MM
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        phase_started_sec = time.time()
+        stable_since: float | None = None
+        last_processed_stamp: float | None = None
+        last_distance_mm = math.inf
+        self._set_action_text(f'{phase_label}: waiting for robot TCP feedback...')
+
+        while rclpy.ok():
+            if self._is_cancel_requested():
+                self._set_action_text(f'Sequence cancelled during {phase_label.lower()}.')
+                return False
+
+            snapshot = self.snapshot()
+            if (
+                snapshot.tcp_stamp is not None
+                and snapshot.tcp_stamp >= phase_started_sec
+                and snapshot.tcp_stamp != last_processed_stamp
+            ):
+                last_processed_stamp = snapshot.tcp_stamp
+                dx = float(snapshot.tcp_values.get('x', 0.0)) - float(goal_xyz_mm[0])
+                dy = float(snapshot.tcp_values.get('y', 0.0)) - float(goal_xyz_mm[1])
+                dz = float(snapshot.tcp_values.get('z', 0.0)) - float(goal_xyz_mm[2])
+                last_distance_mm = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+                if last_distance_mm <= tolerance_mm:
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                    if (time.monotonic() - stable_since) >= max(0.0, float(stable_sec)):
+                        self._set_action_text(
+                            f'{phase_label} complete '
+                            f'(TCP error {last_distance_mm:.1f} mm).'
+                        )
+                        return True
+                else:
+                    stable_since = None
+
+            if time.monotonic() >= deadline:
+                self._set_action_text(
+                    f'Timed out during {phase_label.lower()} '
+                    f'(last TCP error {last_distance_mm:.1f} mm).'
+                )
+                return False
+            time.sleep(0.02)
+
+        self._set_action_text(f'ROS shutdown during {phase_label.lower()}.')
+        return False
 
     @staticmethod
     def _rpy_deg_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> tuple[float, float, float, float]:
@@ -1277,19 +1690,17 @@ class ItemPickNode(Node):
                     float(profile_offsets.get('final_z_up_mm', self._final_z_up_mm)),
                 ),
             ),
-            'pre_pick_settling_time_sec': max(
-                SETTLING_TIME_MIN_SEC,
-                min(
-                    SETTLING_TIME_MAX_SEC,
-                    float(profile_offsets.get('pre_pick_settling_time_sec', self._pre_pick_settling_time_sec)),
-                ),
-            ),
-            'pick_settling_time_sec': max(
-                SETTLING_TIME_MIN_SEC,
-                min(
-                    SETTLING_TIME_MAX_SEC,
-                    float(profile_offsets.get('pick_settling_time_sec', self._pick_settling_time_sec)),
-                ),
+            'pick_motion_speed_percent': int(
+                max(
+                    PICK_MOTION_SPEED_PERCENT_MIN,
+                    min(
+                        PICK_MOTION_SPEED_PERCENT_MAX,
+                        float(profile_offsets.get(
+                            'pick_motion_speed_percent',
+                            self._pick_motion_speed_percent,
+                        )),
+                    ),
+                )
             ),
             'tool_offset_x_mm': self._clamp_tool_offset_translation_mm(
                 profile_offsets.get('tool_offset_x_mm', 0.0)
@@ -1315,8 +1726,7 @@ class ItemPickNode(Node):
         self._post_stop_z_offset_mm = float(profile_offsets['item_standoff_z_mm'])
         self._approach_z_up_mm = float(profile_offsets['approach_z_up_mm'])
         self._final_z_up_mm = float(profile_offsets['final_z_up_mm'])
-        self._pre_pick_settling_time_sec = float(profile_offsets['pre_pick_settling_time_sec'])
-        self._pick_settling_time_sec = float(profile_offsets['pick_settling_time_sec'])
+        self._pick_motion_speed_percent = int(profile_offsets['pick_motion_speed_percent'])
         self._tool_offset_x_mm = float(profile_offsets['tool_offset_x_mm'])
         self._tool_offset_y_mm = float(profile_offsets['tool_offset_y_mm'])
         self._tool_offset_z_mm = float(profile_offsets['tool_offset_z_mm'])
@@ -1434,13 +1844,6 @@ class ItemPickNode(Node):
         worker.start()
 
     def _sync_profile_tool_offsets_from_state(self, force: bool = False) -> tuple[str | None, dict[str, float] | None]:
-        if not self.has_item_pose_publisher():
-            self._profile_state_mtime_ns = None
-            with self._lock:
-                self._active_item_profile_key = None
-                self._active_profile_saved_tool_offsets = None
-            return None, None
-
         profile_state_path = self._item_profile_state_path
         try:
             current_mtime_ns = profile_state_path.stat().st_mtime_ns
@@ -1452,7 +1855,19 @@ class ItemPickNode(Node):
             )
             current_mtime_ns = None
 
-        if not force and current_mtime_ns == self._profile_state_mtime_ns:
+        with self._lock:
+            topic_received = bool(self._selected_profile_topic_received)
+            announced_profile_key = self._announced_item_profile_key
+            announcement_generation = self._selected_profile_announcement_generation
+            announcement_applied = (
+                announcement_generation == self._applied_profile_announcement_generation
+            )
+
+        if (
+            not force
+            and announcement_applied
+            and current_mtime_ns == self._profile_state_mtime_ns
+        ):
             with self._lock:
                 saved_offsets = (
                     dict(self._active_profile_saved_tool_offsets)
@@ -1462,7 +1877,11 @@ class ItemPickNode(Node):
                 return self._active_item_profile_key, saved_offsets
 
         self._profile_state_mtime_ns = current_mtime_ns
-        active_profile_key = self._read_active_item_profile_key()
+        active_profile_key = (
+            announced_profile_key
+            if topic_received
+            else self._read_active_item_profile_key()
+        )
         saved_offsets = None
         if active_profile_key is not None:
             saved_offsets = self._load_saved_tool_offsets_for_profile(active_profile_key)
@@ -1472,6 +1891,8 @@ class ItemPickNode(Node):
             self._active_profile_saved_tool_offsets = dict(saved_offsets) if saved_offsets is not None else None
             if saved_offsets is not None:
                 self._apply_saved_tool_offsets_locked(saved_offsets)
+            if self._selected_profile_announcement_generation == announcement_generation:
+                self._applied_profile_announcement_generation = announcement_generation
         return active_profile_key, dict(saved_offsets) if saved_offsets is not None else None
 
     def get_active_profile_tool_offset_state(self, force: bool = False) -> tuple[str | None, dict[str, float] | None]:
@@ -1570,20 +1991,34 @@ class ItemPickNode(Node):
                 FINAL_Z_UP_MAX,
                 self._final_z_up_mm,
             )
-            self._pre_pick_settling_time_sec = self._clamp_float(
-                payload.get('pre_pick_settling_time_sec', self._pre_pick_settling_time_sec),
-                SETTLING_TIME_MIN_SEC,
-                SETTLING_TIME_MAX_SEC,
-                self._pre_pick_settling_time_sec,
-            )
-            self._pick_settling_time_sec = self._clamp_float(
-                payload.get('pick_settling_time_sec', self._pick_settling_time_sec),
-                SETTLING_TIME_MIN_SEC,
-                SETTLING_TIME_MAX_SEC,
-                self._pick_settling_time_sec,
+            self._pick_motion_speed_percent = int(self._clamp_float(
+                payload.get('pick_motion_speed_percent', self._pick_motion_speed_percent),
+                PICK_MOTION_SPEED_PERCENT_MIN,
+                PICK_MOTION_SPEED_PERCENT_MAX,
+                self._pick_motion_speed_percent,
+            ))
+            self._auto_repick_on_failed_suction = bool(
+                payload.get('auto_repick_on_failed_suction', self._auto_repick_on_failed_suction)
             )
         self.get_logger().info(f'Loaded item pick runtime settings: {settings_path}')
         return True
+
+    def set_auto_repick_on_failed_suction(self, enabled: bool) -> None:
+        with self._lock:
+            self._auto_repick_on_failed_suction = bool(enabled)
+
+    def _auto_repick_service_callback(
+        self,
+        request: SetBool.Request,
+        response: SetBool.Response,
+    ) -> SetBool.Response:
+        enabled = bool(request.data)
+        self.set_auto_repick_on_failed_suction(enabled)
+        state = 'enabled' if enabled else 'disabled'
+        response.success = True
+        response.message = f'Auto Repick {state}.'
+        self._set_action_text(response.message)
+        return response
 
     @staticmethod
     def _solve_intercept_time_sec(
@@ -1959,8 +2394,7 @@ class ItemPickNode(Node):
         z_offset_mm = 0.0
         approach_z_up_mm = 0.0
         final_z_up_mm = 0.0
-        pre_pick_settling_time_sec = 0.0
-        pick_settling_time_sec = 0.0
+        pick_motion_speed_percent = PICK_MOTION_SPEED_PERCENT_DEFAULT
         tool_offset_x_mm = 0.0
         tool_offset_y_mm = 0.0
         tool_offset_z_mm = 0.0
@@ -1978,15 +2412,17 @@ class ItemPickNode(Node):
             if self._item_pose_watch_stop_dispatched:
                 return
             if time.monotonic() > self._item_pose_watch_deadline_monotonic:
-                watch_timeout_sec = float(self._item_pose_watch_timeout_sec)
-                self._reset_runtime_state_locked(
-                    f'No item pose within {watch_timeout_sec:.0f}s. Node reset.'
+                self._item_pose_watch_deadline_monotonic = (
+                    time.monotonic() + float(self._item_pose_watch_timeout_sec)
                 )
-                return
 
             self._item_pose_watch_armed = False
             self._item_pose_watch_stop_dispatched = True
             tf_only_mode = bool(self._item_pose_watch_tf_only_mode)
+            self._record_action_locked(
+                'Item pose received; item pick disarmed. '
+                + ('Previewing TF; Seek remains ON...' if tf_only_mode else 'Starting pick sequence...')
+            )
             watch_timeout_sec = float(self._item_pose_watch_timeout_sec)
             should_send_stop = True
             dispatch_target = item_target
@@ -1996,8 +2432,7 @@ class ItemPickNode(Node):
             z_offset_mm = float(self._post_stop_z_offset_mm)
             approach_z_up_mm = float(self._approach_z_up_mm)
             final_z_up_mm = float(self._final_z_up_mm)
-            pre_pick_settling_time_sec = float(self._pre_pick_settling_time_sec)
-            pick_settling_time_sec = float(self._pick_settling_time_sec)
+            pick_motion_speed_percent = int(self._pick_motion_speed_percent)
             tool_offset_x_mm = float(self._tool_offset_x_mm)
             tool_offset_y_mm = float(self._tool_offset_y_mm)
             tool_offset_z_mm = float(self._tool_offset_z_mm)
@@ -2019,8 +2454,6 @@ class ItemPickNode(Node):
                         z_offset_mm,
                         approach_z_up_mm,
                         final_z_up_mm,
-                        pre_pick_settling_time_sec,
-                        pick_settling_time_sec,
                         tool_offset_x_mm,
                         tool_offset_y_mm,
                         tool_offset_z_mm,
@@ -2045,8 +2478,7 @@ class ItemPickNode(Node):
                     z_offset_mm,
                     approach_z_up_mm,
                     final_z_up_mm,
-                    pre_pick_settling_time_sec,
-                    pick_settling_time_sec,
+                    pick_motion_speed_percent,
                     tool_offset_x_mm,
                     tool_offset_y_mm,
                     tool_offset_z_mm,
@@ -2227,6 +2659,195 @@ class ItemPickNode(Node):
             return False, v_percent, mapping_source
         return True, v_percent, mapping_source
 
+    def _send_movj_goal(
+        self,
+        goal: tuple[float, float, float, float, float, float],
+        reference_pose: tuple[float, float, float, float, float, float] | None,
+        speed_mm_s: float,
+        label_prefix: str,
+        forced_v_percent: int | None = None,
+        forced_a_percent: int | None = None,
+    ) -> tuple[bool, int, str]:
+        _ = (reference_pose, speed_mm_s)
+        if not self._wait_for_service(self._mov_j_client, 'MovJ'):
+            return False, 0, 'service_unavailable'
+        if forced_v_percent is not None:
+            v_percent = max(1, min(100, int(forced_v_percent)))
+            mapping_source = 'forced'
+        else:
+            v_percent = 100
+            mapping_source = 'locked_max'
+        a_percent = DEFAULT_ACC_PERCENT
+        if forced_a_percent is not None:
+            a_percent = max(1, min(100, int(forced_a_percent)))
+
+        movj_request = MovJ.Request()
+        movj_request.mode = False
+        movj_request.a = float(goal[0])
+        movj_request.b = float(goal[1])
+        movj_request.c = float(goal[2])
+        movj_request.d = float(goal[3])
+        movj_request.e = float(goal[4])
+        movj_request.f = float(goal[5])
+        movj_request.param_value = self._build_motion_param_value(v_percent, a_percent)
+        movj_label = (
+            f'{label_prefix}('
+            f'{movj_request.a:.1f},{movj_request.b:.1f},{movj_request.c:.1f},'
+            f'{movj_request.d:.2f},{movj_request.e:.2f},{movj_request.f:.2f},'
+            f'v={v_percent},a={a_percent})'
+        )
+        movj_response = self._call_service(self._mov_j_client, movj_request, movj_label)
+        if movj_response is None:
+            return False, v_percent, mapping_source
+        if int(getattr(movj_response, 'res', -1)) < 0:
+            return False, v_percent, mapping_source
+        return True, v_percent, mapping_source
+
+    def _send_movj_joint_goal(
+        self,
+        joints_deg: tuple[float, float, float, float, float, float],
+        label_prefix: str,
+        forced_v_percent: int = 100,
+        forced_a_percent: int = 100,
+    ) -> bool:
+        if not self._wait_for_service(self._mov_j_client, 'MovJ'):
+            return False
+
+        v_percent = max(1, min(100, int(forced_v_percent)))
+        a_percent = max(1, min(100, int(forced_a_percent)))
+        request = MovJ.Request()
+        request.mode = True
+        request.a = float(joints_deg[0])
+        request.b = float(joints_deg[1])
+        request.c = float(joints_deg[2])
+        request.d = float(joints_deg[3])
+        request.e = float(joints_deg[4])
+        request.f = float(joints_deg[5])
+        request.param_value = self._build_motion_param_value(v_percent, a_percent)
+        label = (
+            f'{label_prefix}(joint='
+            f'{{{request.a:.3f},{request.b:.3f},{request.c:.3f},'
+            f'{request.d:.3f},{request.e:.3f},{request.f:.3f}}},'
+            f'v={v_percent},a={a_percent})'
+        )
+        response = self._call_service(self._mov_j_client, request, label)
+        return response is not None and int(getattr(response, 'res', -1)) >= 0
+
+    @staticmethod
+    def _parse_six_values_from_robot_return(
+        robot_return: object,
+    ) -> tuple[float, float, float, float, float, float] | None:
+        text = str(robot_return or '')
+        if not text:
+            return None
+        float_pattern = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+        for content in re.findall(r'\{([^{}]+)\}', text):
+            values = [float(token) for token in re.findall(float_pattern, content)]
+            if len(values) == 6:
+                return tuple(values)  # type: ignore[return-value]
+        values = [float(token) for token in re.findall(float_pattern, text)]
+        if len(values) == 6:
+            return tuple(values)  # type: ignore[return-value]
+        return None
+
+    @staticmethod
+    def _parse_joint_values_from_robot_return(
+        robot_return: object,
+    ) -> tuple[float, float, float, float, float, float] | None:
+        return ItemPickNode._parse_six_values_from_robot_return(robot_return)
+
+    def _read_robot_joint_angles(
+        self,
+        timeout_sec: float = 2.0,
+    ) -> tuple[float, float, float, float, float, float] | None:
+        if not self._get_angle_client.service_is_ready():
+            if not self._get_angle_client.wait_for_service(timeout_sec=min(0.5, timeout_sec)):
+                return None
+
+        future = self._get_angle_client.call_async(GetAngle.Request())
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        while rclpy.ok() and not future.done():
+            if self._is_cancel_requested() or time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+        if not future.done() or future.exception() is not None:
+            return None
+
+        response = future.result()
+        if response is None or int(getattr(response, 'res', -1)) < 0:
+            return None
+        return self._parse_joint_values_from_robot_return(
+            getattr(response, 'robot_return', ''),
+        )
+
+    def _capture_repick_start_joints(self) -> bool:
+        with self._lock:
+            if self._repick_start_joints_deg is not None:
+                return True
+
+        self._set_action_text('Saving current robot joints as the repick start position...')
+        joints_deg = self._read_robot_joint_angles()
+        if joints_deg is None:
+            self._set_action_text(
+                'Could not read current robot joints. Pick was not started; Seek remains ON.'
+            )
+            return False
+
+        with self._lock:
+            if self._cancel_requested:
+                return False
+            self._repick_start_joints_deg = joints_deg
+            self._pick_attempt = 1
+        self.get_logger().info(
+            'Saved repick start joints (deg): '
+            f'[{", ".join(f"{value:.3f}" for value in joints_deg)}]'
+        )
+        return True
+
+    def _wait_for_repick_start_joints(
+        self,
+        goal_joints_deg: tuple[float, float, float, float, float, float],
+        timeout_sec: float = REPICK_START_TIMEOUT_SEC,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        stable_since: float | None = None
+        last_max_delta = float('inf')
+        self._set_action_text('Returning to saved repick start joints...')
+
+        while rclpy.ok():
+            if self._is_cancel_requested():
+                self._set_action_text('Sequence cancelled while returning to repick start.')
+                return False
+
+            current_joints = self._read_robot_joint_angles(timeout_sec=1.0)
+            if current_joints is not None:
+                last_max_delta = max(
+                    abs(float(current) - float(goal))
+                    for current, goal in zip(current_joints, goal_joints_deg)
+                )
+                if last_max_delta <= REPICK_JOINT_TOLERANCE_DEG:
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                    elif (time.monotonic() - stable_since) >= self._repick_start_stability_sec:
+                        self._set_action_text(
+                            'Robot reached saved repick start '
+                            f'(max joint error {last_max_delta:.2f} deg).'
+                        )
+                        return True
+                else:
+                    stable_since = None
+
+            if time.monotonic() >= deadline:
+                self._set_action_text(
+                    'Timed out returning to saved repick start '
+                    f'(last max joint error {last_max_delta:.2f} deg). Seek remains ON.'
+                )
+                return False
+            time.sleep(0.1)
+
+        self._set_action_text('ROS shutdown while returning to saved repick start.')
+        return False
+
     @staticmethod
     def _build_movelio_do_token(
         mode: int,
@@ -2240,7 +2861,13 @@ class ItemPickNode(Node):
         return [
             self._build_movelio_do_token(
                 MOVLIO_DO_MODE_PERCENT,
-                MOVLIO_PICKUP_START_DISTANCE_PERCENT,
+                MOVLIO_PICKUP_EXHAUST_OFF_DISTANCE_PERCENT,
+                GRIPPER_DO_EXHAUST_INDEX,
+                0,
+            ),
+            self._build_movelio_do_token(
+                MOVLIO_DO_MODE_PERCENT,
+                MOVLIO_PICKUP_SUCTION_ON_DISTANCE_PERCENT,
                 GRIPPER_DO_SUCTION_INDEX,
                 1,
             )
@@ -2321,79 +2948,55 @@ class ItemPickNode(Node):
 
     def _gripper_set_open_no_suction(self) -> bool:
         self._set_action_text(
-            'Gripper pre-pick state: disable close (DO1 OFF), disable suction (DO3 OFF), enable open (DO2 ON)...'
+            'Gripper pre-pick state: disable close/suction/exhaust, enable open...'
         )
         if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 0):
             return False
         if not self._send_do(GRIPPER_DO_SUCTION_INDEX, 0):
             return False
+        if not self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0):
+            return False
         return self._send_do(GRIPPER_DO_OPEN_INDEX, 1)
 
     def _gripper_set_close_hold(self) -> bool:
         self._set_action_text(
-            'Gripper close-hold: disable open (DO2 OFF), enable close (DO1 ON), enable suction (DO3 ON)...'
+            'Gripper close-hold: disable exhaust/open, enable close and suction...'
         )
+        if not self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0):
+            return False
         if not self._send_do(GRIPPER_DO_OPEN_INDEX, 0):
             return False
         if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 1):
             return False
         return self._send_do(GRIPPER_DO_SUCTION_INDEX, 1)
 
-    def _wait_for_tcp_xyz_goal(
-        self,
-        goal_xyz_mm: tuple[float, float, float],
-        tolerance_mm: float = TCP_GOAL_REACHED_TOLERANCE_MM,
-        timeout_sec: float | None = None,
-        update_action_text: bool = True,
-    ) -> bool:
-        tolerance = max(0.1, float(tolerance_mm))
-        deadline = None
-        if timeout_sec is not None:
-            deadline = time.monotonic() + max(0.1, float(timeout_sec))
-        while rclpy.ok():
-            if self._is_cancel_requested():
-                if update_action_text:
-                    self._set_action_text('Sequence cancelled while waiting for pick position.')
-                return False
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            snapshot = self.snapshot()
-            if snapshot.tcp_stamp is None:
-                time.sleep(0.02)
-                continue
-            dx = float(snapshot.tcp_values.get('x', 0.0)) - float(goal_xyz_mm[0])
-            dy = float(snapshot.tcp_values.get('y', 0.0)) - float(goal_xyz_mm[1])
-            dz = float(snapshot.tcp_values.get('z', 0.0)) - float(goal_xyz_mm[2])
-            distance_mm = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
-            if distance_mm <= tolerance:
-                return True
-            time.sleep(0.02)
-        if not rclpy.ok():
-            if update_action_text:
-                self._set_action_text('ROS shutdown while waiting for pick pose reach.')
+    def _gripper_purge_exhaust(self, purge_ms: int = PICK_PURGE_EXHAUST_MS) -> bool:
+        purge_ms = max(0, int(purge_ms))
+        self._set_action_text(f'Pickup not confirmed: purging suction with DO4 for {purge_ms} ms...')
+        if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 0):
             return False
-        if update_action_text:
-            self._set_action_text(
-                f'Timeout waiting for pick pose reach (tol={tolerance:.1f} mm).'
-            )
-        return False
+        if not self._send_do(GRIPPER_DO_SUCTION_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_OPEN_INDEX, 1):
+            return False
+        if not self._send_do(GRIPPER_DO_EXHAUST_INDEX, 1):
+            return False
 
-    def _wait_settling_time(self, settling_time_sec: float, label: str) -> bool:
-        wait_sec = max(0.0, float(settling_time_sec))
-        if wait_sec <= 1e-6:
-            return True
-        self._set_action_text(f'{label}: settling for {wait_sec:.1f}s...')
-        deadline = time.monotonic() + wait_sec
+        deadline = time.monotonic() + (float(purge_ms) * 0.001)
         while rclpy.ok():
             if self._is_cancel_requested():
-                self._set_action_text('Sequence cancelled during settling wait.')
+                self._set_action_text('Sequence cancelled during DO4 purge.')
                 return False
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
-                return True
-            time.sleep(min(0.02, remaining))
-        self._set_action_text('ROS shutdown during settling wait.')
-        return False
+                break
+            time.sleep(min(0.01, remaining))
+
+        return self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0)
+
+    @staticmethod
+    def _angle_delta_abs_deg(lhs: float, rhs: float) -> float:
+        return abs((float(lhs) - float(rhs) + 180.0) % 360.0 - 180.0)
 
     def _preview_goal_only_request(
         self,
@@ -2403,8 +3006,6 @@ class ItemPickNode(Node):
         z_offset_mm: float,
         approach_z_up_mm: float,
         final_z_up_mm: float,
-        pre_pick_settling_time_sec: float,
-        pick_settling_time_sec: float,
         tool_offset_x_mm: float,
         tool_offset_y_mm: float,
         tool_offset_z_mm: float,
@@ -2444,17 +3045,18 @@ class ItemPickNode(Node):
                 f'Previewed approach goal from {base_goal.source_frame_id}: '
                 f'pick pose + Z stand-off ({z_offset_mm:.1f} mm), with Approach Z '
                 f'({approach_z_up_mm:.1f} mm), final Z-up ({final_z_up_mm:.1f} mm), '
-                f'pre-pick settle {pre_pick_settling_time_sec:.1f}s, '
-                f'pick settle {pick_settling_time_sec:.1f}s, '
                 f'tool offset=({tool_offset_x_mm:.1f},{tool_offset_y_mm:.1f},{tool_offset_z_mm:.1f},'
                 f'{tool_offset_rx_deg:.1f},{tool_offset_ry_deg:.1f},{tool_offset_rz_deg:.1f}). '
-                f'TF-only frame="{self._post_stop_movel_goal_debug_frame_id}".'
+                f'TF-only frame="{self._post_stop_movel_goal_debug_frame_id}". Seek remains ON.'
             )
         except Exception as exc:
             self.get_logger().error(f'Preview goal computation failed: {exc}')
             self._set_action_text(f'Preview goal computation failed: {exc}')
         finally:
-            self._set_busy(False)
+            with self._lock:
+                self._repick_start_joints_deg = None
+                self._pick_attempt = 0
+                self._snapshot.busy = False
 
     def _arm_item_pose_watch_locked(self) -> int:
         self._item_pose_watch_generation += 1
@@ -2473,7 +3075,8 @@ class ItemPickNode(Node):
         while rclpy.ok():
             if self.count_publishers(self._item_pose_topic) <= 0:
                 self._reset_runtime_state(
-                    f'No item pose publisher on "{self._item_pose_topic}". Node reset.'
+                    f'No item pose publisher on "{self._item_pose_topic}". '
+                    'Item pick reset; Seek remains ON.'
                 )
                 return
             with self._lock:
@@ -2487,10 +3090,14 @@ class ItemPickNode(Node):
                         ITEM_POSE_WATCH_TIMEOUT_MIN,
                         min(ITEM_POSE_WATCH_TIMEOUT_MAX, float(self._item_pose_watch_timeout_sec)),
                     )
-                    self._reset_runtime_state_locked(
-                        f'No item pose within {watch_timeout_sec:.0f}s. Node reset.'
+                    self._item_pose_watch_deadline_monotonic = (
+                        time.monotonic() + watch_timeout_sec
                     )
-                    return
+                    self._record_action_locked(
+                        f'Still waiting for a fresh item pose after {watch_timeout_sec:.0f}s. '
+                        'Item pick remains armed and Seek remains ON.'
+                    )
+                    remaining_sec = watch_timeout_sec
             time.sleep(min(0.1, max(0.02, remaining_sec)))
 
     def _send_movel_request(
@@ -2502,8 +3109,7 @@ class ItemPickNode(Node):
         z_offset_mm: float,
         approach_z_up_mm: float,
         final_z_up_mm: float,
-        pre_pick_settling_time_sec: float,
-        pick_settling_time_sec: float,
+        pick_motion_speed_percent: int,
         tool_offset_x_mm: float,
         tool_offset_y_mm: float,
         tool_offset_z_mm: float,
@@ -2511,13 +3117,22 @@ class ItemPickNode(Node):
         tool_offset_ry_deg: float,
         tool_offset_rz_deg: float,
     ) -> None:
-        seek_complete_notified = False
-        busy_released_after_final_zup_queue = False
+        repick_rearmed = False
+        final_zup_queued = False
+        pick_v_percent_setting = max(
+            PICK_MOTION_SPEED_PERCENT_MIN,
+            min(PICK_MOTION_SPEED_PERCENT_MAX, int(pick_motion_speed_percent)),
+        )
         try:
             if self._is_cancel_requested():
                 self._set_action_text('Sequence cancelled before dispatch.')
                 return
+            if not self._capture_repick_start_joints():
+                return
+            with self._lock:
+                attempt = max(1, int(self._pick_attempt))
             self._set_action_text('Computing item goal in base frame...')
+            self.get_logger().info(f'Starting item pick attempt {attempt}.')
 
             if self._is_cancel_requested():
                 self._set_action_text('Sequence cancelled before goal computation.')
@@ -2582,12 +3197,12 @@ class ItemPickNode(Node):
             if self._is_cancel_requested():
                 self._set_action_text('Sequence cancelled before queued motion dispatch.')
                 return
-            self._set_action_text('Queueing approach and descent...')
-            approach_ok, approach_v, approach_map = self._send_movel_goal(
+            self._set_action_text('Queueing joint approach and linear descent...')
+            approach_ok, approach_v, approach_map = self._send_movj_goal(
                 approach_goal,
                 current_pose,
                 post_speed_mm_s,
-                f'MovL approach from {base_goal.source_frame_id}',
+                f'MovJ approach from {base_goal.source_frame_id}',
                 forced_v_percent=100,
                 forced_a_percent=100,
             )
@@ -2597,47 +3212,68 @@ class ItemPickNode(Node):
             if not self._gripper_set_open_no_suction():
                 return
 
-            if not self._wait_settling_time(pre_pick_settling_time_sec, 'Pickup open/no-suction state ready'):
-                return
-
             pick_ok, pick_v, pick_map = self._send_movelio_goal(
                 pick_goal,
                 approach_goal,
                 post_speed_mm_s,
                 'MovLIO descent + suction trigger',
                 mdis=self._build_pick_descent_mdis(),
-                forced_v_percent=PICK_DESCENT_SPEED_PERCENT,
+                forced_v_percent=pick_v_percent_setting,
                 forced_a_percent=100,
             )
             if not pick_ok:
-                return
-
-            self._set_action_text('Queued approach/descent. Monitoring pickup depth...')
-            if not self._wait_for_tcp_xyz_goal(
-                (pick_goal[0], pick_goal[1], pick_goal[2]),
-            ):
-                return
-            if not self._wait_settling_time(pick_settling_time_sec, 'Pickup depth reached'):
-                return
-
-            if not self._gripper_set_close_hold():
                 return
 
             retract_ok, retract_v, retract_map = self._send_movel_goal(
                 approach_goal,
                 pick_goal,
                 POST_STOP_MOVL_SPEED_MAX,
-                'MovL retract with close+suction state',
-                forced_v_percent=100,
+                'MovL retract with open+suction state',
+                forced_v_percent=pick_v_percent_setting,
                 forced_a_percent=100,
             )
             if not retract_ok:
                 return
 
-            self._set_action_text('Queued retract. Monitoring approach height...')
-            if not self._wait_for_tcp_xyz_goal(
-                (approach_goal[0], approach_goal[1], approach_goal[2]),
+            if not self._wait_for_retract_motion_finished(
+                stable_sec=TCP_RETRACT_STABILITY_SEC,
+                timeout_sec=TCP_RETRACT_PHASE_TIMEOUT_SEC,
             ):
+                return
+
+            self._set_action_text(
+                f'Retract finished. Reading fresh DI{SUCTION_STATUS_DI_INDEX} status...'
+            )
+            suction_check_started_sec = time.time()
+            suction_active, suction_message = self._wait_for_fresh_suction_status(
+                suction_check_started_sec
+            )
+            if suction_active is None:
+                self._set_action_text(suction_message)
+                return
+            if not suction_active:
+                self._set_action_text(
+                    f'{suction_message} Pickup not confirmed; final Z-up skipped. Seek remains ON.'
+                )
+                with self._lock:
+                    auto_repick_on_failed_suction = bool(self._auto_repick_on_failed_suction)
+                if not auto_repick_on_failed_suction:
+                    if not self._gripper_purge_exhaust(PICK_PURGE_EXHAUST_MS):
+                        return
+                    self._set_action_text(
+                        f'{suction_message} Pickup not confirmed; auto repick disabled. '
+                        'Standby with Seek still ON.'
+                    )
+                    return
+                if not self._execute_release_pulse(automatic=True):
+                    return
+                if not self._restart_item_pick_after_failed_suction():
+                    return
+                repick_rearmed = True
+                return
+
+            self._set_action_text(f'{suction_message} Closing gripper before final Z-up...')
+            if not self._gripper_set_close_hold():
                 return
 
             final_ok, final_v, final_map = self._send_movel_goal(
@@ -2651,25 +3287,30 @@ class ItemPickNode(Node):
             if not final_ok:
                 return
 
+            final_zup_queued = True
             seek_complete_notified = self._notify_item_detect_seek_complete()
-            busy_released_after_final_zup_queue = True
-            self._set_busy(False)
-            self._set_action_text('Queued pick sequence through final Z-up. Ready for next arm.')
-            if not self._wait_for_tcp_xyz_goal(
-                (final_z_goal[0], final_z_goal[1], final_z_goal[2]),
-                update_action_text=False,
-            ):
-                return
+            with self._lock:
+                self._repick_start_joints_deg = None
+                self._pick_attempt = 0
+                self._snapshot.busy = False
+            if seek_complete_notified:
+                self._set_action_text(
+                    'Queued pick sequence through final Z-up. Seek released; ready for next arm.'
+                )
+            else:
+                self._set_action_text(
+                    'Final Z-up queued, but item_detect seek release failed. Seek remains ON.'
+                )
 
             self.get_logger().info(
-                'Completed pick sequence (approach + open/no-suction DO + pre-pick settle + '
-                'MovLIO descent/suction + pickup-depth settle + close/suction DO + retract + final Z-up): '
+                'Queued pick sequence (MovJ approach + open/no-suction DO + '
+                'MovLIO descent/suction + immediate open/suction retract + '
+                f'DI{SUCTION_STATUS_DI_INDEX} check + close/suction DO + final Z-up): '
                 f'pick stand-off offsets (X {x_offset_mm:.0f}, Y {y_offset_mm:.0f}, Z {z_offset_mm:.0f} mm). '
                 f'tool offset=({tool_offset_x_mm:.1f},{tool_offset_y_mm:.1f},{tool_offset_z_mm:.1f},'
                 f'{tool_offset_rx_deg:.1f},{tool_offset_ry_deg:.1f},{tool_offset_rz_deg:.1f}). '
                 f'approach_z={approach_z_up_mm:.0f} mm, final_z_up={final_z_up_mm:.0f} mm, '
-                f'pre_pick_settle={pre_pick_settling_time_sec:.1f}s, '
-                f'pick_settle={pick_settling_time_sec:.1f}s. '
+                f'pick_motion_speed={pick_v_percent_setting}%. '
                 f'(v: approach={approach_v}/{approach_map}, down={pick_v}/{pick_map}, '
                 f'retract={retract_v}/{retract_map}, final-up={final_v}/{final_map}).'
             )
@@ -2677,10 +3318,12 @@ class ItemPickNode(Node):
             self.get_logger().error(f'MovL predicted-goal flow failed: {exc}')
             self._set_action_text(f'MovL predicted-goal flow failed: {exc}')
         finally:
-            if not seek_complete_notified:
-                self._notify_item_detect_seek_complete()
-            if not busy_released_after_final_zup_queue:
-                self._set_busy(False)
+            if not repick_rearmed:
+                with self._lock:
+                    self._snapshot.busy = False
+                    if not final_zup_queued:
+                        self._repick_start_joints_deg = None
+                        self._pick_attempt = 0
 
     def _notify_item_detect_seek_complete(self) -> bool:
         if not self._item_seek_complete_client.service_is_ready():
@@ -2713,7 +3356,7 @@ class ItemPickNode(Node):
 
     def _set_action_text(self, text: str) -> None:
         with self._lock:
-            self._snapshot.action_text = text
+            self._record_action_locked(text)
 
     def _set_busy(self, busy: bool) -> None:
         with self._lock:
@@ -2732,8 +3375,6 @@ class ItemPickNode(Node):
             float(request.tray_standoff_z_mm),
             float(request.follow_distance_mm),
             float(request.post_follow_z_up_mm),
-            self.get_pre_pick_settling_time_sec(),
-            self.get_pick_settling_time_sec(),
             bool(request.troubleshoot_tf_only),
         )
         with self._lock:
@@ -2804,8 +3445,6 @@ class ItemPickNode(Node):
             post_stop_y_offset_mm = float(self._post_stop_y_offset_mm)
             post_stop_z_offset_mm = float(self._post_stop_z_offset_mm)
             approach_z_up_mm = float(self._approach_z_up_mm)
-            pre_pick_settling_time_sec = float(self._pre_pick_settling_time_sec)
-            pick_settling_time_sec = float(self._pick_settling_time_sec)
             tf_only_mode = bool(self._item_pose_watch_tf_only_mode)
             tool_offset_x_mm = float(self._tool_offset_x_mm)
             tool_offset_y_mm = float(self._tool_offset_y_mm)
@@ -2822,8 +3461,6 @@ class ItemPickNode(Node):
             post_stop_z_offset_mm,
             0.0,
             approach_z_up_mm,
-            pre_pick_settling_time_sec,
-            pick_settling_time_sec,
             tf_only_mode,
             tool_offset_x_mm,
             tool_offset_y_mm,
@@ -2940,14 +3577,16 @@ class ItemPickNode(Node):
     ) -> bool:
         with self._lock:
             if self._goal_tf_diagnose_inflight:
-                self._snapshot.action_text = 'TF diagnose already in progress.'
+                self._record_action_locked('TF diagnose already in progress.')
                 return False
             item_target = self._last_item_target
             if item_target is None:
-                self._snapshot.action_text = 'No item pose received yet. Publish item pose, then retry TF diagnose.'
+                self._record_action_locked(
+                    'No item pose received yet. Publish item pose, then retry TF diagnose.'
+                )
                 return False
             self._goal_tf_diagnose_inflight = True
-            self._snapshot.action_text = (
+            self._record_action_locked(
                 f'TF diagnose started: computing goal and publishing "{self._post_stop_movel_goal_debug_frame_id}"...'
             )
 
@@ -3035,14 +3674,17 @@ class ItemPickNode(Node):
     def request_release_pulse(self) -> bool:
         with self._lock:
             if self._manual_release_inflight:
-                self._snapshot.action_text = 'Release pulse already in progress.'
+                self._record_action_locked('Release pulse already in progress.')
                 return False
             if self._snapshot.busy:
-                self._snapshot.action_text = 'Cannot run release pulse while item pick sequence is active.'
+                self._record_action_locked(
+                    'Cannot run release pulse while item pick sequence is active.'
+                )
                 return False
             self._manual_release_inflight = True
-            self._snapshot.action_text = (
-                f'Release pulse started: DO1 OFF + DO3 OFF (vent) + DO2 pulse {int(MANUAL_RELEASE_PULSE_MS)} ms.'
+            self._record_action_locked(
+                'Release pulse started: DO1 OFF + DO3 OFF + '
+                f'DO2/DO4 pulse {int(MANUAL_RELEASE_PULSE_MS)} ms.'
             )
 
         worker = threading.Thread(target=self._manual_release_pulse_worker, daemon=True)
@@ -3051,27 +3693,60 @@ class ItemPickNode(Node):
 
     def _manual_release_pulse_worker(self) -> None:
         try:
-            if not self._send_do(1, 0):
-                return
-            if not self._send_do(3, 0):
-                return
-            if not self._send_do(2, 1):
-                return
-            pulse_sec = float(MANUAL_RELEASE_PULSE_MS) * 0.001
-            wait_started = time.monotonic()
-            while (time.monotonic() - wait_started) < pulse_sec:
-                time.sleep(0.01)
-            if not self._send_do(2, 0):
-                return
-            self._set_action_text('Release pulse complete: neutral state (DO1 OFF, DO2 OFF, DO3 OFF/vent).')
+            self._execute_release_pulse(automatic=False)
         finally:
             with self._lock:
                 self._manual_release_inflight = False
 
+    def _execute_release_pulse(self, *, automatic: bool) -> bool:
+        mode = 'Automatic release' if automatic else 'Release'
+        self._set_action_text(
+            f'{mode} pulse: DO1/DO3 OFF and DO2/DO4 ON for '
+            f'{int(MANUAL_RELEASE_PULSE_MS)} ms...'
+        )
+        if not self._send_do(GRIPPER_DO_CLOSE_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_SUCTION_INDEX, 0):
+            return False
+        if not self._send_do(GRIPPER_DO_OPEN_INDEX, 1):
+            return False
+        if not self._send_do(GRIPPER_DO_EXHAUST_INDEX, 1):
+            self._send_do(GRIPPER_DO_OPEN_INDEX, 0)
+            return False
+
+        deadline = time.monotonic() + (float(MANUAL_RELEASE_PULSE_MS) * 0.001)
+        while rclpy.ok():
+            if automatic and self._is_cancel_requested():
+                self._set_action_text(f'{mode} pulse cancelled.')
+                self._send_do(GRIPPER_DO_OPEN_INDEX, 0)
+                self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0)
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(0.01, remaining))
+
+        do2_off_ok = self._send_do(GRIPPER_DO_OPEN_INDEX, 0)
+        do4_off_ok = self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0)
+        if not do2_off_ok or not do4_off_ok:
+            self._set_action_text(f'{mode} pulse failed to return all outputs to neutral.')
+            return False
+
+        if automatic:
+            self._set_action_text(
+                'Automatic release complete. Returning to saved repick start...'
+            )
+        else:
+            self._set_action_text(
+                'Release pulse complete: neutral state '
+                '(DO1 OFF, DO2 OFF, DO3 OFF, DO4 OFF).'
+            )
+        return True
+
     def request_manual_stop(self) -> bool:
         with self._lock:
             if self._manual_stop_inflight:
-                self._snapshot.action_text = 'Manual Stop already in progress.'
+                self._record_action_locked('Manual Stop already in progress.')
                 return False
             self._manual_stop_inflight = True
             self._cancel_requested = True
@@ -3080,7 +3755,7 @@ class ItemPickNode(Node):
             self._item_pose_watch_stop_dispatched = False
             self._item_pose_watch_deadline_monotonic = 0.0
             self._snapshot.busy = False
-            self._snapshot.action_text = 'Manual Stop requested. Sending robot Stop...'
+            self._record_action_locked('Manual Stop requested. Sending robot Stop...')
 
         worker = threading.Thread(target=self._manual_stop_worker, daemon=True)
         worker.start()
@@ -3095,12 +3770,73 @@ class ItemPickNode(Node):
                 return
             if int(getattr(stop_response, 'res', -1)) < 0:
                 return
-            self._set_action_text('Manual Stop sent. Sequence halted.')
+            self._set_action_text('Manual Stop sent. Sequence halted; item_detect Seek remains ON.')
         finally:
-            self._notify_item_detect_seek_complete()
             with self._lock:
+                self._repick_start_joints_deg = None
+                self._pick_attempt = 0
                 self._snapshot.busy = False
                 self._manual_stop_inflight = False
+
+    def _restart_item_pick_after_failed_suction(self) -> bool:
+        with self._lock:
+            repick_start_joints = self._repick_start_joints_deg
+        if repick_start_joints is None:
+            self._set_action_text(
+                'Pickup not confirmed, but no repick start joints were saved. Seek remains ON.'
+            )
+            return False
+
+        self._set_action_text('Pickup not confirmed: returning to saved repick start joints...')
+        if not self._send_movj_joint_goal(
+            repick_start_joints,
+            'MovJ repick start',
+            forced_v_percent=100,
+            forced_a_percent=100,
+        ):
+            return False
+        if not self._wait_for_repick_start_joints(repick_start_joints):
+            return False
+
+        with self._lock:
+            if self._cancel_requested:
+                self._record_action_locked('Sequence cancelled before repick rearm.')
+                return False
+            self._pick_attempt = max(1, int(self._pick_attempt)) + 1
+            generation = self._arm_item_pose_watch_locked()
+            attempt = int(self._pick_attempt)
+            self._snapshot.busy = True
+            self._record_action_locked(
+                f'Repick attempt {attempt} armed; requesting a newly acquired item pose...'
+            )
+
+        watchdog = threading.Thread(
+            target=self._item_pose_watchdog_worker,
+            args=(generation,),
+            daemon=True,
+        )
+        watchdog.start()
+
+        if not self._call_trigger_service(
+            self._item_repick_client,
+            self._item_repick_service_name,
+            timeout_sec=5.0,
+        ):
+            self._reset_runtime_state(
+                'Item detect repick request failed. Item pick returned to standby; Seek remains ON.'
+            )
+            return False
+
+        with self._lock:
+            if (
+                self._item_pose_watch_generation == generation
+                and self._item_pose_watch_armed
+            ):
+                self._record_action_locked(
+                    f'Repick attempt {attempt}: waiting for a newly acquired item pose. '
+                    'Seek remains ON.'
+                )
+        return True
 
     def _build_motion_param_value(self, v_percent: int, a_percent: int, include_tool: bool = True) -> list[str]:
         args = [f'v={int(v_percent)}', f'a={int(a_percent)}']
@@ -3111,17 +3847,6 @@ class ItemPickNode(Node):
     def get_command_hysteresis_sec(self) -> float:
         with self._lock:
             return float(self._command_hysteresis_sec)
-
-    def get_pre_pick_settling_time_sec(self) -> float:
-        with self._lock:
-            return float(self._pre_pick_settling_time_sec)
-
-    def get_pick_settling_time_sec(self) -> float:
-        with self._lock:
-            return float(self._pick_settling_time_sec)
-
-    def get_settling_time_sec(self) -> float:
-        return self.get_pick_settling_time_sec()
 
     def set_command_hysteresis_sec(self, command_hysteresis_sec: float) -> float:
         with self._lock:
@@ -3140,8 +3865,6 @@ class ItemPickNode(Node):
         post_stop_z_offset_mm: float,
         follow_distance_mm: float,
         approach_z_up_mm: float,
-        pre_pick_settling_time_sec: float,
-        pick_settling_time_sec: float,
         tf_only_mode: bool,
         tool_offset_x_mm: float | None = None,
         tool_offset_y_mm: float | None = None,
@@ -3149,12 +3872,11 @@ class ItemPickNode(Node):
         tool_offset_rx_deg: float | None = None,
         tool_offset_ry_deg: float | None = None,
         tool_offset_rz_deg: float | None = None,
+        pick_motion_speed_percent: float | None = None,
     ) -> bool:
         _ = (
             post_stop_movel_speed_mm_s,
             follow_distance_mm,
-            pre_pick_settling_time_sec,
-            pick_settling_time_sec,
         )
         if not self.has_item_pose_publisher():
             self._reset_runtime_state(
@@ -3177,8 +3899,6 @@ class ItemPickNode(Node):
         saved_post_stop_z_offset_mm = float(saved_offsets['item_standoff_z_mm'])
         saved_approach_z_up_mm = float(saved_offsets['approach_z_up_mm'])
         saved_final_z_up_mm = float(saved_offsets['final_z_up_mm'])
-        saved_pre_pick_settling_time_sec = float(saved_offsets['pre_pick_settling_time_sec'])
-        saved_pick_settling_time_sec = float(saved_offsets['pick_settling_time_sec'])
         saved_tool_offset_x_mm = float(saved_offsets['tool_offset_x_mm'])
         saved_tool_offset_y_mm = float(saved_offsets['tool_offset_y_mm'])
         saved_tool_offset_z_mm = float(saved_offsets['tool_offset_z_mm'])
@@ -3195,10 +3915,12 @@ class ItemPickNode(Node):
 
         with self._lock:
             if self._snapshot.busy:
-                self._snapshot.action_text = 'Busy running previous item pick sequence.'
+                self._record_action_locked('Busy running previous item pick sequence.')
                 return False
             self._snapshot.busy = True
             self._cancel_requested = False
+            self._repick_start_joints_deg = None
+            self._pick_attempt = 0
             self._item_pose_watch_timeout_sec = max(
                 ITEM_POSE_WATCH_TIMEOUT_MIN,
                 min(ITEM_POSE_WATCH_TIMEOUT_MAX, float(item_pose_watch_timeout_sec)),
@@ -3210,8 +3932,11 @@ class ItemPickNode(Node):
             self._post_stop_z_offset_mm = saved_post_stop_z_offset_mm
             self._approach_z_up_mm = saved_approach_z_up_mm
             self._final_z_up_mm = saved_final_z_up_mm
-            self._pre_pick_settling_time_sec = saved_pre_pick_settling_time_sec
-            self._pick_settling_time_sec = saved_pick_settling_time_sec
+            if pick_motion_speed_percent is not None:
+                self._pick_motion_speed_percent = int(max(
+                    PICK_MOTION_SPEED_PERCENT_MIN,
+                    min(PICK_MOTION_SPEED_PERCENT_MAX, float(pick_motion_speed_percent)),
+                ))
             self._tool_offset_x_mm = saved_tool_offset_x_mm
             self._tool_offset_y_mm = saved_tool_offset_y_mm
             self._tool_offset_z_mm = saved_tool_offset_z_mm
@@ -3233,16 +3958,15 @@ class ItemPickNode(Node):
                 f'ry={self._tool_offset_ry_deg:.1f},rz={self._tool_offset_rz_deg:.1f}) '
                 f'approach_z={self._approach_z_up_mm:.0f} mm '
                 f'final_z_up={self._final_z_up_mm:.0f} mm '
-                f'pre_pick_settle={self._pre_pick_settling_time_sec:.1f}s '
-                f'pick_settle={self._pick_settling_time_sec:.1f}s'
+                f'pick_motion_speed={self._pick_motion_speed_percent}%'
             )
             if tf_only_mode:
-                self._snapshot.action_text = (
+                self._record_action_locked(
                     f'Troubleshoot mode armed... waiting for "{self._item_pose_topic}" '
                     f'for {watch_timeout_sec:.0f}s (TF preview only).{tool1_sync_warning}'
                 )
             else:
-                self._snapshot.action_text = (
+                self._record_action_locked(
                     f'Item pick sequence armed... waiting for fresh "{self._item_pose_topic}" '
                     f'for {watch_timeout_sec:.0f}s.'
                 )
@@ -3300,18 +4024,48 @@ class ItemPickNode(Node):
             self._set_action_text(f'OK {label}')
         return response
 
+    def _call_trigger_service(self, client, label: str, timeout_sec: float = 5.0) -> bool:
+        if not self._wait_for_service(client, label, timeout_sec=timeout_sec):
+            return False
+
+        self._set_action_text(f'SEND {label}')
+        future = client.call_async(Trigger.Request())
+        started = time.time()
+        while rclpy.ok() and not future.done():
+            if (time.time() - started) >= timeout_sec:
+                self._set_action_text(f'Timeout: {label}')
+                return False
+            time.sleep(0.02)
+
+        exception = future.exception()
+        if exception is not None:
+            self._set_action_text(f'Exception: {label}: {exception}')
+            return False
+
+        response = future.result()
+        if response is None:
+            self._set_action_text(f'No response: {label}')
+            return False
+        message = str(getattr(response, 'message', '')).strip()
+        if not bool(getattr(response, 'success', False)):
+            self._set_action_text(f'FAIL {label}: {message}' if message else f'FAIL {label}')
+            return False
+        self._set_action_text(f'OK {label}: {message}' if message else f'OK {label}')
+        return True
+
 class ItemPickGui:
     def __init__(self, node: ItemPickNode) -> None:
         self.node = node
         self._gui_thread_id = threading.get_ident()
         self.root = tk.Tk()
         self.root.title('Item Pick Operator Console')
-        fixed_width = 960
-        fixed_height = 520
-        self.root.geometry(f'{fixed_width}x{fixed_height}')
-        self.root.minsize(fixed_width, fixed_height)
-        self.root.maxsize(fixed_width, fixed_height)
-        self.root.resizable(False, False)
+        default_width = 960
+        default_height = 900
+        min_width = 960
+        min_height = 820
+        self.root.geometry(f'{default_width}x{default_height}')
+        self.root.minsize(min_width, min_height)
+        self.root.resizable(False, True)
         self._closed = False
         self._runtime_settings_path = self.node.runtime_settings_path()
         self._runtime_settings_save_after_id: str | None = None
@@ -3319,12 +4073,15 @@ class ItemPickGui:
         self._active_item_profile_key: str | None = None
         self._active_profile_has_saved_tool_teach = False
         self._saved_tool_teach_values: tuple[float, ...] | None = None
+        self._last_action_event_seq = 0
+        self._datalog_line_count = 0
 
         outer = tk.Frame(self.root, padx=12, pady=12)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=1, uniform='maincols')
         outer.columnconfigure(1, weight=1, uniform='maincols')
         outer.rowconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=0)
 
         modes_frame = tk.LabelFrame(outer, text='Operating Modes', padx=10, pady=8)
         modes_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
@@ -3377,7 +4134,16 @@ class ItemPickGui:
         self._tf_only_default_active_fg = self.tf_only_button.cget('activeforeground')
         self._sync_tf_only_button(is_busy=False)
 
-        tk.Label(modes_frame, text='Item pose wait timeout (sec)').grid(row=4, column=0, sticky='w', pady=(10, 0))
+        self.auto_repick_var = tk.BooleanVar(value=AUTO_REPICK_ON_FAILED_SUCTION_DEFAULT)
+        self.auto_repick_check = tk.Checkbutton(
+            modes_frame,
+            text='Auto Repick',
+            variable=self.auto_repick_var,
+            anchor='w',
+        )
+        self.auto_repick_check.grid(row=4, column=0, sticky='w', pady=(8, 0))
+
+        tk.Label(modes_frame, text='Item pose wait timeout (sec)').grid(row=5, column=0, sticky='w', pady=(10, 0))
         self.item_pose_watch_timeout_var = tk.DoubleVar(value=ITEM_POSE_WATCH_TIMEOUT_SEC)
         self.item_pose_watch_timeout_scale = tk.Scale(
             modes_frame,
@@ -3389,11 +4155,11 @@ class ItemPickGui:
             variable=self.item_pose_watch_timeout_var,
             showvalue=True,
         )
-        self.item_pose_watch_timeout_scale.grid(row=5, column=0, sticky='ew')
+        self.item_pose_watch_timeout_scale.grid(row=6, column=0, sticky='ew')
 
         mode_hint = (
             'Press Arm Item Pick, then wait for item pose. '
-            'Normal mode uses separate pre-pick and pickup-depth settling before retract/final Z-up.'
+            'Normal mode queues descent and return-to-approach, then uses DI1 for pickup confirmation.'
         )
         tk.Label(
             modes_frame,
@@ -3401,7 +4167,7 @@ class ItemPickGui:
             anchor='w',
             justify=tk.LEFT,
             wraplength=430,
-        ).grid(row=6, column=0, sticky='w', pady=(8, 0))
+        ).grid(row=7, column=0, sticky='w', pady=(8, 0))
         self.action_var = tk.StringVar(value='Ready')
         tk.Label(
             modes_frame,
@@ -3409,7 +4175,7 @@ class ItemPickGui:
             anchor='w',
             justify=tk.LEFT,
             wraplength=430,
-        ).grid(row=7, column=0, sticky='ew', pady=(8, 0))
+        ).grid(row=8, column=0, sticky='ew', pady=(8, 0))
 
         ee_settings_frame = tk.LabelFrame(outer, text='EE Position Settings', padx=10, pady=8)
         ee_settings_frame.grid(row=0, column=1, sticky='nsew')
@@ -3457,43 +4223,29 @@ class ItemPickGui:
         )
         self.final_z_up_scale.grid(row=5, column=0, sticky='ew')
 
-        settling_frame = tk.Frame(ee_settings_frame)
-        settling_frame.grid(row=6, column=0, sticky='ew', pady=(10, 0))
-        settling_frame.columnconfigure(0, weight=1, uniform='settle_cols')
-        settling_frame.columnconfigure(1, weight=1, uniform='settle_cols')
-        tk.Label(settling_frame, text='Pre-pick settle (sec)').grid(row=0, column=0, sticky='w', padx=(0, 4))
-        tk.Label(settling_frame, text='Pick settle (sec)').grid(row=0, column=1, sticky='w', padx=(4, 0))
-        self.pre_pick_settling_time_var = tk.DoubleVar(value=SETTLING_TIME_DEFAULT_SEC)
-        self.pick_settling_time_var = tk.DoubleVar(value=SETTLING_TIME_DEFAULT_SEC)
-        self.pre_pick_settling_time_scale = tk.Scale(
-            settling_frame,
-            from_=SETTLING_TIME_MIN_SEC,
-            to=SETTLING_TIME_MAX_SEC,
+        speed_frame = tk.Frame(ee_settings_frame)
+        speed_frame.grid(row=6, column=0, sticky='ew', pady=(10, 0))
+        speed_frame.columnconfigure(0, weight=1)
+        tk.Label(speed_frame, text='Pick move speed (%)').grid(row=0, column=0, sticky='w')
+        self.pick_motion_speed_var = tk.DoubleVar(value=PICK_MOTION_SPEED_PERCENT_DEFAULT)
+        self.pick_motion_speed_scale = tk.Scale(
+            speed_frame,
+            from_=PICK_MOTION_SPEED_PERCENT_MIN,
+            to=PICK_MOTION_SPEED_PERCENT_MAX,
             orient=tk.HORIZONTAL,
-            resolution=0.1,
-            length=120,
-            variable=self.pre_pick_settling_time_var,
+            resolution=1.0,
+            length=slider_length,
+            variable=self.pick_motion_speed_var,
             showvalue=True,
         )
-        self.pre_pick_settling_time_scale.grid(row=1, column=0, sticky='ew', padx=(0, 4))
-        self.pick_settling_time_scale = tk.Scale(
-            settling_frame,
-            from_=SETTLING_TIME_MIN_SEC,
-            to=SETTLING_TIME_MAX_SEC,
-            orient=tk.HORIZONTAL,
-            resolution=0.1,
-            length=120,
-            variable=self.pick_settling_time_var,
-            showvalue=True,
-        )
-        self.pick_settling_time_scale.grid(row=1, column=1, sticky='ew', padx=(4, 0))
+        self.pick_motion_speed_scale.grid(row=1, column=0, sticky='ew')
 
         tk.Label(
             ee_settings_frame,
             text='Tool offset (x/y/z mm, rx/ry/rz deg) | Use button to preview TF wrt Link6 in RViz',
-        ).grid(row=8, column=0, sticky='w', pady=(10, 0))
+        ).grid(row=7, column=0, sticky='w', pady=(10, 0))
         tool_offset_frame = tk.Frame(ee_settings_frame)
-        tool_offset_frame.grid(row=9, column=0, sticky='ew')
+        tool_offset_frame.grid(row=8, column=0, sticky='ew')
         for col in range(3):
             tool_offset_frame.columnconfigure(col, weight=1, uniform='tool_offset_col')
         self.active_profile_var = tk.StringVar(value='Active item teach: waiting for item_detect...')
@@ -3586,7 +4338,7 @@ class ItemPickGui:
         tool_offset_button_frame.columnconfigure(1, weight=1)
         self.save_tool_offset_button = tk.Button(
             tool_offset_button_frame,
-            text='Save Tool Teach',
+            text='Save EE + Tool Teach',
             command=self._save_tool_offset_profile_clicked,
             width=24,
             bg='#6a1b9a',
@@ -3607,7 +4359,7 @@ class ItemPickGui:
         )
         self.show_tool_tf_button.grid(row=0, column=1, sticky='ew', padx=(4, 0))
         self.tool_offset_profile_status_var = tk.StringVar(
-            value='Tool teach must be saved for the active item teach before arming.'
+            value='EE/tool teach must be saved for the active item teach before arming.'
         )
         tk.Label(
             tool_offset_frame,
@@ -3617,13 +4369,38 @@ class ItemPickGui:
             wraplength=430,
         ).grid(row=6, column=0, columnspan=3, sticky='ew', pady=(8, 0))
 
+        datalog_frame = tk.LabelFrame(outer, text='Item Datalog', padx=8, pady=8)
+        datalog_frame.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky='nsew',
+            pady=(10, 0),
+        )
+        datalog_frame.columnconfigure(0, weight=1)
+        self.clear_datalog_button = tk.Button(
+            datalog_frame,
+            text='Clear',
+            command=self._clear_datalog,
+            width=9,
+        )
+        self.clear_datalog_button.grid(row=0, column=0, sticky='e', pady=(0, 6))
+        self.datalog_text = scrolledtext.ScrolledText(
+            datalog_frame,
+            height=9,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font='TkFixedFont',
+        )
+        self.datalog_text.grid(row=1, column=0, sticky='nsew')
+
         self._arm_locked_setting_controls = [
             self.item_pose_watch_timeout_scale,
+            self.auto_repick_check,
             self.post_stop_z_offset_scale,
             self.approach_z_up_scale,
             self.final_z_up_scale,
-            self.pre_pick_settling_time_scale,
-            self.pick_settling_time_scale,
+            self.pick_motion_speed_scale,
             self.tool_offset_x_spinbox,
             self.tool_offset_y_spinbox,
             self.tool_offset_z_spinbox,
@@ -3690,8 +4467,7 @@ class ItemPickGui:
         item_pose_watch_timeout_value = float(self.item_pose_watch_timeout_var.get())
         post_stop_z_offset_value = float(self.post_stop_z_offset_var.get())
         approach_z_up_value = float(self.approach_z_up_var.get())
-        pre_pick_settling_time_value = float(self.pre_pick_settling_time_var.get())
-        pick_settling_time_value = float(self.pick_settling_time_var.get())
+        pick_motion_speed_value = float(self.pick_motion_speed_var.get())
         tool_offset_x_value = float(self.tool_offset_x_var.get())
         tool_offset_y_value = float(self.tool_offset_y_var.get())
         tool_offset_z_value = float(self.tool_offset_z_var.get())
@@ -3699,6 +4475,7 @@ class ItemPickGui:
         tool_offset_ry_value = float(self.tool_offset_ry_var.get())
         tool_offset_rz_value = float(self.tool_offset_rz_var.get())
         tf_only_mode = bool(self.tf_only_var.get())
+        self.node.set_auto_repick_on_failed_suction(bool(self.auto_repick_var.get()))
 
         started = self.node.run_item_sequence(
             item_pose_watch_timeout_value,
@@ -3708,8 +4485,6 @@ class ItemPickGui:
             post_stop_z_offset_value,
             0.0,
             approach_z_up_value,
-            pre_pick_settling_time_value,
-            pick_settling_time_value,
             tf_only_mode,
             tool_offset_x_value,
             tool_offset_y_value,
@@ -3717,6 +4492,7 @@ class ItemPickGui:
             tool_offset_rx_value,
             tool_offset_ry_value,
             tool_offset_rz_value,
+            pick_motion_speed_value,
         )
         if not started:
             snapshot = self.node.snapshot()
@@ -3773,7 +4549,7 @@ class ItemPickGui:
         saved = self._save_profile_tool_offsets_for_active_item()
         if saved:
             tool_teach_name = display_name_for_tool_teach_profile(self._active_item_profile_key)
-            message = f'Saved tool teach "{tool_teach_name}". Tool 1 sync started.'
+            message = f'Saved EE/tool teach "{tool_teach_name}". Tool 1 sync started.'
             self.node._set_action_text(message)
             self.action_var.set(message)
 
@@ -3819,8 +4595,7 @@ class ItemPickGui:
             round(float(profile_offsets.get('item_standoff_z_mm', 0.0)), 4),
             round(float(profile_offsets.get('approach_z_up_mm', 0.0)), 4),
             round(float(profile_offsets.get('final_z_up_mm', FINAL_Z_UP_DEFAULT)), 4),
-            round(float(profile_offsets.get('pre_pick_settling_time_sec', 0.0)), 4),
-            round(float(profile_offsets.get('pick_settling_time_sec', 0.0)), 4),
+            round(float(profile_offsets.get('pick_motion_speed_percent', PICK_MOTION_SPEED_PERCENT_DEFAULT)), 4),
             round(float(profile_offsets.get('tool_offset_x_mm', 0.0)), 4),
             round(float(profile_offsets.get('tool_offset_y_mm', 0.0)), 4),
             round(float(profile_offsets.get('tool_offset_z_mm', 0.0)), 4),
@@ -3834,8 +4609,7 @@ class ItemPickGui:
             round(float(self.post_stop_z_offset_var.get()), 4),
             round(float(self.approach_z_up_var.get()), 4),
             round(float(self.final_z_up_var.get()), 4),
-            round(float(self.pre_pick_settling_time_var.get()), 4),
-            round(float(self.pick_settling_time_var.get()), 4),
+            round(float(self.pick_motion_speed_var.get()), 4),
             round(float(self.tool_offset_x_var.get()), 4),
             round(float(self.tool_offset_y_var.get()), 4),
             round(float(self.tool_offset_z_var.get()), 4),
@@ -3859,12 +4633,12 @@ class ItemPickGui:
             return 'No active item teach selected in item_detect. Load an item teach profile first.'
         if not self._active_profile_has_saved_tool_teach or self._saved_tool_teach_values is None:
             return (
-                'No saved tool teach for '
+                'No saved EE/tool teach for '
                 f'"{self._profile_display_name(self._active_item_profile_key)}". Save it before arming.'
             )
         if self._has_unsaved_tool_offset_changes():
             return (
-                'Tool teach changes for '
+                'EE/tool teach changes for '
                 f'"{self._profile_display_name(self._active_item_profile_key)}" are not saved. '
                 'Save them before arming.'
             )
@@ -3889,29 +4663,29 @@ class ItemPickGui:
             return
         if not self._active_profile_has_saved_tool_teach or self._saved_tool_teach_values is None:
             self.tool_offset_profile_status_var.set(
-                'No saved tool teach for this item teach. Current UI values are unsaved.'
+                'No saved EE/tool teach for this item teach. Current UI values are unsaved.'
             )
             return
         if self._has_unsaved_tool_offset_changes():
             self.tool_offset_profile_status_var.set(
-                'Saved tool teach loaded, but current UI values have unsaved changes. '
-                'Save to update Tool 1.'
+                'Saved EE/tool teach loaded, but current UI values have unsaved changes. '
+                'Save before arming.'
             )
             return
         tool1_status = self.node.get_tool1_sync_status_text()
         self.tool_offset_profile_status_var.set(
-            f'Saved tool teach loaded and ready for arming. {tool1_status}'
+            f'Saved EE/tool teach loaded and ready for arming. {tool1_status}'
         )
 
     def _register_runtime_setting_traces(self) -> None:
         tracked_vars = [
             self.tf_only_var,
+            self.auto_repick_var,
             self.item_pose_watch_timeout_var,
             self.post_stop_z_offset_var,
             self.approach_z_up_var,
             self.final_z_up_var,
-            self.pre_pick_settling_time_var,
-            self.pick_settling_time_var,
+            self.pick_motion_speed_var,
         ]
         tool_teach_vars = [
             self.tool_offset_x_var,
@@ -3951,15 +4725,10 @@ class ItemPickGui:
                     FINAL_Z_UP_MIN,
                     FINAL_Z_UP_MAX,
                 ))
-                self.pre_pick_settling_time_var.set(self._clamp(
-                    profile_offsets.get('pre_pick_settling_time_sec', self.pre_pick_settling_time_var.get()),
-                    SETTLING_TIME_MIN_SEC,
-                    SETTLING_TIME_MAX_SEC,
-                ))
-                self.pick_settling_time_var.set(self._clamp(
-                    profile_offsets.get('pick_settling_time_sec', self.pick_settling_time_var.get()),
-                    SETTLING_TIME_MIN_SEC,
-                    SETTLING_TIME_MAX_SEC,
+                self.pick_motion_speed_var.set(self._clamp(
+                    profile_offsets.get('pick_motion_speed_percent', self.pick_motion_speed_var.get()),
+                    PICK_MOTION_SPEED_PERCENT_MIN,
+                    PICK_MOTION_SPEED_PERCENT_MAX,
                 ))
                 self.tool_offset_x_var.set(self._clamp(
                     profile_offsets.get('tool_offset_x_mm', self.tool_offset_x_var.get()),
@@ -4002,7 +4771,7 @@ class ItemPickGui:
 
     def _save_profile_tool_offsets_for_active_item(self) -> bool:
         if not self.node.has_item_pose_publisher():
-            message = 'Start item_detect and load an item teach before saving tool teach.'
+            message = 'Start item_detect and load an item teach before saving EE/tool teach.'
             self.node._set_action_text(message)
             self.action_var.set(message)
             return False
@@ -4015,13 +4784,12 @@ class ItemPickGui:
             return False
 
         payload: dict[str, object] = {
-            'tool_teach_version': 3,
+            'tool_teach_version': 5,
             'item_teach_name': item_teach_name_for_profile(active_profile_key),
             'item_standoff_z_mm': float(self.post_stop_z_offset_var.get()),
             'approach_z_up_mm': float(self.approach_z_up_var.get()),
             'final_z_up_mm': float(self.final_z_up_var.get()),
-            'pre_pick_settling_time_sec': float(self.pre_pick_settling_time_var.get()),
-            'pick_settling_time_sec': float(self.pick_settling_time_var.get()),
+            'pick_motion_speed_percent': float(self.pick_motion_speed_var.get()),
             'tool_offset_x_mm': float(self.tool_offset_x_var.get()),
             'tool_offset_y_mm': float(self.tool_offset_y_var.get()),
             'tool_offset_z_mm': float(self.tool_offset_z_var.get()),
@@ -4036,7 +4804,7 @@ class ItemPickGui:
             self.node.get_logger().warn(
                 f'Failed to save embedded tool teach in "{active_profile_key}": {exc}'
             )
-            message = f'Failed to save tool teach for "{self._profile_display_name(active_profile_key)}".'
+            message = f'Failed to save EE/tool teach for "{self._profile_display_name(active_profile_key)}".'
             self.node._set_action_text(message)
             self.action_var.set(message)
             return False
@@ -4047,8 +4815,9 @@ class ItemPickGui:
 
     def _collect_runtime_settings(self) -> dict:
         return {
-            'schema_version': 8,
+            'schema_version': 9,
             'tf_only_mode': bool(self.tf_only_var.get()),
+            'auto_repick_on_failed_suction': bool(self.auto_repick_var.get()),
             'item_pose_wait_timeout_sec': float(self.item_pose_watch_timeout_var.get()),
             'ee_intercept_speed_mm_s': float(LOCKED_MAX_SPEED_MM_S),
             'tray_intercept_x_offset_mm': 0.0,
@@ -4056,8 +4825,7 @@ class ItemPickGui:
             'item_standoff_z_mm': float(self.post_stop_z_offset_var.get()),
             'approach_z_up_mm': float(self.approach_z_up_var.get()),
             'final_z_up_mm': float(self.final_z_up_var.get()),
-            'pre_pick_settling_time_sec': float(self.pre_pick_settling_time_var.get()),
-            'pick_settling_time_sec': float(self.pick_settling_time_var.get()),
+            'pick_motion_speed_percent': float(self.pick_motion_speed_var.get()),
         }
 
     def _schedule_runtime_settings_save(self) -> None:
@@ -4106,6 +4874,9 @@ class ItemPickGui:
         self._suspend_runtime_settings_events = True
         try:
             self.tf_only_var.set(bool(payload.get('tf_only_mode', True)))
+            self.auto_repick_var.set(bool(
+                payload.get('auto_repick_on_failed_suction', AUTO_REPICK_ON_FAILED_SUCTION_DEFAULT)
+            ))
             self.item_pose_watch_timeout_var.set(self._clamp(
                 payload.get(
                     'item_pose_wait_timeout_sec',
@@ -4129,16 +4900,12 @@ class ItemPickGui:
                 FINAL_Z_UP_MIN,
                 FINAL_Z_UP_MAX,
             ))
-            self.pre_pick_settling_time_var.set(self._clamp(
-                payload.get('pre_pick_settling_time_sec', SETTLING_TIME_DEFAULT_SEC),
-                SETTLING_TIME_MIN_SEC,
-                SETTLING_TIME_MAX_SEC,
+            self.pick_motion_speed_var.set(self._clamp(
+                payload.get('pick_motion_speed_percent', PICK_MOTION_SPEED_PERCENT_DEFAULT),
+                PICK_MOTION_SPEED_PERCENT_MIN,
+                PICK_MOTION_SPEED_PERCENT_MAX,
             ))
-            self.pick_settling_time_var.set(self._clamp(
-                payload.get('pick_settling_time_sec', SETTLING_TIME_DEFAULT_SEC),
-                SETTLING_TIME_MIN_SEC,
-                SETTLING_TIME_MAX_SEC,
-            ))
+            self.node.set_auto_repick_on_failed_suction(bool(self.auto_repick_var.get()))
         finally:
             self._suspend_runtime_settings_events = False
 
@@ -4162,6 +4929,36 @@ class ItemPickGui:
             except tk.TclError:
                 pass
 
+    def _clear_datalog(self) -> None:
+        self.datalog_text.configure(state=tk.NORMAL)
+        self.datalog_text.delete('1.0', tk.END)
+        self.datalog_text.configure(state=tk.DISABLED)
+        self._datalog_line_count = 0
+
+    def _refresh_datalog(self) -> None:
+        events = self.node.action_events_since(self._last_action_event_seq)
+        if not events:
+            return
+
+        self.datalog_text.configure(state=tk.NORMAL)
+        for sequence, event_time, message in events:
+            seconds = int(event_time)
+            timestamp = time.strftime('%H:%M:%S', time.localtime(event_time))
+            milliseconds = int((event_time - seconds) * 1000.0)
+            self.datalog_text.insert(
+                tk.END,
+                f'[{timestamp}.{milliseconds:03d}] {message}\n',
+            )
+            self._last_action_event_seq = max(self._last_action_event_seq, sequence)
+            self._datalog_line_count += 1
+
+        excess_lines = self._datalog_line_count - ACTION_EVENT_HISTORY_MAX
+        if excess_lines > 0:
+            self.datalog_text.delete('1.0', f'{excess_lines + 1}.0')
+            self._datalog_line_count -= excess_lines
+        self.datalog_text.see(tk.END)
+        self.datalog_text.configure(state=tk.DISABLED)
+
     def _refresh(self) -> None:
         snapshot = self.node.snapshot()
         stop_inflight = self.node.is_manual_stop_inflight()
@@ -4170,6 +4967,7 @@ class ItemPickGui:
         if not ui_locked:
             self._sync_profile_tool_offsets_from_state()
         self._sync_tf_only_button(is_busy=ui_locked)
+        self.node.set_auto_repick_on_failed_suction(bool(self.auto_repick_var.get()))
         self._set_arm_locked_setting_controls_enabled(not ui_locked)
         can_arm = self._can_arm_sequence()
         can_save_tool_offset = (
@@ -4179,13 +4977,21 @@ class ItemPickGui:
             and not ui_locked
         )
 
+        self._refresh_datalog()
         self.action_var.set(snapshot.action_text)
+        if snapshot.armed:
+            run_text = 'Armed: Waiting'
+        elif snapshot.busy:
+            run_text = 'Pick Busy'
+        else:
+            run_text = 'Arm Item Pick'
         self.run_button.configure(
+            text=run_text,
             state=tk.NORMAL if (not ui_locked and can_arm) else tk.DISABLED
         )
         self._set_stop_button_enabled(bool(snapshot.busy) and not stop_inflight)
         self.release_button.configure(
-            state=tk.DISABLED if (ui_locked or release_inflight) else tk.NORMAL
+            state=tk.DISABLED if ui_locked or release_inflight else tk.NORMAL
         )
         self.show_tool_tf_button.configure(
             state=tk.DISABLED if ui_locked else tk.NORMAL

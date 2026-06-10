@@ -9,11 +9,13 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include <cv_bridge/cv_bridge.h>
+#include <dobot_msgs_v4/srv/get_angle.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <orbbec_camera_msgs/srv/set_int32.hpp>
@@ -21,7 +23,6 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <yaml-cpp/yaml.h>
 
@@ -31,7 +32,7 @@ namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
 using CameraInfoMsg = sensor_msgs::msg::CameraInfo;
-using JointStateMsg = sensor_msgs::msg::JointState;
+using GetAngleSrv = dobot_msgs_v4::srv::GetAngle;
 using SetBoolSrv = std_srvs::srv::SetBool;
 using SetInt32Srv = orbbec_camera_msgs::srv::SetInt32;
 
@@ -69,6 +70,48 @@ constexpr int kExposurePercentMax = 100;
 constexpr int kDefaultExposureMinUs = 1;
 constexpr int kDefaultExposureMaxUs = 32000;
 constexpr int kTeachColorExposureMaxUs = 100;
+constexpr double kCentimetersToMillimeters = 10.0;
+constexpr double kMetersToMillimeters = 1000.0;
+
+std::optional<std::array<double, 6>> parseSixDoublesFromRobotReturn(const std::string &text)
+{
+  if (text.empty())
+  {
+    return std::nullopt;
+  }
+
+  static const std::regex brace_pattern(R"(\{([^{}]+)\})");
+  static const std::regex number_pattern(R"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)");
+
+  const auto parse_segment = [&](const std::string &segment) -> std::optional<std::array<double, 6>>
+  {
+    std::array<double, 6> values {};
+    std::size_t count = 0;
+    for (std::sregex_iterator it(segment.begin(), segment.end(), number_pattern), end; it != end; ++it)
+    {
+      if (count >= values.size())
+      {
+        return std::nullopt;
+      }
+      values[count++] = std::stod(it->str());
+    }
+    if (count == values.size())
+    {
+      return values;
+    }
+    return std::nullopt;
+  };
+
+  for (std::sregex_iterator it(text.begin(), text.end(), brace_pattern), end; it != end; ++it)
+  {
+    if (auto parsed = parse_segment((*it)[1].str()); parsed.has_value())
+    {
+      return parsed;
+    }
+  }
+
+  return parse_segment(text);
+}
 
 bool isOpenCvWindowClosed(const std::string &window_name)
 {
@@ -259,32 +302,6 @@ std::string makeFilenameSafeTrayName(const std::string &tray_name)
   return safe_name;
 }
 
-std::string normalizeDetectionModeToken(const std::string &mode_text)
-{
-  std::string normalized;
-  normalized.reserve(mode_text.size());
-  for (const unsigned char ch : mode_text)
-  {
-    if (std::isspace(ch) != 0)
-    {
-      continue;
-    }
-    normalized.push_back(static_cast<char>(std::tolower(ch)));
-  }
-  return normalized;
-}
-
-bool isDepthDetectionMode(const std::string &mode_text)
-{
-  const std::string token = normalizeDetectionModeToken(mode_text);
-  return token == "depth" || token == "d" || token == "true" || token == "1";
-}
-
-std::string detectionModeToString(bool depth_mode_enabled)
-{
-  return depth_mode_enabled ? "depth" : "rgb";
-}
-
 cv::Mat buildRgbMask(const cv::Mat &bgr, int red_threshold, int green_threshold, int blue_threshold)
 {
   cv::Mat mask;
@@ -434,16 +451,28 @@ struct TrayMetricEstimate
 {
   double area_cm2 {0.0};
   double mean_depth_m {0.0};
-  // Ordered as: origin X edge, opposite X edge, origin Y edge, opposite Y edge.
+  // Ordered as: origin-prev edge, opposite parallel edge, origin-next edge, opposite parallel edge.
   std::array<double, 4> edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
 };
 
-struct SideDepthSample
+std::optional<std::array<double, 2>> averageTrayWidthHeightMm(
+  const std::array<double, 4> &edge_lengths_cm)
 {
-  double t {0.0};
-  double depth_m {0.0};
-  cv::Vec3d camera_point {0.0, 0.0, 0.0};
-};
+  for (const double edge_length_cm : edge_lengths_cm)
+  {
+    if (!std::isfinite(edge_length_cm) || edge_length_cm <= 0.0)
+    {
+      return std::nullopt;
+    }
+  }
+
+  const double side_a_mm = 0.5 * (edge_lengths_cm[0] + edge_lengths_cm[1]) * kCentimetersToMillimeters;
+  const double side_b_mm = 0.5 * (edge_lengths_cm[2] + edge_lengths_cm[3]) * kCentimetersToMillimeters;
+  return std::array<double, 2>{
+    std::min(side_a_mm, side_b_mm),
+    std::max(side_a_mm, side_b_mm),
+  };
+}
 
 double pointToLineDistance(
   const cv::Point2f &point,
@@ -804,19 +833,6 @@ float sampleGrayAt(const cv::Mat &gray, const cv::Point2f &pt)
   return static_cast<float>(gray.at<unsigned char>(y, x));
 }
 
-float sampleDepthAt(const cv::Mat &depth_m, const cv::Point2f &pt)
-{
-  const int x = static_cast<int>(std::round(pt.x));
-  const int y = static_cast<int>(std::round(pt.y));
-  if (x < 0 || y < 0 || x >= depth_m.cols || y >= depth_m.rows)
-  {
-    return 0.0F;
-  }
-
-  const float z = depth_m.at<float>(y, x);
-  return std::isfinite(z) ? z : 0.0F;
-}
-
 std::optional<double> averageDepthAt(const cv::Mat &depth_m, const cv::Point2f &pt, int window_size = 5)
 {
   if (depth_m.empty() || depth_m.type() != CV_32FC1)
@@ -998,319 +1014,6 @@ int lowerRightCornerIndex(const std::vector<cv::Point2f> &corners)
   return lower_right_idx;
 }
 
-std::optional<std::array<cv::Vec3d, 4>> estimateTrayCornerCameraPoints(
-  const std::vector<cv::Point2f> &corners,
-  const cv::Mat &depth_m,
-  const CameraInfoMsg &camera_info)
-{
-  if (corners.size() != 4)
-  {
-    return std::nullopt;
-  }
-  if (camera_info.k[0] <= 1e-6 || camera_info.k[4] <= 1e-6)
-  {
-    return std::nullopt;
-  }
-
-  std::array<cv::Vec3d, 4> camera_points;
-  for (std::size_t i = 0; i < corners.size(); ++i)
-  {
-    const auto depth = averageDepthAt(depth_m, corners[i]);
-    if (!depth.has_value())
-    {
-      return std::nullopt;
-    }
-    camera_points[i] = projectPixelToCamera(corners[i], *depth, camera_info);
-  }
-
-  return camera_points;
-}
-
-std::optional<double> estimateEdgeLengthCmFromDepthSamples(
-  const std::vector<cv::Point2f> &side_points,
-  const cv::Point2f &start,
-  const cv::Point2f &end,
-  const cv::Point2f &interior_reference,
-  const cv::Mat &depth_m,
-  const CameraInfoMsg &camera_info,
-  int depth_edge_offset_px,
-  std::vector<double> *sampled_depths_m = nullptr)
-{
-  if (camera_info.k[0] <= 1e-6 || camera_info.k[4] <= 1e-6)
-  {
-    return std::nullopt;
-  }
-
-  const cv::Point2f side_vector = end - start;
-  const double side_length_sq = static_cast<double>(side_vector.dot(side_vector));
-  if (side_length_sq < 1e-6)
-  {
-    return std::nullopt;
-  }
-
-  std::vector<SideDepthSample> depth_samples;
-  depth_samples.reserve(side_points.size() + 2);
-  const cv::Point2f depth_offset = inwardOffsetVectorForSegment(
-    start,
-    end,
-    interior_reference,
-    depth_edge_offset_px);
-  const auto append_sample = [&](const cv::Point2f &pixel, bool force_include)
-  {
-    const double t =
-      ((static_cast<double>(pixel.x) - static_cast<double>(start.x)) * static_cast<double>(side_vector.x) +
-       (static_cast<double>(pixel.y) - static_cast<double>(start.y)) * static_cast<double>(side_vector.y)) /
-      side_length_sq;
-    if (!force_include && (t < -0.05 || t > 1.05))
-    {
-      return;
-    }
-    const cv::Point2f depth_pixel = pixel + depth_offset;
-    const auto depth = averageDepthAt(depth_m, depth_pixel, 7);
-    if (!depth.has_value())
-    {
-      return;
-    }
-    depth_samples.push_back(SideDepthSample{
-      std::clamp(t, 0.0, 1.0),
-      *depth,
-      projectPixelToCamera(depth_pixel, *depth, camera_info)
-    });
-  };
-
-  append_sample(start, true);
-  for (const auto &point : side_points)
-  {
-    append_sample(point, false);
-  }
-  append_sample(end, true);
-
-  if (depth_samples.size() < 2)
-  {
-    return std::nullopt;
-  }
-
-  for (int iteration = 0; iteration < 2; ++iteration)
-  {
-    if (depth_samples.size() < 3)
-    {
-      break;
-    }
-
-    std::vector<cv::Point3f> points_3d;
-    points_3d.reserve(depth_samples.size());
-    for (const auto &sample : depth_samples)
-    {
-      points_3d.emplace_back(
-        static_cast<float>(sample.camera_point[0]),
-        static_cast<float>(sample.camera_point[1]),
-        static_cast<float>(sample.camera_point[2]));
-    }
-
-    cv::Vec6f line_3d;
-    cv::fitLine(points_3d, line_3d, cv::DIST_L2, 0.0, 0.01, 0.01);
-    cv::Vec3d line_direction(line_3d[0], line_3d[1], line_3d[2]);
-    const double direction_norm = vectorNorm(line_direction);
-    if (direction_norm < 1e-9)
-    {
-      break;
-    }
-    line_direction *= (1.0 / direction_norm);
-    const cv::Vec3d line_point(line_3d[3], line_3d[4], line_3d[5]);
-
-    std::vector<double> distances;
-    distances.reserve(depth_samples.size());
-    for (const auto &sample : depth_samples)
-    {
-      const cv::Vec3d delta = sample.camera_point - line_point;
-      distances.push_back(vectorNorm(delta.cross(line_direction)));
-    }
-
-    const double median_distance = medianValue(distances);
-    const double threshold = std::max(0.002, 3.0 * median_distance);
-    std::vector<SideDepthSample> filtered_samples;
-    filtered_samples.reserve(depth_samples.size());
-    for (std::size_t i = 0; i < depth_samples.size(); ++i)
-    {
-      if (distances[i] <= threshold)
-      {
-        filtered_samples.push_back(depth_samples[i]);
-      }
-    }
-
-    if (filtered_samples.size() < 2 || filtered_samples.size() == depth_samples.size())
-    {
-      break;
-    }
-    depth_samples = std::move(filtered_samples);
-  }
-
-  if (depth_samples.size() < 2)
-  {
-    return std::nullopt;
-  }
-
-  std::vector<cv::Point3f> points_3d;
-  points_3d.reserve(depth_samples.size());
-  for (const auto &sample : depth_samples)
-  {
-    points_3d.emplace_back(
-      static_cast<float>(sample.camera_point[0]),
-      static_cast<float>(sample.camera_point[1]),
-      static_cast<float>(sample.camera_point[2]));
-  }
-
-  cv::Vec6f line_3d;
-  cv::fitLine(points_3d, line_3d, cv::DIST_L2, 0.0, 0.01, 0.01);
-  cv::Vec3d line_direction(line_3d[0], line_3d[1], line_3d[2]);
-  const double direction_norm = vectorNorm(line_direction);
-  if (direction_norm < 1e-9)
-  {
-    return std::nullopt;
-  }
-  line_direction *= (1.0 / direction_norm);
-  const cv::Vec3d line_point(line_3d[3], line_3d[4], line_3d[5]);
-
-  double min_projection = std::numeric_limits<double>::infinity();
-  double max_projection = -std::numeric_limits<double>::infinity();
-  for (const auto &sample : depth_samples)
-  {
-    const double projection = line_direction.dot(sample.camera_point - line_point);
-    min_projection = std::min(min_projection, projection);
-    max_projection = std::max(max_projection, projection);
-    if (sampled_depths_m)
-    {
-      sampled_depths_m->push_back(sample.depth_m);
-    }
-  }
-
-  const double length_m = max_projection - min_projection;
-  return length_m > 0.0 ? std::optional<double>(length_m * 100.0) : std::nullopt;
-}
-
-double triangleArea3D(const cv::Vec3d &a, const cv::Vec3d &b, const cv::Vec3d &c)
-{
-  return 0.5 * vectorNorm((b - a).cross(c - a));
-}
-
-std::optional<TrayMetricEstimate> estimateTrayMetricsFromCorners(
-  const std::vector<cv::Point2f> &corners,
-  const std::array<std::vector<cv::Point2f>, 4> &side_samples_by_segment,
-  const cv::Mat &depth_m,
-  const CameraInfoMsg &camera_info,
-  int depth_edge_offset_px)
-{
-  if (corners.size() != 4)
-  {
-    return std::nullopt;
-  }
-  const int origin_idx = lowerRightCornerIndex(corners);
-  if (origin_idx < 0)
-  {
-    return std::nullopt;
-  }
-
-  const int prev_idx = (origin_idx + 3) % 4;
-  const int next_idx = (origin_idx + 1) % 4;
-  const int opposite_idx = (origin_idx + 2) % 4;
-  const cv::Point2f interior_reference = polygonCentroid(corners);
-  std::vector<double> sampled_depths_m;
-  sampled_depths_m.reserve(128);
-  std::array<std::optional<double>, 4> segment_lengths_cm;
-  for (int side = 0; side < 4; ++side)
-  {
-    segment_lengths_cm[side] = estimateEdgeLengthCmFromDepthSamples(
-      side_samples_by_segment[side],
-      corners[side],
-      corners[(side + 1) % 4],
-      interior_reference,
-      depth_m,
-      camera_info,
-      depth_edge_offset_px,
-      &sampled_depths_m);
-  }
-
-  const auto length_for_edge = [&](int a, int b) -> std::optional<double>
-  {
-    if ((a + 1) % 4 == b)
-    {
-      return segment_lengths_cm[a];
-    }
-    if ((b + 1) % 4 == a)
-    {
-      return segment_lengths_cm[b];
-    }
-    return std::nullopt;
-  };
-
-  const auto origin_prev_len_cm = length_for_edge(origin_idx, prev_idx);
-  const auto next_opposite_len_cm = length_for_edge(next_idx, opposite_idx);
-  const auto origin_next_len_cm = length_for_edge(origin_idx, next_idx);
-  const auto prev_opposite_len_cm = length_for_edge(prev_idx, opposite_idx);
-  if (!origin_prev_len_cm.has_value() ||
-      !next_opposite_len_cm.has_value() ||
-      !origin_next_len_cm.has_value() ||
-      !prev_opposite_len_cm.has_value())
-  {
-    return std::nullopt;
-  }
-
-  double mean_depth_m = 0.0;
-  if (!sampled_depths_m.empty())
-  {
-    for (const double depth_m_value : sampled_depths_m)
-    {
-      mean_depth_m += depth_m_value;
-    }
-    mean_depth_m /= static_cast<double>(sampled_depths_m.size());
-  }
-
-  TrayMetricEstimate metrics;
-  if (*origin_prev_len_cm >= *origin_next_len_cm)
-  {
-    metrics.edge_lengths_cm = {
-      *origin_prev_len_cm,
-      *next_opposite_len_cm,
-      *origin_next_len_cm,
-      *prev_opposite_len_cm,
-    };
-  }
-  else
-  {
-    metrics.edge_lengths_cm = {
-      *origin_next_len_cm,
-      *prev_opposite_len_cm,
-      *origin_prev_len_cm,
-      *next_opposite_len_cm,
-    };
-  }
-
-  if (!sampled_depths_m.empty())
-  {
-    metrics.mean_depth_m = mean_depth_m;
-  }
-
-  if (const auto camera_points = estimateTrayCornerCameraPoints(corners, depth_m, camera_info); camera_points.has_value())
-  {
-    const double area_m2 =
-      triangleArea3D((*camera_points)[0], (*camera_points)[1], (*camera_points)[2]) +
-      triangleArea3D((*camera_points)[0], (*camera_points)[2], (*camera_points)[3]);
-    if (area_m2 > 0.0)
-    {
-      metrics.area_cm2 = area_m2 * 10000.0;
-    }
-  }
-
-  for (const double length_cm : metrics.edge_lengths_cm)
-  {
-    if (length_cm <= 0.0)
-    {
-      return std::nullopt;
-    }
-  }
-  return metrics;
-}
-
 std::optional<TrayEstimate> buildTrayEstimateFromIsolatedSideSamples(
   const std::vector<cv::Point2f> &edge_points,
   const std::vector<cv::Point2f> &left_samples,
@@ -1322,6 +1025,10 @@ std::optional<TrayEstimate> buildTrayEstimateFromIsolatedSideSamples(
   int depth_edge_offset_px,
   int outlier_sensitivity)
 {
+  (void)depth_m;
+  (void)camera_info;
+  (void)depth_edge_offset_px;
+
   if (edge_points.size() < 8 ||
       left_samples.size() < 2 ||
       right_samples.size() < 2 ||
@@ -1407,24 +1114,6 @@ std::optional<TrayEstimate> buildTrayEstimateFromIsolatedSideSamples(
     bottom_fit.line,
   };
   estimate.polygon = polygon;
-  const std::array<std::vector<cv::Point2f>, 4> side_samples_by_segment{
-    top_fit.inliers,
-    right_fit.inliers,
-    bottom_fit.inliers,
-    left_fit.inliers,
-  };
-  if (const auto metrics = estimateTrayMetricsFromCorners(
-        corners_f,
-        side_samples_by_segment,
-        depth_m,
-        camera_info,
-        depth_edge_offset_px); metrics.has_value())
-  {
-    estimate.has_metric_estimate = true;
-    estimate.area_cm2 = metrics->area_cm2;
-    estimate.mean_depth_m = metrics->mean_depth_m;
-    estimate.edge_lengths_cm = metrics->edge_lengths_cm;
-  }
   return estimate;
 }
 
@@ -1703,6 +1392,121 @@ cv::Mat applyFixedDepthPlaneNormalization(const cv::Mat &depth_m, const DepthPla
     }
   }
   return normalized;
+}
+
+std::optional<double> trayPlaneDepthAtPixel(
+  const cv::Point2f &pixel,
+  const cv::Size &image_size,
+  const DepthPlaneModel &plane)
+{
+  if (!plane.valid || image_size.width <= 1 || image_size.height <= 1)
+  {
+    return std::nullopt;
+  }
+
+  const double clamped_x = std::clamp(static_cast<double>(pixel.x), 0.0, static_cast<double>(image_size.width - 1));
+  const double clamped_y = std::clamp(static_cast<double>(pixel.y), 0.0, static_cast<double>(image_size.height - 1));
+  const double x_norm = clamped_x / static_cast<double>(image_size.width - 1);
+  const double y_norm = clamped_y / static_cast<double>(image_size.height - 1);
+  const double depth_m = (plane.a * x_norm) + (plane.b * y_norm) + plane.c;
+  if (!std::isfinite(depth_m) || depth_m <= 0.0)
+  {
+    return std::nullopt;
+  }
+  return depth_m;
+}
+
+std::optional<std::array<cv::Vec3d, 4>> estimateTrayCornerCameraPointsFromTrayPlane(
+  const std::vector<cv::Point2f> &corners,
+  const cv::Size &image_size,
+  const DepthPlaneModel &plane,
+  const CameraInfoMsg &camera_info)
+{
+  if (corners.size() != 4 || camera_info.k[0] <= 1e-6 || camera_info.k[4] <= 1e-6)
+  {
+    return std::nullopt;
+  }
+
+  std::array<cv::Vec3d, 4> camera_points;
+  for (std::size_t i = 0; i < corners.size(); ++i)
+  {
+    const auto depth = trayPlaneDepthAtPixel(corners[i], image_size, plane);
+    if (!depth.has_value())
+    {
+      return std::nullopt;
+    }
+    camera_points[i] = projectPixelToCamera(corners[i], *depth, camera_info);
+  }
+  return camera_points;
+}
+
+std::optional<TrayMetricEstimate> estimateTrayMetricsFromTrayPlane(
+  const std::vector<cv::Point2f> &corners,
+  const cv::Size &image_size,
+  const DepthPlaneModel &plane,
+  const CameraInfoMsg &camera_info)
+{
+  const auto camera_points = estimateTrayCornerCameraPointsFromTrayPlane(
+    corners,
+    image_size,
+    plane,
+    camera_info);
+  if (!camera_points.has_value())
+  {
+    return std::nullopt;
+  }
+
+  const int origin_idx = lowerRightCornerIndex(corners);
+  if (origin_idx < 0)
+  {
+    return std::nullopt;
+  }
+
+  const int prev_idx = (origin_idx + 3) % 4;
+  const int next_idx = (origin_idx + 1) % 4;
+  const int opposite_idx = (origin_idx + 2) % 4;
+  const auto length_cm = [&](int a, int b) -> std::optional<double>
+  {
+    const double length = vectorNorm((*camera_points)[a] - (*camera_points)[b]) * 100.0;
+    if (!std::isfinite(length) || length <= 0.0)
+    {
+      return std::nullopt;
+    }
+    return length;
+  };
+
+  const auto origin_prev_len_cm = length_cm(origin_idx, prev_idx);
+  const auto next_opposite_len_cm = length_cm(next_idx, opposite_idx);
+  const auto origin_next_len_cm = length_cm(origin_idx, next_idx);
+  const auto prev_opposite_len_cm = length_cm(prev_idx, opposite_idx);
+  if (!origin_prev_len_cm.has_value() ||
+      !next_opposite_len_cm.has_value() ||
+      !origin_next_len_cm.has_value() ||
+      !prev_opposite_len_cm.has_value())
+  {
+    return std::nullopt;
+  }
+
+  TrayMetricEstimate metrics;
+  metrics.edge_lengths_cm = {
+    *origin_prev_len_cm,
+    *next_opposite_len_cm,
+    *origin_next_len_cm,
+    *prev_opposite_len_cm,
+  };
+
+  double depth_sum_m = 0.0;
+  for (const auto &corner : corners)
+  {
+    const auto depth = trayPlaneDepthAtPixel(corner, image_size, plane);
+    if (!depth.has_value())
+    {
+      return std::nullopt;
+    }
+    depth_sum_m += *depth;
+  }
+  metrics.mean_depth_m = depth_sum_m / static_cast<double>(corners.size());
+  return metrics;
 }
 
 bool hasValidRoiRegions(const std::vector<AxisAlignedRoiBounds> &roi_regions)
@@ -2807,6 +2611,62 @@ std::optional<TrayEstimate> detectTrayFromAxisAlignedRoi(
     outlier_sensitivity);
 }
 
+void drawMetricSummaryBox(
+  cv::Mat &image,
+  const std::vector<std::string> &lines,
+  const cv::Scalar &border_color,
+  const cv::Scalar &text_color)
+{
+  if (image.empty() || lines.empty())
+  {
+    return;
+  }
+
+  constexpr double kFontScale = 0.52;
+  constexpr int kThickness = 1;
+  constexpr int kLineGapPx = 8;
+  int max_width = 0;
+  int baseline = 0;
+  std::vector<cv::Size> text_sizes;
+  text_sizes.reserve(lines.size());
+  for (const auto &line : lines)
+  {
+    const cv::Size size = cv::getTextSize(line, cv::FONT_HERSHEY_SIMPLEX, kFontScale, kThickness, &baseline);
+    text_sizes.push_back(size);
+    max_width = std::max(max_width, size.width);
+  }
+
+  const int line_height = std::max(18, text_sizes.front().height + kLineGapPx);
+  const int box_w = max_width + 22;
+  const int box_h = 16 + static_cast<int>(lines.size()) * line_height;
+  const int margin = 14;
+  const int box_x = std::max(margin, image.cols - box_w - margin);
+  int box_y = 54;
+  if (box_y + box_h > image.rows - margin)
+  {
+    box_y = std::max(margin, image.rows - box_h - margin);
+  }
+
+  const cv::Rect box(box_x, box_y, box_w, box_h);
+  cv::rectangle(image, box, cv::Scalar(24, 24, 24), cv::FILLED);
+  cv::rectangle(image, box, border_color, 1);
+  for (std::size_t i = 0; i < lines.size(); ++i)
+  {
+    const cv::Point origin(
+      box.x + 11,
+      box.y + 11 + static_cast<int>(i + 1) * line_height - 4);
+    cv::putText(
+      image,
+      lines[i],
+      origin,
+      cv::FONT_HERSHEY_SIMPLEX,
+      kFontScale,
+      text_color,
+      kThickness,
+      cv::LINE_AA);
+  }
+}
+
 void drawTrayEstimate(cv::Mat &binary_bgr, const std::optional<TrayEstimate> &estimate, int depth_edge_offset_px)
 {
   if (!estimate.has_value())
@@ -2846,7 +2706,33 @@ void drawTrayEstimate(cv::Mat &binary_bgr, const std::optional<TrayEstimate> &es
 
   if (!estimate->has_metric_estimate || estimate->corners.size() != 4)
   {
+    drawMetricSummaryBox(
+      binary_bgr,
+      {"Plane metric unavailable", "Set tray plane ROI"},
+      cv::Scalar(0, 180, 255),
+      cv::Scalar(0, 220, 255));
     return;
+  }
+
+  if (const auto tray_width_height_mm = averageTrayWidthHeightMm(estimate->edge_lengths_cm);
+      tray_width_height_mm.has_value())
+  {
+    std::vector<std::string> metric_lines{
+      cv::format("W %.1f mm  H %.1f mm", (*tray_width_height_mm)[0], (*tray_width_height_mm)[1])
+    };
+    if (std::isfinite(estimate->mean_depth_m) && estimate->mean_depth_m > 0.0)
+    {
+      metric_lines.push_back(cv::format("Distance %.1f mm", estimate->mean_depth_m * kMetersToMillimeters));
+    }
+    else
+    {
+      metric_lines.push_back("Distance --");
+    }
+    drawMetricSummaryBox(
+      binary_bgr,
+      metric_lines,
+      cv::Scalar(0, 255, 0),
+      cv::Scalar(0, 255, 0));
   }
 
   const int origin_idx = lowerRightCornerIndex(estimate->corners);
@@ -2859,28 +2745,12 @@ void drawTrayEstimate(cv::Mat &binary_bgr, const std::optional<TrayEstimate> &es
   const int next_idx = (origin_idx + 1) % 4;
   const int opposite_idx = (origin_idx + 2) % 4;
 
-  const float origin_prev_px = cv::norm(estimate->corners[origin_idx] - estimate->corners[prev_idx]);
-  const float origin_next_px = cv::norm(estimate->corners[origin_idx] - estimate->corners[next_idx]);
-
-  std::array<std::pair<int, int>, 4> edge_segments;
-  if (origin_prev_px >= origin_next_px)
-  {
-    edge_segments = {{
-      {origin_idx, prev_idx},
-      {next_idx, opposite_idx},
-      {origin_idx, next_idx},
-      {prev_idx, opposite_idx},
-    }};
-  }
-  else
-  {
-    edge_segments = {{
-      {origin_idx, next_idx},
-      {prev_idx, opposite_idx},
-      {origin_idx, prev_idx},
-      {next_idx, opposite_idx},
-    }};
-  }
+  const std::array<std::pair<int, int>, 4> edge_segments{{
+    {origin_idx, prev_idx},
+    {next_idx, opposite_idx},
+    {origin_idx, next_idx},
+    {prev_idx, opposite_idx},
+  }};
 
   for (std::size_t i = 0; i < edge_segments.size(); ++i)
   {
@@ -2903,7 +2773,7 @@ void drawTrayEstimate(cv::Mat &binary_bgr, const std::optional<TrayEstimate> &es
     const float dist_b = cv::norm(outward_b - estimate->rect.center);
     const cv::Point2f label_anchor = dist_a >= dist_b ? outward_a : outward_b;
 
-    const std::string label = cv::format("%.2f cm", estimate->edge_lengths_cm[i]);
+    const std::string label = cv::format("%.1f mm", estimate->edge_lengths_cm[i] * kCentimetersToMillimeters);
     int baseline = 0;
     const cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.55, 2, &baseline);
     const cv::Point text_origin(
@@ -3175,7 +3045,6 @@ public:
       color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
       depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
       camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
-      joint_states_topic_ = declare_parameter<std::string>("joint_states_topic", "/joint_states_robot");
       overlay_topic_ = declare_parameter<std::string>("overlay_topic", "tray_overlay");
       camera_control_service_root_ = declare_parameter<std::string>(
         "camera_control_service_root",
@@ -3221,8 +3090,24 @@ public:
       "runtime_settings_path",
       dobot_common::paths::workspacePath(
         {"config", "tray_perception", "tray_teach_runtime.yaml"}, __FILE__).string());
+    motion_service_root_ = declare_parameter<std::string>(
+      "motion_service_root",
+      "/dobot_bringup_ros2/srv");
+    while (!motion_service_root_.empty() && motion_service_root_.back() == '/')
+    {
+      motion_service_root_.pop_back();
+    }
+    if (motion_service_root_.empty())
+    {
+      motion_service_root_ = "/dobot_bringup_ros2/srv";
+    }
+    get_angle_service_name_ = motion_service_root_ + "/GetAngle";
     publish_overlay_ = declare_parameter<bool>("publish_overlay", true);
     display_scale_ = declare_parameter<double>("display_scale", 1.0);
+    depth_threshold_mm_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("depth_threshold_mm", 10)),
+      kDepthThresholdMinMm,
+      kDepthThresholdMaxMm);
     ray_step_px_ = declare_parameter<int>("ray_step_px", 3);
     depth_edge_offset_px_ = std::clamp(
       static_cast<int>(declare_parameter<int>("depth_edge_offset_px", 4)),
@@ -3240,6 +3125,10 @@ public:
       static_cast<int>(declare_parameter<int>("vertical_ray_count", 50)),
       50,
       150);
+    outlier_sensitivity_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("outlier_sensitivity", 50)),
+      1,
+      100);
     trace_out_to_in_ = declare_parameter<bool>("trace_out_to_in", false);
     loadRuntimeSettingsFromFile();
 
@@ -3253,13 +3142,14 @@ public:
     camera_info_sub_ = create_subscription<CameraInfoMsg>(
       camera_info_topic_, rclcpp::QoS(10).best_effort(),
       std::bind(&TrayDetectorNode::cameraInfoCallback, this, std::placeholders::_1));
-    joint_state_sub_ = create_subscription<JointStateMsg>(
-      joint_states_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&TrayDetectorNode::jointStateCallback, this, std::placeholders::_1));
+    get_angle_client_ = create_client<GetAngleSrv>(get_angle_service_name_);
 
       createUi();
       cv::setMouseCallback(kWindowName, &TrayDetectorNode::onMouseThunk, this);
       createCameraExposureClients();
+      robot_state_poll_timer_ = create_wall_timer(
+        std::chrono::milliseconds(500),
+        std::bind(&TrayDetectorNode::pollRobotJointAngles, this));
       camera_exposure_timer_ = create_wall_timer(
         std::chrono::milliseconds(250),
         std::bind(&TrayDetectorNode::applyPendingCameraExposureSettings, this));
@@ -3270,11 +3160,11 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "Tray teach ready. Color topic=%s depth topic=%s info topic=%s joints topic=%s overlay topic=%s settings=%s",
+      "Tray teach ready. Color topic=%s depth topic=%s info topic=%s robot joint service=%s overlay topic=%s settings=%s",
       color_topic_.c_str(),
       depth_topic_.c_str(),
       camera_info_topic_.c_str(),
-      joint_states_topic_.c_str(),
+      get_angle_service_name_.c_str(),
         overlay_topic_.c_str(),
         settings_path_.c_str());
       RCLCPP_INFO(
@@ -3465,14 +3355,7 @@ private:
 
   void updateDetectionModeFromCurrentView()
   {
-    if (view_mode_ == ViewMode::kDepth)
-    {
-      detection_use_depth_ = true;
-    }
-    else if (view_mode_ == ViewMode::kRgb)
-    {
-      detection_use_depth_ = false;
-    }
+    detection_use_depth_ = false;
   }
 
   bool hasDepthPlaneReference() const
@@ -3866,7 +3749,7 @@ private:
       out << YAML::Key << "depth_exposure_min_us" << YAML::Value << depth_exposure_min_us_;
       out << YAML::Key << "depth_exposure_max_us" << YAML::Value << depth_exposure_max_us_;
       out << YAML::Key << "depth_threshold_mm" << YAML::Value << depth_threshold_mm_;
-    out << YAML::Key << "detection_mode" << YAML::Value << detectionModeToString(detection_use_depth_);
+    out << YAML::Key << "detection_mode" << YAML::Value << "rgb";
     out << YAML::Key << "ray_step_px" << YAML::Value << ray_step_px_;
     out << YAML::Key << "depth_edge_offset_px" << YAML::Value << depth_edge_offset_px_;
     out << YAML::Key << "previous_color_percent" << YAML::Value << previous_color_percent_;
@@ -3879,12 +3762,12 @@ private:
     out << YAML::Key << "show_rays_enabled" << YAML::Value << show_rays_enabled_;
     out << YAML::Key << "detect_black_to_white" << YAML::Value << detect_black_to_white_;
     out << YAML::Key << "trace_out_to_in" << YAML::Value << trace_out_to_in_;
-    out << YAML::Key << "depth_plane_enabled" << YAML::Value << depth_plane_model_.valid;
-    out << YAML::Key << "depth_plane_a" << YAML::Value << depth_plane_model_.a;
-    out << YAML::Key << "depth_plane_b" << YAML::Value << depth_plane_model_.b;
-    out << YAML::Key << "depth_plane_c" << YAML::Value << depth_plane_model_.c;
-    out << YAML::Key << "depth_plane_reference_depth_m" << YAML::Value << depth_plane_model_.reference_depth_m;
-    out << YAML::Key << "depth_plane_roi" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+    out << YAML::Key << "tray_plane_enabled" << YAML::Value << depth_plane_model_.valid;
+    out << YAML::Key << "tray_plane_a" << YAML::Value << depth_plane_model_.a;
+    out << YAML::Key << "tray_plane_b" << YAML::Value << depth_plane_model_.b;
+    out << YAML::Key << "tray_plane_c" << YAML::Value << depth_plane_model_.c;
+    out << YAML::Key << "tray_plane_reference_depth_m" << YAML::Value << depth_plane_model_.reference_depth_m;
+    out << YAML::Key << "tray_plane_roi" << YAML::Value << YAML::Flow << YAML::BeginSeq;
     if (depth_plane_roi_bounds_.has_value())
     {
       out << depth_plane_roi_bounds_->left
@@ -3899,7 +3782,7 @@ private:
     out << YAML::EndSeq;
     if (!depth_plane_roi_points_.empty())
     {
-      out << YAML::Key << "depth_plane_roi_points" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+      out << YAML::Key << "tray_plane_roi_points" << YAML::Value << YAML::Flow << YAML::BeginSeq;
       for (const auto &point : depth_plane_roi_points_)
       {
         out << static_cast<int>(std::round(point.x));
@@ -4013,10 +3896,7 @@ private:
         depth_threshold_mm_ = params["depth_threshold_mm"]
           ? std::clamp(params["depth_threshold_mm"].as<int>(), kDepthThresholdMinMm, kDepthThresholdMaxMm)
         : depth_threshold_mm_;
-      if (params["detection_mode"])
-      {
-        detection_use_depth_ = isDepthDetectionMode(params["detection_mode"].as<std::string>());
-      }
+      detection_use_depth_ = false;
       ray_step_px_ = params["ray_step_px"] ? std::clamp(params["ray_step_px"].as<int>(), 1, 100) : ray_step_px_;
       depth_edge_offset_px_ = params["depth_edge_offset_px"]
         ? std::clamp(params["depth_edge_offset_px"].as<int>(), kDepthEdgeOffsetMinPx, kDepthEdgeOffsetMaxPx)
@@ -4036,13 +3916,13 @@ private:
       detect_black_to_white_ = params["detect_black_to_white"] ? params["detect_black_to_white"].as<bool>() : detect_black_to_white_;
       trace_out_to_in_ = params["trace_out_to_in"] ? params["trace_out_to_in"].as<bool>() : trace_out_to_in_;
       clearDepthPlaneReference(false);
-      if (params["depth_plane_roi"] && params["depth_plane_roi"].IsSequence() && params["depth_plane_roi"].size() >= 4)
+      if (params["tray_plane_roi"] && params["tray_plane_roi"].IsSequence() && params["tray_plane_roi"].size() >= 4)
       {
         AxisAlignedRoiBounds plane_bounds{
-          params["depth_plane_roi"][0].as<int>(),
-          params["depth_plane_roi"][1].as<int>(),
-          params["depth_plane_roi"][2].as<int>(),
-          params["depth_plane_roi"][3].as<int>(),
+          params["tray_plane_roi"][0].as<int>(),
+          params["tray_plane_roi"][1].as<int>(),
+          params["tray_plane_roi"][2].as<int>(),
+          params["tray_plane_roi"][3].as<int>(),
         };
         if (isValidRoiBounds(plane_bounds))
         {
@@ -4050,21 +3930,21 @@ private:
           depth_plane_roi_points_ = roiPointsFromBounds(plane_bounds);
         }
       }
-      if (const auto depth_plane_points = roiPointsFromYamlNode(params["depth_plane_roi_points"]);
+      if (const auto depth_plane_points = roiPointsFromYamlNode(params["tray_plane_roi_points"]);
           depth_plane_points.size() == kTeachRoiPointCount)
       {
         depth_plane_roi_points_ = depth_plane_points;
         depth_plane_roi_bounds_ = roiBoundsFromSelection(depth_plane_points);
       }
-      const bool depth_plane_enabled =
-        params["depth_plane_enabled"] ? params["depth_plane_enabled"].as<bool>() : false;
-      if (depth_plane_enabled && (depth_plane_roi_bounds_.has_value() || hasValidRoiPoints(depth_plane_roi_points_)))
+      const bool tray_plane_enabled =
+        params["tray_plane_enabled"] ? params["tray_plane_enabled"].as<bool>() : false;
+      if (tray_plane_enabled && (depth_plane_roi_bounds_.has_value() || hasValidRoiPoints(depth_plane_roi_points_)))
       {
-        const double a = params["depth_plane_a"] ? params["depth_plane_a"].as<double>() : 0.0;
-        const double b = params["depth_plane_b"] ? params["depth_plane_b"].as<double>() : 0.0;
-        const double c = params["depth_plane_c"] ? params["depth_plane_c"].as<double>() : 0.0;
-        const double ref_depth_m = params["depth_plane_reference_depth_m"]
-          ? params["depth_plane_reference_depth_m"].as<double>()
+        const double a = params["tray_plane_a"] ? params["tray_plane_a"].as<double>() : 0.0;
+        const double b = params["tray_plane_b"] ? params["tray_plane_b"].as<double>() : 0.0;
+        const double c = params["tray_plane_c"] ? params["tray_plane_c"].as<double>() : 0.0;
+        const double ref_depth_m = params["tray_plane_reference_depth_m"]
+          ? params["tray_plane_reference_depth_m"].as<double>()
           : 0.0;
         if (std::isfinite(a) && std::isfinite(b) && std::isfinite(c) && std::isfinite(ref_depth_m) && ref_depth_m > 0.0)
         {
@@ -4141,7 +4021,7 @@ private:
       roi_selection_active_ = false;
       const bool was_depth_plane_selection = depth_plane_roi_selection_active_;
       depth_plane_roi_selection_active_ = false;
-      save_status_message_ = was_depth_plane_selection ? "Depth plane ROI cancelled" : "ROI selection cancelled";
+      save_status_message_ = was_depth_plane_selection ? "Tray plane ROI cancelled" : "ROI selection cancelled";
       save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
       markRuntimeSettingsDirty();
       return;
@@ -4179,15 +4059,22 @@ private:
       return;
     }
 
-    if (!latest_tray_edge_lengths_cm_.has_value())
+    if (!hasDepthPlaneReference())
     {
-      save_status_message_ = "No tray edge lengths";
+      save_status_message_ = "Tray plane ROI required";
       save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
       return;
     }
-    if (detection_use_depth_ && !hasDepthPlaneReference())
+    if (!latest_tray_edge_lengths_cm_.has_value())
     {
-      save_status_message_ = "Depth plane ROI required";
+      save_status_message_ = "No tray width/height";
+      save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
+      return;
+    }
+    const auto tray_width_height_mm = averageTrayWidthHeightMm(*latest_tray_edge_lengths_cm_);
+    if (!tray_width_height_mm.has_value())
+    {
+      save_status_message_ = "No tray width/height";
       save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
       return;
     }
@@ -4195,7 +4082,7 @@ private:
     std::array<double, 6> joints_deg_snapshot {};
     bool has_joint_snapshot = false;
     {
-      std::lock_guard<std::mutex> lock(joint_state_mutex_);
+      std::lock_guard<std::mutex> lock(robot_state_mutex_);
       joints_deg_snapshot = latest_joint_positions_deg_;
       has_joint_snapshot = has_joint_positions_;
     }
@@ -4226,7 +4113,7 @@ private:
       out << YAML::Key << "depth_exposure_min_us" << YAML::Value << depth_exposure_min_us_;
       out << YAML::Key << "depth_exposure_max_us" << YAML::Value << depth_exposure_max_us_;
       out << YAML::Key << "depth_threshold_mm" << YAML::Value << depth_threshold_mm_;
-    out << YAML::Key << "detection_mode" << YAML::Value << detectionModeToString(detection_use_depth_);
+    out << YAML::Key << "detection_mode" << YAML::Value << "rgb";
     out << YAML::Key << "ray_step_px" << YAML::Value << ray_step_px_;
     out << YAML::Key << "depth_edge_offset_px" << YAML::Value << depth_edge_offset_px_;
     out << YAML::Key << "previous_color_percent" << YAML::Value << previous_color_percent_;
@@ -4235,12 +4122,12 @@ private:
     out << YAML::Key << "outlier_sensitivity" << YAML::Value << outlier_sensitivity_;
     out << YAML::Key << "detect_black_to_white" << YAML::Value << detect_black_to_white_;
     out << YAML::Key << "trace_out_to_in" << YAML::Value << trace_out_to_in_;
-    out << YAML::Key << "depth_plane_enabled" << YAML::Value << depth_plane_model_.valid;
-    out << YAML::Key << "depth_plane_a" << YAML::Value << depth_plane_model_.a;
-    out << YAML::Key << "depth_plane_b" << YAML::Value << depth_plane_model_.b;
-    out << YAML::Key << "depth_plane_c" << YAML::Value << depth_plane_model_.c;
-    out << YAML::Key << "depth_plane_reference_depth_m" << YAML::Value << depth_plane_model_.reference_depth_m;
-    out << YAML::Key << "depth_plane_roi" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+    out << YAML::Key << "tray_plane_enabled" << YAML::Value << depth_plane_model_.valid;
+    out << YAML::Key << "tray_plane_a" << YAML::Value << depth_plane_model_.a;
+    out << YAML::Key << "tray_plane_b" << YAML::Value << depth_plane_model_.b;
+    out << YAML::Key << "tray_plane_c" << YAML::Value << depth_plane_model_.c;
+    out << YAML::Key << "tray_plane_reference_depth_m" << YAML::Value << depth_plane_model_.reference_depth_m;
+    out << YAML::Key << "tray_plane_roi" << YAML::Value << YAML::Flow << YAML::BeginSeq;
     if (depth_plane_roi_bounds_.has_value())
     {
       out << depth_plane_roi_bounds_->left
@@ -4255,7 +4142,7 @@ private:
     out << YAML::EndSeq;
     if (!depth_plane_roi_points_.empty())
     {
-      out << YAML::Key << "depth_plane_roi_points" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+      out << YAML::Key << "tray_plane_roi_points" << YAML::Value << YAML::Flow << YAML::BeginSeq;
       for (const auto &point : depth_plane_roi_points_)
       {
         out << static_cast<int>(std::round(point.x));
@@ -4281,13 +4168,10 @@ private:
       }
       out << YAML::EndSeq;
     }
-    out << YAML::Key << "taught_edge_lengths_cm" << YAML::Value << YAML::Flow << YAML::BeginSeq;
-    for (const double edge_length_cm : *latest_tray_edge_lengths_cm_)
-    {
-      out << edge_length_cm;
-    }
-    out << YAML::EndSeq;
-    out << YAML::Key << "taught_area_cm2" << YAML::Value << latest_tray_area_cm2_.value_or(0.0);
+    out << YAML::Key << "tray_dimension_source" << YAML::Value
+        << "rgb_corners_on_tray_plane";
+    out << YAML::Key << "tray_width_mm" << YAML::Value << (*tray_width_height_mm)[0];
+    out << YAML::Key << "tray_height_mm" << YAML::Value << (*tray_width_height_mm)[1];
     out << YAML::EndMap;
     out << YAML::EndMap;
     out << YAML::EndMap;
@@ -4341,7 +4225,7 @@ private:
           {
             pending_roi_points_.clear();
             save_status_message_ = depth_plane_roi_selection_active_
-              ? "Depth plane ROI: click 4 corners"
+              ? "Tray plane ROI: click 4 corners"
               : "Click 4 ROI corners";
             save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
             return;
@@ -4349,6 +4233,25 @@ private:
           if (button.label == "Clear ROI" && button.rect.contains(ui_point))
           {
             clearLastRoiRegion();
+            return;
+          }
+        }
+
+        for (int i = 0; i < static_cast<int>(sliders_.size()); ++i)
+        {
+          if (!isSliderEnabled(sliders_[i]))
+          {
+            continue;
+          }
+          const cv::Rect hit_box(
+            sliders_[i].track_rect.x,
+            sliders_[i].track_rect.y - 16,
+            sliders_[i].track_rect.width,
+            sliders_[i].track_rect.height + 32);
+          if (hit_box.contains(ui_point))
+          {
+            active_slider_index_ = i;
+            updateSliderFromPoint(i, ui_point);
             return;
           }
         }
@@ -4376,7 +4279,7 @@ private:
             DepthPlaneModel fitted_plane;
             if (!fitDepthPlaneFromRoiPoints(depth_for_fit, pending_roi_points_, fitted_plane))
             {
-              save_status_message_ = "Invalid depth plane ROI";
+              save_status_message_ = "Invalid tray plane ROI";
               save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
               pending_roi_points_.clear();
               return;
@@ -4386,34 +4289,23 @@ private:
             depth_plane_roi_points_ = pending_roi_points_;
             roi_selection_active_ = false;
             depth_plane_roi_selection_active_ = false;
-            save_status_message_ = "Depth plane set";
+            save_status_message_ = "Tray plane set";
             save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
             markRuntimeSettingsDirty();
           }
           else if (new_region_bounds.has_value())
           {
-            const bool selected_depth_mode = (view_mode_ == ViewMode::kDepth);
             roi_regions_.clear();
             roi_points_ = pending_roi_points_;
             updateDetectionModeFromCurrentView();
             markRuntimeSettingsDirty();
-            if (selected_depth_mode)
-            {
-              clearDepthPlaneReference(false);
-              depth_plane_roi_selection_active_ = true;
-              roi_selection_active_ = true;
-              save_status_message_ = "Depth plane ROI: click 4 corners";
-              save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
-              markRuntimeSettingsDirty();
-            }
-            else
-            {
-              roi_selection_active_ = false;
-              depth_plane_roi_selection_active_ = false;
-              save_status_message_ = "ROI added";
-              save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
-            }
-            if (!selected_depth_mode && view_mode_ != ViewMode::kBinarized)
+            clearDepthPlaneReference(false);
+            depth_plane_roi_selection_active_ = true;
+            roi_selection_active_ = true;
+            save_status_message_ = "Tray plane ROI: click 4 corners";
+            save_status_deadline_ = this->now() + rclcpp::Duration::from_seconds(1.5);
+            markRuntimeSettingsDirty();
+            if (view_mode_ != ViewMode::kBinarized)
             {
               view_mode_ = ViewMode::kBinarized;
               markRuntimeSettingsDirty();
@@ -4746,12 +4638,12 @@ private:
     const std::string roi_status = roi_selection_active_
       ? (
       depth_plane_roi_selection_active_
-      ? ("Depth plane " + std::to_string(pending_roi_points_.size()) + "/4")
+      ? ("Tray plane " + std::to_string(pending_roi_points_.size()) + "/4")
       : ("ROI selecting " + std::to_string(pending_roi_points_.size()) + "/4"))
       : (
       !hasValidRoiPoints(roi_points_)
       ? "ROI required"
-      : ((detection_use_depth_ && !hasDepthPlaneReference()) ? "Depth plane ROI required" : "ROI ready"));
+      : (!hasDepthPlaneReference() ? "Tray plane ROI required" : "ROI ready"));
     const std::string runtime_status =
       show_save_status
       ? save_status_message_
@@ -4895,7 +4787,7 @@ private:
     const bool save_ready = hasValidTrayName() &&
       hasValidRoiPoints(roi_points_) &&
       latest_tray_edge_lengths_cm_.has_value() &&
-      (!detection_use_depth_ || hasDepthPlaneReference());
+      hasDepthPlaneReference();
     const cv::Scalar save_fill = save_ready ? cv::Scalar(70, 132, 82) : cv::Scalar(66, 70, 76);
     const cv::Scalar save_border = save_ready ? cv::Scalar(132, 215, 150) : cv::Scalar(102, 106, 112);
     cv::rectangle(panel, save_button_rect_, save_fill, cv::FILLED);
@@ -5032,72 +4924,70 @@ private:
     latest_camera_info_ = msg;
   }
 
-  void jointStateCallback(const JointStateMsg::ConstSharedPtr msg)
+  void pollRobotJointAngles()
   {
-    if (msg->position.empty())
+    if (!get_angle_client_ || get_angle_request_in_flight_)
     {
       return;
     }
-
-    constexpr double kRadToDeg = 57.29577951308232;
-    std::array<double, 6> joints_deg {};
-    std::array<bool, 6> has_named_joint {false, false, false, false, false, false};
-
-    for (std::size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i)
+    if (!get_angle_client_->service_is_ready())
     {
-      const std::string &name = msg->name[i];
-      int index = -1;
-      if (name == "joint1")
-      {
-        index = 0;
-      }
-      else if (name == "joint2")
-      {
-        index = 1;
-      }
-      else if (name == "joint3")
-      {
-        index = 2;
-      }
-      else if (name == "joint4")
-      {
-        index = 3;
-      }
-      else if (name == "joint5")
-      {
-        index = 4;
-      }
-      else if (name == "joint6")
-      {
-        index = 5;
-      }
-
-      if (index >= 0)
-      {
-        joints_deg[static_cast<std::size_t>(index)] = msg->position[i] * kRadToDeg;
-        has_named_joint[static_cast<std::size_t>(index)] = true;
-      }
-    }
-
-    bool valid_sample =
-      std::all_of(has_named_joint.begin(), has_named_joint.end(), [](const bool value) { return value; });
-    if (!valid_sample && msg->position.size() >= 6)
-    {
-      for (std::size_t i = 0; i < 6; ++i)
-      {
-        joints_deg[i] = msg->position[i] * kRadToDeg;
-      }
-      valid_sample = true;
-    }
-
-    if (!valid_sample)
-    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        5000,
+        "Robot joint snapshot service not available: %s",
+        get_angle_service_name_.c_str());
       return;
     }
 
-    std::lock_guard<std::mutex> lock(joint_state_mutex_);
-    latest_joint_positions_deg_ = joints_deg;
-    has_joint_positions_ = true;
+    get_angle_request_in_flight_ = true;
+    auto request = std::make_shared<GetAngleSrv::Request>();
+    get_angle_client_->async_send_request(
+      request,
+      [this](rclcpp::Client<GetAngleSrv>::SharedFuture future)
+      {
+        get_angle_request_in_flight_ = false;
+        try
+        {
+          const auto response = future.get();
+          if (!response || response->res < 0)
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              5000,
+              "GetAngle failed while caching teach joints from %s",
+              get_angle_service_name_.c_str());
+            return;
+          }
+
+          const auto joints_deg = parseSixDoublesFromRobotReturn(response->robot_return);
+          if (!joints_deg.has_value())
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              5000,
+              "Could not parse GetAngle reply while caching teach joints: %s",
+              response->robot_return.c_str());
+            return;
+          }
+
+          std::lock_guard<std::mutex> lock(robot_state_mutex_);
+          latest_joint_positions_deg_ = *joints_deg;
+          has_joint_positions_ = true;
+        }
+        catch (const std::exception &ex)
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            5000,
+            "GetAngle call failed while caching teach joints: %s",
+            ex.what());
+        }
+      });
   }
 
   cv::Mat buildNoCameraTopicsPlaceholder()
@@ -5222,30 +5112,11 @@ private:
       return;
     }
 
-    cv::Mat mask;
-    if (detection_use_depth_)
-    {
-      if (hasDepthPlaneReference())
-      {
-        const cv::Mat normalized_depth = applyFixedDepthPlaneNormalization(current_depth, depth_plane_model_);
-        mask = buildDepthMask(
-          normalized_depth,
-          depth_threshold_mm_,
-          depth_plane_model_.reference_depth_m);
-      }
-      else if (!current_depth.empty() && current_depth.type() == CV_32FC1)
-      {
-        mask = cv::Mat::zeros(current_depth.size(), CV_8UC1);
-      }
-    }
-    else
-    {
-      mask = buildRgbMask(
-        current_frame,
-        red_threshold_,
-        green_threshold_,
-        blue_threshold_);
-    }
+    cv::Mat mask = buildRgbMask(
+      current_frame,
+      red_threshold_,
+      green_threshold_,
+      blue_threshold_);
 
     const bool roi_ready = hasValidRoiPoints(roi_points_);
     cv::Mat detection_mask = mask.clone();
@@ -5273,17 +5144,28 @@ private:
         trace_out_to_in_);
     }
 
+    if (tray_estimate.has_value() && hasDepthPlaneReference())
+    {
+      if (const auto metrics = estimateTrayMetricsFromTrayPlane(
+            tray_estimate->corners,
+            current_frame.size(),
+            depth_plane_model_,
+            *current_camera_info); metrics.has_value())
+      {
+        tray_estimate->has_metric_estimate = true;
+        tray_estimate->mean_depth_m = metrics->mean_depth_m;
+        tray_estimate->edge_lengths_cm = metrics->edge_lengths_cm;
+      }
+    }
+
     if (tray_estimate.has_value() && tray_estimate->has_metric_estimate)
     {
       latest_tray_edge_lengths_cm_ = tray_estimate->edge_lengths_cm;
-      if (tray_estimate->area_cm2 > 0.0)
-      {
-        latest_tray_area_cm2_ = tray_estimate->area_cm2;
-      }
-      else
-      {
-        latest_tray_area_cm2_.reset();
-      }
+      latest_tray_area_cm2_.reset();
+    }
+    else
+    {
+      resetTaughtMetrics();
     }
 
     cv::Mat display_image;
@@ -5341,7 +5223,7 @@ private:
       drawMeasurementAxes(display_image, tray_estimate);
     }
     drawViewLabel(display_image, currentViewLabel());
-    drawModeLabel(display_image, detection_use_depth_ ? "Depth" : "RGB");
+    drawModeLabel(display_image, "RGB");
     if (!roi_ready)
     {
       cv::putText(
@@ -5353,11 +5235,11 @@ private:
         cv::Scalar(0, 180, 255),
         2);
     }
-    else if (detection_use_depth_ && !hasDepthPlaneReference())
+    else if (!hasDepthPlaneReference())
     {
       cv::putText(
         display_image,
-        "Depth plane ROI required",
+        "Tray plane ROI required",
         cv::Point(24, 72),
         cv::FONT_HERSHEY_SIMPLEX,
         0.80,
@@ -5409,12 +5291,13 @@ private:
   std::string color_topic_;
   std::string depth_topic_;
   std::string camera_info_topic_;
-  std::string joint_states_topic_;
     std::string overlay_topic_;
     std::string camera_control_service_root_ {"/robot_camera"};
     std::string profiles_dir_;
   std::string settings_path_;
   std::string runtime_settings_path_;
+  std::string motion_service_root_;
+  std::string get_angle_service_name_;
   std::string latest_saved_profile_path_;
   std::string save_status_message_ {"Saved"};
   std::string tray_name_;
@@ -5432,7 +5315,7 @@ private:
     int color_exposure_max_us_ {kDefaultExposureMaxUs};
     int depth_exposure_min_us_ {kDefaultExposureMinUs};
     int depth_exposure_max_us_ {kDefaultExposureMaxUs};
-    int depth_threshold_mm_ {10};
+  int depth_threshold_mm_ {10};
   int ray_step_px_ {3};
   int depth_edge_offset_px_ {4};
   int previous_color_percent_ {kDefaultPreviousColorPercent};
@@ -5475,16 +5358,17 @@ private:
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
     rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;
-    rclcpp::Subscription<JointStateMsg>::SharedPtr joint_state_sub_;
     rclcpp::TimerBase::SharedPtr render_timer_;
+    rclcpp::TimerBase::SharedPtr robot_state_poll_timer_;
     rclcpp::TimerBase::SharedPtr camera_exposure_timer_;
+    rclcpp::Client<GetAngleSrv>::SharedPtr get_angle_client_;
     rclcpp::Client<SetBoolSrv>::SharedPtr color_auto_exposure_client_;
     rclcpp::Client<SetInt32Srv>::SharedPtr color_exposure_client_;
     rclcpp::Client<SetBoolSrv>::SharedPtr depth_auto_exposure_client_;
     rclcpp::Client<SetInt32Srv>::SharedPtr depth_exposure_client_;
 
   std::mutex frame_mutex_;
-  std::mutex joint_state_mutex_;
+  std::mutex robot_state_mutex_;
   cv::Mat latest_frame_;
   cv::Mat latest_depth_;
   cv::Mat frozen_frame_;
@@ -5495,6 +5379,7 @@ private:
   CameraInfoMsg::ConstSharedPtr frozen_camera_info_;
   std::array<double, 6> latest_joint_positions_deg_ {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_joint_positions_ {false};
+  bool get_angle_request_in_flight_ {false};
 };
 
 int main(int argc, char **argv)

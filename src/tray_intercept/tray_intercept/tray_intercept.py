@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import threading
 import time
 import tkinter as tk
@@ -13,8 +14,18 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
-from dobot_msgs_v4.msg import ToolVectorActual, TrayVector
-from dobot_msgs_v4.srv import CP, DO, GetTrayDimensions, MovL, MovLIO, SpeedFactor, Stop, TrayInterceptStart
+from dobot_msgs_v4.msg import TrayVector
+from dobot_msgs_v4.srv import (
+    CP,
+    DO,
+    GetPose,
+    GetTrayDimensions,
+    MovL,
+    MovLIO,
+    SpeedFactor,
+    Stop,
+    TrayInterceptStart,
+)
 from geometry_msgs.msg import PolygonStamped, TransformStamped
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -26,6 +37,7 @@ LINEAR_SPEED_MM_S_MIN = 50.0
 LINEAR_SPEED_MM_S_MAX = 650.0
 DEFAULT_ACC_PERCENT = 100
 TCP_FIELDS = ('x', 'y', 'z', 'rx', 'ry', 'rz')
+TCP_POSE_POLL_PERIOD_SEC = 0.1
 TRANSLATION_AXES = ('x', 'y', 'z')
 
 
@@ -133,11 +145,13 @@ MOTION_PROFILE_ENFORCE_WAIT_SEC = 12.0
 MOTION_PROFILE_ENFORCE_CALL_SEC = 8.0
 MOVLIO_RELEASE_MODE_PERCENT = 0
 MOVLIO_RELEASE_START_DISTANCE_PERCENT = 1
+TRAY_RELEASE_EXHAUST_PULSE_SEC = 0.3
 TRAY_RELEASE_OPEN_SETTLE_SEC = 0.5
 TRAY_RELEASE_NO_MOTION_TOLERANCE_MM = 0.5
 GRIPPER_DO_CLOSE_INDEX = 1
 GRIPPER_DO_OPEN_INDEX = 2
 GRIPPER_DO_SUCTION_INDEX = 3
+GRIPPER_DO_EXHAUST_INDEX = 4
 TRAY_INTERCEPT_RUNTIME_REQUIRED_KEYS = (
     'schema_version',
     'tf_only_mode',
@@ -213,6 +227,10 @@ class RelMovLMiniNode(Node):
         self._motion_service_root = str(
             self.declare_parameter('motion_service_root', SERVICE_ROOT_DEFAULT).value
         ).strip().rstrip('/') or SERVICE_ROOT_DEFAULT
+        self._tcp_pose_user = int(float(self.declare_parameter('tcp_pose_user', 0).value))
+        self._tcp_pose_tool = int(float(self.declare_parameter('tcp_pose_tool', 0).value))
+        self._tcp_pose_request_in_flight = False
+        self._tcp_pose_warning_logged = False
         self._tray_vector_topic = str(
             self.declare_parameter('tray_vector_topic', TRAY_VECTOR_TOPIC).value
         ).strip() or TRAY_VECTOR_TOPIC
@@ -388,6 +406,7 @@ class RelMovLMiniNode(Node):
         self._stop_client = self.create_client(Stop, f'{self._motion_service_root}/Stop')
         self._cp_client = self.create_client(CP, f'{self._motion_service_root}/CP')
         self._do_client = self.create_client(DO, f'{self._motion_service_root}/DO')
+        self._get_pose_client = self.create_client(GetPose, f'{self._motion_service_root}/GetPose')
         self._speed_factor_client = self.create_client(SpeedFactor, f'{self._motion_service_root}/SpeedFactor')
         self._tray_dimensions_client = self.create_client(
             GetTrayDimensions,
@@ -406,7 +425,7 @@ class RelMovLMiniNode(Node):
         self._last_tray_preview_axes_valid = False
         self._last_tray_preview_x_axis = (1.0, 0.0)
         self._last_tray_preview_y_axis = (0.0, 1.0)
-        self.create_subscription(ToolVectorActual, 'dobot_msgs_v4/msg/ToolVectorActual', self._tcp_callback, 10)
+        self._tcp_pose_timer = self.create_timer(TCP_POSE_POLL_PERIOD_SEC, self._poll_tcp_pose)
         self.create_subscription(TrayVector, self._tray_vector_topic, self._tray_vector_callback, 10)
         self.create_subscription(PolygonStamped, self._tray_axis_overlay_topic, self._tray_axis_overlay_callback, 10)
         self._start_sequence_service = self.create_service(
@@ -439,10 +458,15 @@ class RelMovLMiniNode(Node):
         self.get_logger().info(f'Tray vector topic: {self._tray_vector_topic}')
         self.get_logger().info(f'Motion service root: {self._motion_service_root}')
         self.get_logger().info(
+            f'TCP pose service: {self._motion_service_root}/GetPose '
+            f'(user={self._tcp_pose_user}, tool={self._tcp_pose_tool})'
+        )
+        self.get_logger().info(
             'Startup settings: '
             f'wait={self._tray_vector_watch_timeout_sec:.0f}s, '
             f'fixed_speed={self._post_stop_movel_speed_mm_s:.0f} mm/s, '
             f'ee_angle={self._ee_final_pose_angle_deg:.0f} deg, '
+            'align_ee_to_tray_y=always, '
             f'offsets(x={self._post_stop_x_offset_mm:.0f},'
             f'y={self._post_stop_y_offset_mm:.0f},'
             f'z={self._post_stop_z_offset_mm:.0f}) mm, '
@@ -494,15 +518,83 @@ class RelMovLMiniNode(Node):
                 tray_preview_y_axis=self._last_tray_preview_y_axis,
             )
 
-    def _tcp_callback(self, msg: ToolVectorActual) -> None:
+    def _update_tcp_pose_cache(
+        self,
+        values: tuple[float, float, float, float, float, float],
+    ) -> None:
         with self._lock:
-            self._snapshot.tcp_values['x'] = float(msg.x)
-            self._snapshot.tcp_values['y'] = float(msg.y)
-            self._snapshot.tcp_values['z'] = float(msg.z)
-            self._snapshot.tcp_values['rx'] = float(msg.rx)
-            self._snapshot.tcp_values['ry'] = float(msg.ry)
-            self._snapshot.tcp_values['rz'] = float(msg.rz)
+            self._snapshot.tcp_values['x'] = float(values[0])
+            self._snapshot.tcp_values['y'] = float(values[1])
+            self._snapshot.tcp_values['z'] = float(values[2])
+            self._snapshot.tcp_values['rx'] = float(values[3])
+            self._snapshot.tcp_values['ry'] = float(values[4])
+            self._snapshot.tcp_values['rz'] = float(values[5])
             self._snapshot.tcp_stamp = time.time()
+
+    def _poll_tcp_pose(self) -> None:
+        if self._tcp_pose_request_in_flight:
+            return
+        if not self._get_pose_client.service_is_ready():
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(
+                    f'TCP pose service is not ready: {self._motion_service_root}/GetPose'
+                )
+                self._tcp_pose_warning_logged = True
+            return
+
+        request = GetPose.Request()
+        request.user = self._tcp_pose_user
+        request.tool = self._tcp_pose_tool
+        self._tcp_pose_request_in_flight = True
+        future = self._get_pose_client.call_async(request)
+        future.add_done_callback(self._handle_tcp_pose_response)
+
+    def _handle_tcp_pose_response(self, future) -> None:
+        self._tcp_pose_request_in_flight = False
+        try:
+            response = future.result()
+        except Exception as exc:
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(f'GetPose call failed while caching TCP pose: {exc}')
+                self._tcp_pose_warning_logged = True
+            return
+        if response is None or int(getattr(response, 'res', -1)) < 0:
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(
+                    f'GetPose failed while caching TCP pose: '
+                    f'res={getattr(response, "res", None)}, '
+                    f'return={getattr(response, "robot_return", "")}'
+                )
+                self._tcp_pose_warning_logged = True
+            return
+        values = self._parse_six_values_from_robot_return(getattr(response, 'robot_return', ''))
+        if values is None:
+            if not self._tcp_pose_warning_logged:
+                self.get_logger().warn(
+                    f'Could not parse GetPose reply while caching TCP pose: '
+                    f'{getattr(response, "robot_return", "")}'
+                )
+                self._tcp_pose_warning_logged = True
+            return
+        self._tcp_pose_warning_logged = False
+        self._update_tcp_pose_cache(values)
+
+    @staticmethod
+    def _parse_six_values_from_robot_return(
+        robot_return: object,
+    ) -> tuple[float, float, float, float, float, float] | None:
+        text = str(robot_return or '')
+        if not text:
+            return None
+        float_pattern = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+        for content in re.findall(r'\{([^{}]+)\}', text):
+            values = [float(token) for token in re.findall(float_pattern, content)]
+            if len(values) == 6:
+                return tuple(values)  # type: ignore[return-value]
+        values = [float(token) for token in re.findall(float_pattern, text)]
+        if len(values) == 6:
+            return tuple(values)  # type: ignore[return-value]
+        return None
 
     def _tray_axis_overlay_callback(self, msg: PolygonStamped) -> None:
         points = getattr(getattr(msg, 'polygon', None), 'points', [])
@@ -597,6 +689,18 @@ class RelMovLMiniNode(Node):
         cosy_cosp = 1.0 - (2.0 * ((qy * qy) + (qz * qz)))
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return (math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
+
+    @staticmethod
+    def _angle_delta_deg(left_deg: float, right_deg: float) -> float:
+        return ((float(left_deg) - float(right_deg) + 180.0) % 360.0) - 180.0
+
+    @classmethod
+    def _closest_parallel_yaw_deg(cls, axis_yaw_deg: float, reference_yaw_deg: float) -> float:
+        # Tray Y is a line for EE alignment: yaw and yaw+180 are equivalent.
+        return min(
+            (float(axis_yaw_deg) + (180.0 * step) for step in range(-2, 3)),
+            key=lambda candidate: abs(cls._angle_delta_deg(candidate, reference_yaw_deg)),
+        )
 
     @staticmethod
     def _builtin_time_to_sec(stamp) -> float:
@@ -1019,33 +1123,31 @@ class RelMovLMiniNode(Node):
         target_y_goal = desired_now_goal_mm[1] + (velocity_base_mmps[1] * lead_time_sec)
         target_z_goal = desired_now_goal_mm[2] + (velocity_base_mmps[2] * lead_time_sec)
 
-        q_base_goal = self._quat_normalize(
-            self._rpy_deg_to_quaternion(
-                float(snapshot.tcp_values.get('rx', 0.0)),
-                float(snapshot.tcp_values.get('ry', 0.0)),
-                float(snapshot.tcp_values.get('rz', 0.0)),
-            )
-        )
+        current_rx_deg = float(snapshot.tcp_values.get('rx', 0.0))
+        current_ry_deg = float(snapshot.tcp_values.get('ry', 0.0))
+        current_rz_deg = float(snapshot.tcp_values.get('rz', 0.0))
         ee_angle_deg = max(
             EE_FINAL_POSE_ANGLE_MIN_DEG,
             min(EE_FINAL_POSE_ANGLE_MAX_DEG, float(ee_final_pose_angle_deg)),
         )
         signed_ee_angle_deg = 0.0
-        ee_angle_direction_label = 'none'
+        ee_angle_direction_label = 'tray_y_axis'
         if ee_angle_deg < -1e-6:
             signed_ee_angle_deg = ee_angle_deg
-            ee_angle_direction_label = 'ccw_manual'
+            ee_angle_direction_label = 'tray_y_axis_ccw_manual'
         elif ee_angle_deg > 1e-6:
             signed_ee_angle_deg = ee_angle_deg
-            ee_angle_direction_label = 'cw_manual'
-        if abs(signed_ee_angle_deg) > 1e-6:
-            # GUI convention is negative=CCW and positive=CW. Positive local Rz
-            # is CCW in quaternion math, so invert the operator command here.
-            q_angle_local = self._rpy_deg_to_quaternion(0.0, 0.0, -signed_ee_angle_deg)
-            q_base_goal = self._quat_normalize(
-                self._quat_multiply(q_base_goal, q_angle_local)
-            )
-        goal_rx_deg, goal_ry_deg, goal_rz_deg = self._quaternion_to_rpy_deg(q_base_goal)
+            ee_angle_direction_label = 'tray_y_axis_cw_manual'
+
+        tray_axis_yaw_deg = math.degrees(
+            math.atan2(tray_local_y_in_base[1], tray_local_y_in_base[0])
+        )
+        aligned_rz_deg = self._closest_parallel_yaw_deg(tray_axis_yaw_deg, current_rz_deg)
+        goal_rx_deg = current_rx_deg
+        goal_ry_deg = current_ry_deg
+        # GUI convention is negative=CCW and positive=CW. Positive base yaw
+        # is CCW, so subtract the operator's signed offset.
+        goal_rz_deg = aligned_rz_deg - signed_ee_angle_deg
 
         return PredictedGoal(
             x_mm=target_x_goal,
@@ -1160,8 +1262,26 @@ class RelMovLMiniNode(Node):
     ) -> str:
         return f'{{{int(mode)},{int(distance)},{int(index)},{int(status)}}}'
 
-    def _build_release_follow_mdis(self) -> list[str]:
-        return [
+    def _release_exhaust_off_distance_percent(
+        self,
+        follow_translation_mm: float,
+        follow_speed_mm_s: float,
+    ) -> int:
+        travel_mm = max(0.0, float(follow_translation_mm))
+        speed_mm_s = max(1.0, float(follow_speed_mm_s))
+        follow_duration_sec = travel_mm / speed_mm_s
+        if follow_duration_sec <= 1e-6:
+            return MOVLIO_RELEASE_START_DISTANCE_PERCENT + 1
+
+        pulse_percent = math.ceil((TRAY_RELEASE_EXHAUST_PULSE_SEC / follow_duration_sec) * 100.0)
+        off_distance_percent = MOVLIO_RELEASE_START_DISTANCE_PERCENT + int(pulse_percent)
+        return max(
+            MOVLIO_RELEASE_START_DISTANCE_PERCENT + 1,
+            min(99, off_distance_percent),
+        )
+
+    def _build_release_follow_mdis(self, exhaust_off_distance_percent: int | None = None) -> list[str]:
+        tokens = [
             self._build_movelio_do_token(
                 MOVLIO_RELEASE_MODE_PERCENT,
                 MOVLIO_RELEASE_START_DISTANCE_PERCENT,
@@ -1177,10 +1297,30 @@ class RelMovLMiniNode(Node):
             self._build_movelio_do_token(
                 MOVLIO_RELEASE_MODE_PERCENT,
                 MOVLIO_RELEASE_START_DISTANCE_PERCENT,
+                GRIPPER_DO_EXHAUST_INDEX,
+                1,
+            ),
+            self._build_movelio_do_token(
+                MOVLIO_RELEASE_MODE_PERCENT,
+                MOVLIO_RELEASE_START_DISTANCE_PERCENT,
                 GRIPPER_DO_OPEN_INDEX,
                 1,
             ),
         ]
+        if exhaust_off_distance_percent is not None:
+            off_distance = max(
+                MOVLIO_RELEASE_START_DISTANCE_PERCENT + 1,
+                min(99, int(exhaust_off_distance_percent)),
+            )
+            tokens.append(
+                self._build_movelio_do_token(
+                    MOVLIO_RELEASE_MODE_PERCENT,
+                    off_distance,
+                    GRIPPER_DO_EXHAUST_INDEX,
+                    0,
+                )
+            )
+        return tokens
 
     def _build_release_post_follow_mdis(self) -> list[str]:
         return [
@@ -1200,6 +1340,12 @@ class RelMovLMiniNode(Node):
                 MOVLIO_RELEASE_MODE_PERCENT,
                 MOVLIO_RELEASE_START_DISTANCE_PERCENT,
                 GRIPPER_DO_SUCTION_INDEX,
+                0,
+            ),
+            self._build_movelio_do_token(
+                MOVLIO_RELEASE_MODE_PERCENT,
+                MOVLIO_RELEASE_START_DISTANCE_PERCENT,
+                GRIPPER_DO_EXHAUST_INDEX,
                 0,
             ),
         ]
@@ -1309,10 +1455,23 @@ class RelMovLMiniNode(Node):
             return False
         if not self._send_do(GRIPPER_DO_SUCTION_INDEX, 0):
             return False
+        if not self._send_do(GRIPPER_DO_EXHAUST_INDEX, 1):
+            return False
         if not self._send_do(GRIPPER_DO_OPEN_INDEX, 1):
             return False
+        pulse_sec = min(TRAY_RELEASE_EXHAUST_PULSE_SEC, TRAY_RELEASE_OPEN_SETTLE_SEC)
+        if not self._wait_settling_time(
+            pulse_sec,
+            'Static tray release exhaust pulse',
+        ):
+            return False
+        if not self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0):
+            return False
+        remaining_settle_sec = max(0.0, TRAY_RELEASE_OPEN_SETTLE_SEC - pulse_sec)
+        if remaining_settle_sec <= 1e-6:
+            return True
         return self._wait_settling_time(
-            TRAY_RELEASE_OPEN_SETTLE_SEC,
+            remaining_settle_sec,
             'Static tray release gripper open',
         )
 
@@ -1324,7 +1483,9 @@ class RelMovLMiniNode(Node):
             return False
         if not self._send_do(GRIPPER_DO_OPEN_INDEX, 0):
             return False
-        return self._send_do(GRIPPER_DO_SUCTION_INDEX, 0)
+        if not self._send_do(GRIPPER_DO_SUCTION_INDEX, 0):
+            return False
+        return self._send_do(GRIPPER_DO_EXHAUST_INDEX, 0)
 
     def _wait_for_tcp_xyz_goal(
         self,
@@ -1623,7 +1784,13 @@ class RelMovLMiniNode(Node):
             )
             zup_without_motion = zup_translation_mm <= TRAY_RELEASE_NO_MOTION_TOLERANCE_MM
 
-            follow_mdis = self._build_release_follow_mdis() if release_grip_enabled else None
+            follow_mdis = None
+            if release_grip_enabled:
+                exhaust_off_distance_percent = self._release_exhaust_off_distance_percent(
+                    follow_translation_mm,
+                    follow_speed_mm_s,
+                )
+                follow_mdis = self._build_release_follow_mdis(exhaust_off_distance_percent)
             if release_without_follow_motion:
                 self._set_action_text(
                     'Static tray release: waiting for intercept pose before opening gripper...'
@@ -2242,6 +2409,7 @@ class RelMovLMiniNode(Node):
                 f'wait={watch_timeout_sec:.0f}s '
                 f'fixed_speed={self._post_stop_movel_speed_mm_s:.0f} mm/s '
                 f'ee_angle={self._ee_final_pose_angle_deg:.0f} deg '
+                'align_ee_to_tray_y=always '
                 f'offsets(x={self._post_stop_x_offset_mm:.0f},'
                 f'y={self._post_stop_y_offset_mm:.0f},'
                 f'z={self._post_stop_z_offset_mm:.0f}) mm '
@@ -2708,7 +2876,7 @@ class RelMovLMiniGui:
             text=f'EE intercept speed fixed: {FIXED_EE_INTERCEPT_SPEED_MM_S:.0f} mm/s',
         ).grid(row=0, column=0, sticky='w')
 
-        tk.Label(settings_frame, text='EE final pose angle (deg, -CCW / +CW)').grid(row=1, column=0, sticky='w', pady=(10, 0))
+        tk.Label(settings_frame, text='EE tray-Y angle offset (deg, -CCW / +CW)').grid(row=1, column=0, sticky='w', pady=(10, 0))
         self.ee_final_pose_angle_var = tk.DoubleVar(value=EE_FINAL_POSE_ANGLE_DEFAULT_DEG)
         self.ee_final_pose_angle_scale = tk.Scale(
             settings_frame,

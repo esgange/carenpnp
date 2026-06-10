@@ -42,6 +42,9 @@ ros2 launch item_perception item_detect.launch.py
 `/bin_camera`.
 Pass `color_topic`, `depth_topic`, `camera_info_topic`, and
 `camera_control_service_root` when using a different camera namespace.
+When DOBOT bringup is running, `item_teach` snapshots the current teach joints
+from `/dobot_bringup_ros2/srv/GetAngle` through the `motion_service_root`
+parameter and saves them as `teach_joints_deg`.
 
 Teach a bin frame from ArUco markers:
 
@@ -49,16 +52,21 @@ Teach a bin frame from ArUco markers:
 ros2 launch item_perception bin_teach.launch.py
 ```
 
+When DOBOT bringup is running, `bin_teach` caches the current robot joints from
+`/dobot_bringup_ros2/srv/GetAngle` through `motion_service_root` and records
+`arm_joints_at_save` in saved bin profiles. `item_teach` recalls those joints
+with `MovJ` when loading a bin-teach profile.
+
 By default, `bin_teach` now auto-loads the current platform calibration from:
 
 ```text
-WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>.yaml
+WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>_<ddmmyyyy>_<robot_ip>.yaml
 ```
 
 Create or update that file first with:
 
 ```bash
-ros2 launch camera_calibration platform_teach.launch.py
+ros2 launch platform_calibration platform_calibration.launch.py
 ```
 
 Set `use_platform_calibration:=false` only when you intentionally want a
@@ -84,6 +92,20 @@ folder.
 Use `headless:=true` for production/service mode; it keeps topics and services
 active without creating the OpenCV operator window.
 
+## Item Detect Seek Services
+
+| Service | Purpose |
+| --- | --- |
+| `item_detect/seek` | Manual toggle that starts or cancels Seek. |
+| `item_detect/repick` | Reacquires and publishes a new item pose while keeping Seek ON. Valid only after a pose is latched. |
+| `item_detect/seek_complete` | Releases the latched seek after Item Pick has accepted final Z-up. |
+| `item_detect/seek_status` | Reports ON while actively acquiring or waiting for Item Pick. |
+
+After publishing a pose, Item Detect latches Seek ON. A repick request clears
+the old evidence and returns directly to acquisition without exposing an OFF
+transition. If an acquisition window ends without a valid item pose, Item Detect
+starts another window and also keeps Seek ON.
+
 ## Calibration
 
 Both nodes default to the current eye-on-hand calibration workflow.
@@ -92,7 +114,7 @@ Both nodes default to the current eye-on-hand calibration workflow.
   `calibration_file` is provided.
 - `item_teach` and `item_detect` publish the static calibration transform in-node
   when calibration is enabled.
-- Item poses are parented to `calibrated_camera_link`.
+- Item poses are parented to `arm_calibrated_camera_link`.
 - If no usable calibration YAML is available and calibration is enabled, launch
   fails early with a clear error.
 
@@ -145,6 +167,12 @@ RGB mask AND ROI
 The normalized depth plane is a reference surface for measuring the depth window;
 it no longer clamps the scan to only pixels above the plane.
 
+Item size is saved from the same visible pose rectangle shown in the teach
+overlay. `item_teach` projects the rectangle corners onto the loaded bin/depth
+plane and records the averaged opposite-edge dimensions as millimeter metadata.
+Runtime `item_detect` still uses live measured depth for item pose Z/XYZ; the
+saved item size does not replace runtime depth in the current detect path.
+
 ## Profile Files
 
 Item profiles are saved in:
@@ -181,7 +209,7 @@ bin_<name>_<ddmmyyyy>.yaml
 ```
 
 With platform calibration enabled, each bin-teach YAML saves the bin transform in
-the loaded platform frame, for example `platform_teach -> bin_blue_bin_frame`,
+the loaded platform frame, for example `platform_reference -> bin_blue_bin_frame`,
 and records the platform calibration file under `platform_reference`. The saved
 `roi_points` are still the four image-space corner dots used by `item_teach`.
 Each file also saves the bin reference depth plane as `depth_plane_*` fields
@@ -201,6 +229,11 @@ Runtime state files:
 | `item_teach_runtime.yaml` | `item_teach` | Stores teach UI/runtime preferences. |
 | `item_detect_runtime_settings.yaml` | `item_detect` | Stores detect UI/runtime preferences such as view mode, overlay, tolerance, and seek timing. |
 | `item_detect_selected_profile.txt` | `item_detect` | Exports the current selected profile path for other nodes. Teach selection is provided at launch with `selected_profile_path:=...`. |
+
+`item_detect` also publishes the selected YAML path on the transient-local
+`item_detect/selected_profile` (`std_msgs/msg/String`) topic at startup and
+whenever the loaded teach changes. `item_pick` uses this live notification to
+load the matching embedded EE and tool settings automatically.
 
 Use `Open Teach` in `item_detect` to browse for a teach YAML file. Deleting a
 profile from `item_detect` removes the selected dated YAML file from disk.
@@ -228,6 +261,11 @@ with debug images on unattended runs.
   - `depth_plane_roi`
 - Z-axis alignment policy:
   - `align_item_z_axis_to_depth_plane`
+- Plane-projected item footprint metadata:
+  - `item_length_mm`
+  - `item_width_mm`
+  - `item_dimensions_mm`
+  - `taught_item_dimension_source`
 - Pose template data for single or pair references.
 - Optional embedded `tool_teach` data used by `item_pick`. `item_teach`
   preserves this block when re-saving an existing profile.

@@ -42,8 +42,14 @@ OPTIONAL_NODE_PARAMETER_OVERRIDES = {
         'item_standoff_z_mm': ('item_pick.parameters.item_standoff_z_mm', 'item_standoff_z_mm'),
         'item_approach_z_up_mm': ('item_pick.parameters.approach_z_up_mm', 'approach_z_up_mm'),
         'item_final_z_up_mm': ('item_pick.parameters.final_z_up_mm', 'final_z_up_mm'),
-        'pre_pick_settling_time_sec': ('item_pick.parameters.pre_pick_settling_time_sec', 'pre_pick_settling_time_sec'),
-        'pick_settling_time_sec': ('item_pick.parameters.pick_settling_time_sec', 'pick_settling_time_sec'),
+        'item_repick_start_stability_sec': (
+            'item_pick.parameters.repick_start_stability_sec',
+            'repick_start_stability_sec',
+        ),
+        'item_auto_repick_on_failed_suction': (
+            'item_pick.parameters.auto_repick_on_failed_suction',
+            'auto_repick_on_failed_suction',
+        ),
         'item_command_hysteresis_sec': ('item_pick.parameters.command_hysteresis_sec', 'command_hysteresis_sec'),
     },
     'tray_intercept': {
@@ -93,6 +99,30 @@ def _repo_path(*parts: str) -> str:
 
 def _package_launch(package: str, launch_file: str) -> str:
     return str(Path(get_package_share_directory(package)) / 'launch' / launch_file)
+
+
+def _ros_domain_action():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / 'src' / 'dobot_bringup_v4' / 'launch' / 'ros_domain.py',
+            parent / 'install' / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'cr_robot_ros2' / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+            parent / 'share' / 'cr_robot_ros2' / 'launch' / 'ros_domain.py',
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location('_dobot_ros_domain', helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.ros_domain_action()
+
+    raise RuntimeError('Could not find ros_domain.py helper for ROS discovery settings')
 
 
 def _include(package: str, launch_file: str, launch_arguments: dict[str, str]):
@@ -517,6 +547,41 @@ def _launch_setup(context, *args, **kwargs):
                 'bin_item_pose_array_topic',
                 'item_detect.pose_array_topic',
             ),
+            'seek_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_seek_service',
+                'item_detect.seek_service',
+            ),
+            'repick_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_repick_service',
+                'item_detect.repick_service',
+            ),
+            'seek_complete_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_seek_complete_service',
+                'item_detect.seek_complete_service',
+            ),
+            'seek_status_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_seek_status_service',
+                'item_detect.seek_status_service',
+            ),
+            'go_to_teach_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_go_to_teach_service',
+                'item_detect.go_to_teach_service',
+            ),
             'start_visualization': start_visualization,
             'headless': 'true',
             **item_camera_args,
@@ -557,6 +622,13 @@ def _launch_setup(context, *args, **kwargs):
                 'item_pick_track_status_service',
                 'item_pick.track_status_service',
             ),
+            'auto_repick_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_pick_auto_repick_service',
+                'item_pick.auto_repick_service',
+            ),
             'item_seek_complete_service': _setting(
                 context,
                 settings,
@@ -564,9 +636,18 @@ def _launch_setup(context, *args, **kwargs):
                 'item_seek_complete_service',
                 'item_detect.seek_complete_service',
             ),
+            'item_repick_service': _setting(
+                context,
+                settings,
+                workspace_root,
+                'item_repick_service',
+                'item_pick.item_repick_service',
+            ),
             'robot_goal_frame_id': _setting(context, settings, workspace_root, 'robot_goal_frame_id', 'common.robot_goal_frame_id'),
             'robot_gripper_frame_id': _setting(context, settings, workspace_root, 'robot_gripper_frame_id', 'common.robot_gripper_frame_id'),
             'camera_safety_frame_id': item_calibration_args['child_frame'],
+            'tcp_pose_user': _optional_setting(context, settings, workspace_root, 'tcp_pose_user', 'common.tcp_pose_user') or '0',
+            'tcp_pose_tool': _optional_setting(context, settings, workspace_root, 'tcp_pose_tool', 'common.tcp_pose_tool') or '0',
         }
         for arg_name, (dotted_key, child_arg_name) in OPTIONAL_NODE_PARAMETER_OVERRIDES['item_pick'].items():
             _add_optional_passthrough(context, settings, item_pick_args, arg_name, dotted_key, child_arg_name)
@@ -659,6 +740,8 @@ def _launch_setup(context, *args, **kwargs):
                 'tray_detect.seek_complete_service',
             ),
             'robot_goal_frame_id': _setting(context, settings, workspace_root, 'robot_goal_frame_id', 'common.robot_goal_frame_id'),
+            'tcp_pose_user': _optional_setting(context, settings, workspace_root, 'tcp_pose_user', 'common.tcp_pose_user') or '0',
+            'tcp_pose_tool': _optional_setting(context, settings, workspace_root, 'tcp_pose_tool', 'common.tcp_pose_tool') or '0',
         }
         for arg_name, (dotted_key, child_arg_name) in OPTIONAL_NODE_PARAMETER_OVERRIDES['tray_intercept'].items():
             _add_optional_passthrough(context, settings, tray_intercept_args, arg_name, dotted_key, child_arg_name)
@@ -714,6 +797,8 @@ def generate_launch_description():
                 'robot_goal_frame_id',
                 'robot_gripper_frame_id',
                 'motion_service_root',
+                'tcp_pose_user',
+                'tcp_pose_tool',
                 'gripper_do_service',
                 'item_detect_params_file',
                 'item_selected_profile_path',
@@ -731,7 +816,11 @@ def generate_launch_description():
                 'item_camera_frame',
                 'item_pose_topic',
                 'bin_item_pose_array_topic',
+                'item_seek_service',
+                'item_repick_service',
                 'item_seek_complete_service',
+                'item_seek_status_service',
+                'item_go_to_teach_service',
                 'item_pick_runtime_settings_file',
                 'item_pick_start_sequence_service',
                 'item_pick_track_service',
@@ -744,8 +833,7 @@ def generate_launch_description():
                 'item_standoff_z_mm',
                 'item_approach_z_up_mm',
                 'item_final_z_up_mm',
-                'pre_pick_settling_time_sec',
-                'pick_settling_time_sec',
+                'item_repick_start_stability_sec',
                 'item_command_hysteresis_sec',
                 'tray_detect_params_file',
                 'tray_selected_profile_path',
@@ -778,5 +866,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         *args,
+        _ros_domain_action(),
         OpaqueFunction(function=_launch_setup),
     ])

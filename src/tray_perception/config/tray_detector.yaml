@@ -3,7 +3,6 @@ tray_teach:
     color_topic: /robot_camera/color/image_raw
     depth_topic: /robot_camera/depth/image_raw
     camera_info_topic: /robot_camera/color/camera_info
-    joint_states_topic: /joint_states_robot
     overlay_topic: tray_overlay
     publish_overlay: true
     camera_control_service_root: /robot_camera
@@ -15,5 +14,6 @@ tray_teach:
     color_exposure_max_us: 100
     depth_exposure_min_us: 1
     depth_exposure_max_us: 32000
+    motion_service_root: /dobot_bringup_ros2/srv
     display_scale: 1.0
     trace_out_to_in: false

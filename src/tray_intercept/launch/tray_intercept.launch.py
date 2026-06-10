@@ -44,6 +44,11 @@ FLOAT_PARAMS = (
     'preview_tray_width_mm',
 )
 
+INT_PARAMS = (
+    'tcp_pose_user',
+    'tcp_pose_tool',
+)
+
 
 def _tray_intercept_pythonpath() -> str:
     paths = []
@@ -107,6 +112,13 @@ def _float_arg(value: str, name: str) -> float:
         raise RuntimeError(f'{name} must be a number, got {value!r}') from exc
 
 
+def _int_arg(value: str, name: str) -> int:
+    try:
+        return int(float(value))
+    except ValueError as exc:
+        raise RuntimeError(f'{name} must be an integer, got {value!r}') from exc
+
+
 def _launch_setup(context, *args, **kwargs):
     del args, kwargs
     params = {}
@@ -122,6 +134,10 @@ def _launch_setup(context, *args, **kwargs):
         value = _arg(context, name)
         if value:
             params[name] = _float_arg(value, name)
+    for name in INT_PARAMS:
+        value = _arg(context, name)
+        if value:
+            params[name] = _int_arg(value, name)
 
     return [
         Node(
@@ -143,5 +159,6 @@ def generate_launch_description():
         *[DeclareLaunchArgument(name, default_value='') for name in STRING_PARAMS],
         *[DeclareLaunchArgument(name, default_value='') for name in BOOL_PARAMS],
         *[DeclareLaunchArgument(name, default_value='') for name in FLOAT_PARAMS],
+        *[DeclareLaunchArgument(name, default_value='') for name in INT_PARAMS],
         OpaqueFunction(function=_launch_setup),
     ])

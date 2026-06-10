@@ -18,7 +18,8 @@ Readiness gate:
 3. Verify `/item_pick/track_status` reports armed
 4. Monitor robot TCP feedback until it is stable
 5. `/item_detect/seek`
-6. Wait for `/item_detect/seek_status` to turn on, then off
+6. Wait for `/item_detect/seek_status` to turn on, remain on through any
+   `item_detect/repick` attempts, then turn off only after successful final Z-up
 7. `/tray_detect/go_to_teach`
 8. `/tray_intercept/start_sequence` with the orchestrator tray X/Y/RZ settings
 9. Verify `/tray_intercept/track_status` reports armed
@@ -33,17 +34,22 @@ data returned by seek services and no longer uses pose topics, fixed seek
 timeouts, fixed robot-stop waits, or a required motion-detected gate. It waits
 for each detect node's Seek status to turn on after the seek command, then turn
 off again, so an old OFF state cannot be mistaken for completion. The detect
-node's own configurable seek window controls the maximum seek time. It only watches
-`/dobot_msgs_v4/msg/ToolVectorActual`, the same TCP feedback topic used by
-`item_pick` and `tray_intercept`. After each arm/start call, the GUI verifies
-the corresponding armed-status service before waiting for TCP stability and
+node's configurable seek window controls each acquisition window; if no valid
+item is found, Item Detect starts another window while keeping Seek ON. The
+orchestrator caches robot joint angles from `/dobot_bringup_ros2/srv/GetAngle`
+through `motion_service_root`. After each arm/start call, the GUI verifies the
+corresponding armed-status service before waiting for joint stability and
 sending seek.
 
-The robot is treated as stable when TCP feedback stays within 1 mm linear and
-1 degree rotational for the selected stability time. The stability timer is
-based on live feedback time, not a fixed number of frames. A 30 second internal
-watchdog prevents robot monitoring from hanging forever and logs the last
-observed TCP delta when it cannot classify stability.
+Item Pick owns failed-suction repicks. The orchestrator does not restart the
+pick side between attempts; its existing Seek ON-to-OFF wait acts as the
+success gate and prevents placement after a failed pickup.
+
+The robot is treated as stable when all joints stay within 1 degree for the
+selected stability time. The stability timer is based on cached `GetAngle`
+update time, not a fixed number of frames. A 30 second internal watchdog
+prevents robot monitoring from hanging forever and logs the last observed joint
+delta when it cannot classify stability.
 
 ## Launch
 
@@ -109,7 +115,9 @@ ros2 run robot_cell_orchestrator robot_cell_orchestrator_gui
 ```
 
 `robot_cell_orchestrator_gui` arms `item_pick` and `tray_intercept`, then coordinates the
-shared `item_detect` and `tray_detect` seek services.
+shared `item_detect` and `tray_detect` seek services. Its joint stability monitor
+uses `/dobot_bringup_ros2/srv/GetAngle` by default; override
+`motion_service_root` if the DOBOT services are rooted somewhere else.
 
 Robot Cell Orchestrator GUI runtime knobs and window size are saved in:
 
@@ -117,9 +125,21 @@ Robot Cell Orchestrator GUI runtime knobs and window size are saved in:
 WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml
 ```
 
-This file stores Step Mode, tray seek stability, tray placement X/Y/RZ offsets,
-and the Robot Cell Orchestrator window geometry. The loop and Auto Repick
-checkboxes are session-only; Auto Repick is currently UI-only.
+This file stores Step Mode, Auto Repick, tray seek stability, tray placement
+X/Y/RZ offsets, and the Robot Cell Orchestrator window geometry. The Auto Repick
+checkbox calls `item_pick/set_auto_repick` and is applied again at the start of
+each pick side.
+
+The right-side **Robot Connection** panel shows `ROBOT_IP_ADDRESS` from the root
+`station_config`. Edit the IP and press **Save** to update that file. Robot
+Bringup reads `station_config` when it launches, so stop and relaunch Robot
+Bringup after changing the IP. For direct LAN2 debug, the controller IP is
+normally `192.168.200.1`; set the PC wired adapter to the same `/24` subnet.
+
+The right-side **Camera Views** section opens the bin/tray detect overlays in a
+separate **Camera Detect Views** window. Press **Open Camera Window** to create
+the viewer; pressing it again brings the existing viewer to the front. Close the
+camera viewer from that window when it is no longer needed.
 
 Switching the Robot Cell Orchestrator GUI between **Offline** and **Online**
 only changes the orchestration mode. It does not launch or stop robot,
@@ -186,13 +206,24 @@ YAML with root key `tool_teach_version` is still accepted for older profiles.
 
 Unknown YAML files block online readiness. Non-YAML files are ignored.
 
-Cycle start is blocked until all three calibration classes are present:
+Cycle start is blocked until the operator selects one file for each calibration
+class in the `Calibration Files` panel:
 
 ```text
-WORKSPACE_ROOT/calibration/axab_calibration_eyeonhand_*.yaml
-WORKSPACE_ROOT/calibration/axab_calibration_eyetohand_*.yaml
-WORKSPACE_ROOT/calibration/platform_calibration_*.yaml
+Eye-on-hand
+Eye-to-hand
+Platform
 ```
+
+The selections are persisted in
+`config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml`.
+The orchestrator passes the selected paths explicitly to calibration consumers;
+it does not choose the newest or legacy calibration automatically.
+Each calibration picker filters the file dialog to the matching filename class:
+`axab_calibration_eyeonhand_*.yaml` for Eye-on-hand,
+`axab_calibration_eyetohand_*.yaml` for Eye-to-hand, and
+`platform_calibration_*.yaml` for Platform. After selection, the YAML metadata is
+still checked so a wrongly named file is rejected.
 
 The external online start API is:
 

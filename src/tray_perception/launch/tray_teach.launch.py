@@ -72,6 +72,7 @@ def generate_launch_description():
     depth_exposure_min_us = ParameterValue(LaunchConfiguration("depth_exposure_min_us"), value_type=int)
     depth_exposure_max_us = ParameterValue(LaunchConfiguration("depth_exposure_max_us"), value_type=int)
     profiles_dir = LaunchConfiguration("profiles_dir")
+    motion_service_root = LaunchConfiguration("motion_service_root")
 
     return LaunchDescription([
         _ros_domain_action(),
@@ -119,6 +120,10 @@ def generate_launch_description():
             "profiles_dir",
             default_value=_repo_path("teach", "tray_teach"),
         ),
+        DeclareLaunchArgument(
+            "motion_service_root",
+            default_value="/dobot_bringup_ros2/srv",
+        ),
         Node(
             package="tray_perception",
             executable="tray_teach_node",
@@ -136,6 +141,7 @@ def generate_launch_description():
                     "depth_exposure_min_us": depth_exposure_min_us,
                     "depth_exposure_max_us": depth_exposure_max_us,
                     "profiles_dir": profiles_dir,
+                    "motion_service_root": motion_service_root,
                 },
             ],
         ),

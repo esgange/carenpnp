@@ -10,13 +10,17 @@ from launch_ros.actions import Node
 STRING_PARAMS = (
     'runtime_settings_file',
     'item_profile_state_file',
+    'selected_profile_topic',
     'motion_service_root',
     'gripper_do_service',
+    'di_status_topic',
     'item_pose_topic',
     'start_sequence_service',
     'track_service',
     'track_status_service',
     'item_seek_complete_service',
+    'item_repick_service',
+    'auto_repick_service',
     'robot_goal_frame_id',
     'robot_gripper_frame_id',
     'camera_safety_frame_id',
@@ -28,6 +32,7 @@ BOOL_PARAMS = (
     'tf_only_mode',
     'publish_goal_debug_tf',
     'prefer_camera_inside_bin',
+    'auto_repick_on_failed_suction',
 )
 
 FLOAT_PARAMS = (
@@ -38,8 +43,7 @@ FLOAT_PARAMS = (
     'item_standoff_z_mm',
     'approach_z_up_mm',
     'final_z_up_mm',
-    'pre_pick_settling_time_sec',
-    'pick_settling_time_sec',
+    'pick_motion_speed_percent',
     'command_hysteresis_sec',
     'tool_offset_x_mm',
     'tool_offset_y_mm',
@@ -48,6 +52,12 @@ FLOAT_PARAMS = (
     'tool_offset_ry_deg',
     'tool_offset_rz_deg',
     'camera_bin_safe_margin_mm',
+    'repick_start_stability_sec',
+)
+
+INT_PARAMS = (
+    'tcp_pose_user',
+    'tcp_pose_tool',
 )
 
 
@@ -113,6 +123,13 @@ def _float_arg(value: str, name: str) -> float:
         raise RuntimeError(f'{name} must be a number, got {value!r}') from exc
 
 
+def _int_arg(value: str, name: str) -> int:
+    try:
+        return int(float(value))
+    except ValueError as exc:
+        raise RuntimeError(f'{name} must be an integer, got {value!r}') from exc
+
+
 def _launch_setup(context, *args, **kwargs):
     del args, kwargs
     params = {}
@@ -128,6 +145,10 @@ def _launch_setup(context, *args, **kwargs):
         value = _arg(context, name)
         if value:
             params[name] = _float_arg(value, name)
+    for name in INT_PARAMS:
+        value = _arg(context, name)
+        if value:
+            params[name] = _int_arg(value, name)
 
     return [
         Node(
@@ -149,5 +170,6 @@ def generate_launch_description():
         *[DeclareLaunchArgument(name, default_value='') for name in STRING_PARAMS],
         *[DeclareLaunchArgument(name, default_value='') for name in BOOL_PARAMS],
         *[DeclareLaunchArgument(name, default_value='') for name in FLOAT_PARAMS],
+        *[DeclareLaunchArgument(name, default_value='') for name in INT_PARAMS],
         OpaqueFunction(function=_launch_setup),
     ])

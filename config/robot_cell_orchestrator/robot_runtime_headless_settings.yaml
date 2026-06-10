@@ -35,11 +35,13 @@ common:
   calibration_dir: calibration
   calibration_file: ""
   calibration_parent_frame: Link6
-  calibration_child_frame: calibrated_camera_link
+  calibration_child_frame: arm_calibrated_camera_link
   camera_frame: ""
   robot_goal_frame_id: base_link
   robot_gripper_frame_id: Link6
   motion_service_root: /dobot_bringup_ros2/srv
+  tcp_pose_user: 0
+  tcp_pose_tool: 0
   gripper_do_service: ""
 
 item_detect:
@@ -52,23 +54,30 @@ item_detect:
   calibration_dir: calibration
   calibration_file: ""
   calibration_parent_frame: base_link
-  calibration_child_frame: bin_calibrated_link
+  calibration_child_frame: bin_calibrated_camera_link
   camera_frame: ""
   runtime_settings_file: config/item_perception/item_detect_runtime_settings.yaml
   selected_profile_export_file: config/item_perception/item_detect_selected_profile.txt
   pose_topic: bin_seek_pose
   pose_array_topic: bin_item_poses
+  seek_service: item_detect/seek
+  repick_service: item_detect/repick
   seek_complete_service: item_detect/seek_complete
+  seek_status_service: item_detect/seek_status
+  go_to_teach_service: item_detect/go_to_teach
 
 item_pick:
   runtime_settings_file: config/item_perception/item_pick_runtime_settings.json
   start_sequence_service: item_pick/start_sequence
   track_service: item_pick/track
   track_status_service: item_pick/track_status
-  parameters: {}
+  auto_repick_service: item_pick/set_auto_repick
+  item_repick_service: item_detect/repick
+  parameters:
+    auto_repick_on_failed_suction: true
 
 tray_detect:
-  params_file: config/tray_perception/tray_teach_settings.yaml
+  params_file: ""
   runtime_settings_file: config/tray_perception/tray_detect_runtime_settings.yaml
   pose_topic: tray_pose
   vector_topic: tray_vector

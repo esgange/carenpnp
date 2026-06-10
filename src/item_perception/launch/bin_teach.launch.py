@@ -104,8 +104,6 @@ def generate_launch_description():
     align_visible_max_age_sec = ParameterValue(LaunchConfiguration("align_visible_max_age_sec"), value_type=float)
     align_initial_timeout_sec = ParameterValue(LaunchConfiguration("align_initial_timeout_sec"), value_type=float)
     align_min_base_z_mm = ParameterValue(LaunchConfiguration("align_min_base_z_mm"), value_type=float)
-    align_goal_pos_tol_mm = ParameterValue(LaunchConfiguration("align_goal_pos_tol_mm"), value_type=float)
-    align_goal_rot_tol_deg = ParameterValue(LaunchConfiguration("align_goal_rot_tol_deg"), value_type=float)
     align_up_max_distance_mm = ParameterValue(LaunchConfiguration("align_up_max_distance_mm"), value_type=float)
     align_up_speed_factor_percent = ParameterValue(
         LaunchConfiguration("align_up_speed_factor_percent"),
@@ -172,8 +170,6 @@ def generate_launch_description():
             "align_visible_max_age_sec": align_visible_max_age_sec,
             "align_initial_timeout_sec": align_initial_timeout_sec,
             "align_min_base_z_mm": align_min_base_z_mm,
-            "align_goal_pos_tol_mm": align_goal_pos_tol_mm,
-            "align_goal_rot_tol_deg": align_goal_rot_tol_deg,
             "align_up_max_distance_mm": align_up_max_distance_mm,
             "align_up_speed_factor_percent": align_up_speed_factor_percent,
             "align_up_timeout_sec": align_up_timeout_sec,
@@ -189,15 +185,15 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_info_topic", default_value="/bin_camera/color/camera_info"),
         DeclareLaunchArgument("use_calibration", default_value="true"),
         DeclareLaunchArgument("calibration_parent_frame", default_value="base_link"),
-        DeclareLaunchArgument("calibration_child_frame", default_value="bin_calibrated_link"),
+        DeclareLaunchArgument("calibration_child_frame", default_value="bin_calibrated_camera_link"),
         DeclareLaunchArgument("calibration_dir", default_value=_repo_path("calibration")),
         DeclareLaunchArgument("calibration_file", default_value=""),
         DeclareLaunchArgument("calibration_file_prefix", default_value="axab_calibration_eyetohand_"),
         DeclareLaunchArgument("target_frame", default_value="bin_teach_target"),
-        DeclareLaunchArgument("marker_parent_frame", default_value="bin_calibrated_link"),
+        DeclareLaunchArgument("marker_parent_frame", default_value="bin_calibrated_camera_link"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("gripper_frame", default_value="Link6"),
-        DeclareLaunchArgument("camera_frame", default_value="bin_calibrated_link"),
+        DeclareLaunchArgument("camera_frame", default_value="bin_calibrated_camera_link"),
         DeclareLaunchArgument("use_platform_calibration", default_value="true"),
         DeclareLaunchArgument("auto_discover_platform_calibration", default_value="true"),
         DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("calibration")),
@@ -224,8 +220,6 @@ def generate_launch_description():
         DeclareLaunchArgument("align_visible_max_age_sec", default_value="0.75"),
         DeclareLaunchArgument("align_initial_timeout_sec", default_value="30.0"),
         DeclareLaunchArgument("align_min_base_z_mm", default_value="200.0"),
-        DeclareLaunchArgument("align_goal_pos_tol_mm", default_value="8.0"),
-        DeclareLaunchArgument("align_goal_rot_tol_deg", default_value="3.0"),
         DeclareLaunchArgument("align_up_max_distance_mm", default_value="400.0"),
         DeclareLaunchArgument("align_up_speed_factor_percent", default_value="5"),
         DeclareLaunchArgument("align_up_timeout_sec", default_value="60.0"),

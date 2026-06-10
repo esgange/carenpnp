@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <cv_bridge/cv_bridge.h>
+#include <dobot_msgs_v4/srv/get_angle.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
@@ -29,7 +31,6 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
@@ -40,7 +41,7 @@ namespace
 {
 using ImageMsg = sensor_msgs::msg::Image;
 using CameraInfoMsg = sensor_msgs::msg::CameraInfo;
-using JointStateMsg = sensor_msgs::msg::JointState;
+using GetAngleSrv = dobot_msgs_v4::srv::GetAngle;
 using MovJSrv = dobot_msgs_v4::srv::MovJ;
 using SetBoolSrv = std_srvs::srv::SetBool;
 using SetInt32Srv = orbbec_camera_msgs::srv::SetInt32;
@@ -106,6 +107,48 @@ constexpr int kTeachFixedVerticalRayCount = 50;
 constexpr int kTeachFixedOutlierSensitivity = 50;
 constexpr bool kTeachFixedDetectBlackToWhite = true;
 constexpr bool kTeachFixedTraceOutToIn = false;
+constexpr double kCentimetersToMillimeters = 10.0;
+constexpr double kSquareCentimetersToSquareMillimeters = 100.0;
+
+std::optional<std::array<double, 6>> parseSixDoublesFromRobotReturn(const std::string &text)
+{
+  if (text.empty())
+  {
+    return std::nullopt;
+  }
+
+  static const std::regex brace_pattern(R"(\{([^{}]+)\})");
+  static const std::regex number_pattern(R"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)");
+
+  const auto parse_segment = [&](const std::string &segment) -> std::optional<std::array<double, 6>>
+  {
+    std::array<double, 6> values {};
+    std::size_t count = 0;
+    for (std::sregex_iterator it(segment.begin(), segment.end(), number_pattern), end; it != end; ++it)
+    {
+      if (count >= values.size())
+      {
+        return std::nullopt;
+      }
+      values[count++] = std::stod(it->str());
+    }
+    if (count == values.size())
+    {
+      return values;
+    }
+    return std::nullopt;
+  };
+
+  for (std::sregex_iterator it(text.begin(), text.end(), brace_pattern), end; it != end; ++it)
+  {
+    if (auto parsed = parse_segment((*it)[1].str()); parsed.has_value())
+    {
+      return parsed;
+    }
+  }
+
+  return parse_segment(text);
+}
 
 bool isOpenCvWindowClosed(const std::string &window_name)
 {
@@ -993,6 +1036,22 @@ struct ItemMetricEstimate
   double mean_depth_m {0.0};
   // Ordered as: origin X edge, opposite X edge, origin Y edge, opposite Y edge.
   std::array<double, 4> edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
+};
+
+struct ItemDimensionSample
+{
+  double length_cm {0.0};
+  double width_cm {0.0};
+  double area_cm2 {0.0};
+  std::array<double, 4> edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
+};
+
+struct AverageItemDimensions
+{
+  int sample_count {0};
+  double length_cm {0.0};
+  double width_cm {0.0};
+  double area_cm2 {0.0};
 };
 
 struct ItemPose3D
@@ -3446,6 +3505,151 @@ std::optional<ItemMetricEstimate> estimateItemMetricsFromCorners(
   return metrics;
 }
 
+std::optional<ItemDimensionSample> estimateItemDimensionsFromCornerCameraPoints(
+  const std::vector<cv::Point2f> &corners,
+  const std::array<cv::Vec3d, 4> &camera_points)
+{
+  if (corners.size() != 4)
+  {
+    return std::nullopt;
+  }
+
+  const int origin_idx = lowerLeftCornerIndex(corners);
+  if (origin_idx < 0)
+  {
+    return std::nullopt;
+  }
+
+  const auto edge_length_cm = [&](int a, int b) -> double
+  {
+    return vectorNorm(
+      camera_points[static_cast<std::size_t>(a)] -
+      camera_points[static_cast<std::size_t>(b)]) * 100.0;
+  };
+
+  const int prev_idx = (origin_idx + 3) % 4;
+  const int next_idx = (origin_idx + 1) % 4;
+  const int opposite_idx = (origin_idx + 2) % 4;
+  const double origin_prev_len_cm = edge_length_cm(origin_idx, prev_idx);
+  const double next_opposite_len_cm = edge_length_cm(next_idx, opposite_idx);
+  const double origin_next_len_cm = edge_length_cm(origin_idx, next_idx);
+  const double prev_opposite_len_cm = edge_length_cm(prev_idx, opposite_idx);
+
+  std::array<double, 4> ordered_edges_cm;
+  if (origin_prev_len_cm >= origin_next_len_cm)
+  {
+    ordered_edges_cm = {
+      origin_prev_len_cm,
+      next_opposite_len_cm,
+      origin_next_len_cm,
+      prev_opposite_len_cm,
+    };
+  }
+  else
+  {
+    ordered_edges_cm = {
+      origin_next_len_cm,
+      prev_opposite_len_cm,
+      origin_prev_len_cm,
+      next_opposite_len_cm,
+    };
+  }
+
+  for (const double edge_cm : ordered_edges_cm)
+  {
+    if (!std::isfinite(edge_cm) || edge_cm <= 0.0)
+    {
+      return std::nullopt;
+    }
+  }
+
+  const double x_size_cm = 0.5 * (ordered_edges_cm[0] + ordered_edges_cm[1]);
+  const double y_size_cm = 0.5 * (ordered_edges_cm[2] + ordered_edges_cm[3]);
+  const double area_m2 =
+    triangleArea3D(camera_points[0], camera_points[1], camera_points[2]) +
+    triangleArea3D(camera_points[0], camera_points[2], camera_points[3]);
+  const double area_cm2 = area_m2 > 0.0 ? area_m2 * 10000.0 : x_size_cm * y_size_cm;
+  if (!std::isfinite(x_size_cm) || !std::isfinite(y_size_cm) ||
+      !std::isfinite(area_cm2) || x_size_cm <= 0.0 || y_size_cm <= 0.0 || area_cm2 <= 0.0)
+  {
+    return std::nullopt;
+  }
+
+  ItemDimensionSample sample;
+  sample.length_cm = std::max(x_size_cm, y_size_cm);
+  sample.width_cm = std::min(x_size_cm, y_size_cm);
+  sample.area_cm2 = area_cm2;
+  sample.edge_lengths_cm = ordered_edges_cm;
+  return sample;
+}
+
+std::optional<ItemDimensionSample> estimateBlobItemDimensions(
+  const BinarizedPoseEstimate2D::BlobPose2D &blob_pose,
+  const cv::Mat &depth_m,
+  const CameraInfoMsg &camera_info)
+{
+  if (blob_pose.corners.size() != 4 || depth_m.empty())
+  {
+    return std::nullopt;
+  }
+
+  cv::Mat blob_depth_mask;
+  if (!blob_pose.pixels.empty())
+  {
+    blob_depth_mask = buildPixelMask(depth_m.size(), blob_pose.pixels);
+  }
+  const cv::Mat *mask_ptr = blob_depth_mask.empty() ? nullptr : &blob_depth_mask;
+  const std::optional<double> fallback_blob_depth = averageDepthFromPixels(depth_m, blob_pose.pixels);
+  const auto camera_points = estimateItemCornerCameraPoints(
+    blob_pose.corners,
+    depth_m,
+    camera_info,
+    mask_ptr,
+    fallback_blob_depth);
+  if (!camera_points.has_value())
+  {
+    return std::nullopt;
+  }
+
+  return estimateItemDimensionsFromCornerCameraPoints(blob_pose.corners, *camera_points);
+}
+
+std::optional<AverageItemDimensions> averageItemDimensionsFromPoseEstimate(
+  const std::optional<BinarizedPoseEstimate2D> &pose_estimate,
+  const cv::Mat &depth_m,
+  const CameraInfoMsg &camera_info)
+{
+  if (!pose_estimate.has_value() || pose_estimate->blob_poses.empty() || depth_m.empty())
+  {
+    return std::nullopt;
+  }
+
+  AverageItemDimensions average;
+  for (const auto &blob_pose : pose_estimate->blob_poses)
+  {
+    const auto sample = estimateBlobItemDimensions(blob_pose, depth_m, camera_info);
+    if (!sample.has_value())
+    {
+      continue;
+    }
+    average.length_cm += sample->length_cm;
+    average.width_cm += sample->width_cm;
+    average.area_cm2 += sample->area_cm2;
+    ++average.sample_count;
+  }
+
+  if (average.sample_count <= 0)
+  {
+    return std::nullopt;
+  }
+
+  const double count = static_cast<double>(average.sample_count);
+  average.length_cm /= count;
+  average.width_cm /= count;
+  average.area_cm2 /= count;
+  return average;
+}
+
 std::optional<ItemEstimate> buildItemEstimateFromIsolatedSideSamples(
   const std::vector<cv::Point2f> &edge_points,
   const std::vector<cv::Point2f> &left_samples,
@@ -3875,6 +4079,96 @@ std::optional<double> depthPlaneDepthAtPixel(
     return std::nullopt;
   }
   return plane_depth_m;
+}
+
+std::optional<std::array<cv::Vec3d, 4>> estimateItemCornerCameraPointsFromDepthPlane(
+  const std::vector<cv::Point2f> &corners,
+  const DepthPlaneModel &plane,
+  const cv::Size &image_size,
+  const CameraInfoMsg &camera_info)
+{
+  if (corners.size() != 4 || camera_info.k[0] <= 1e-6 || camera_info.k[4] <= 1e-6)
+  {
+    return std::nullopt;
+  }
+
+  std::array<cv::Vec3d, 4> camera_points;
+  for (std::size_t i = 0; i < corners.size(); ++i)
+  {
+    const auto depth = depthPlaneDepthAtPixel(plane, corners[i], image_size);
+    if (!depth.has_value())
+    {
+      return std::nullopt;
+    }
+    camera_points[i] = projectPixelToCamera(corners[i], *depth, camera_info);
+  }
+  return camera_points;
+}
+
+std::optional<ItemDimensionSample> estimateBlobItemDimensionsFromDepthPlane(
+  const BinarizedPoseEstimate2D::BlobPose2D &blob_pose,
+  const DepthPlaneModel &plane,
+  const cv::Size &image_size,
+  const CameraInfoMsg &camera_info)
+{
+  if (blob_pose.corners.size() != 4 || !plane.valid || image_size.width <= 0 || image_size.height <= 0)
+  {
+    return std::nullopt;
+  }
+
+  const auto camera_points = estimateItemCornerCameraPointsFromDepthPlane(
+    blob_pose.corners,
+    plane,
+    image_size,
+    camera_info);
+  if (!camera_points.has_value())
+  {
+    return std::nullopt;
+  }
+
+  return estimateItemDimensionsFromCornerCameraPoints(blob_pose.corners, *camera_points);
+}
+
+std::optional<AverageItemDimensions> averageItemDimensionsFromPoseEstimateOnDepthPlane(
+  const std::optional<BinarizedPoseEstimate2D> &pose_estimate,
+  const DepthPlaneModel &plane,
+  const cv::Size &image_size,
+  const CameraInfoMsg &camera_info)
+{
+  if (!pose_estimate.has_value() || pose_estimate->blob_poses.empty() ||
+      !plane.valid || image_size.width <= 0 || image_size.height <= 0)
+  {
+    return std::nullopt;
+  }
+
+  AverageItemDimensions average;
+  for (const auto &blob_pose : pose_estimate->blob_poses)
+  {
+    const auto sample = estimateBlobItemDimensionsFromDepthPlane(
+      blob_pose,
+      plane,
+      image_size,
+      camera_info);
+    if (!sample.has_value())
+    {
+      continue;
+    }
+    average.length_cm += sample->length_cm;
+    average.width_cm += sample->width_cm;
+    average.area_cm2 += sample->area_cm2;
+    ++average.sample_count;
+  }
+
+  if (average.sample_count <= 0)
+  {
+    return std::nullopt;
+  }
+
+  const double count = static_cast<double>(average.sample_count);
+  average.length_cm /= count;
+  average.width_cm /= count;
+  average.area_cm2 /= count;
+  return average;
 }
 
 std::optional<cv::Vec3d> depthPlaneNormalInCameraFrame(
@@ -5516,7 +5810,6 @@ public:
     color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
     depth_topic_ = declare_parameter<std::string>("depth_topic", "/robot_camera/depth/image_raw");
     camera_info_topic_ = declare_parameter<std::string>("camera_info_topic", "/robot_camera/color/camera_info");
-    joint_states_topic_ = declare_parameter<std::string>("joint_states_topic", "/joint_states_robot");
 	    overlay_topic_ = declare_parameter<std::string>("overlay_topic", "bin_overlay");
 	    camera_control_service_root_ = declare_parameter<std::string>(
 	      "camera_control_service_root",
@@ -5555,7 +5848,7 @@ public:
     publish_static_calibration_tf_ = declare_parameter<bool>("publish_static_calibration_tf", true);
     calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "base_link");
     calibration_child_frame_ = declare_parameter<std::string>(
-      "calibration_child_frame", "bin_calibrated_link");
+      "calibration_child_frame", "bin_calibrated_camera_link");
     calibration_dir_ = declare_parameter<std::string>("calibration_dir", defaultCalibrationDir());
     calibration_file_ = declare_parameter<std::string>("calibration_file", "");
     auto_discover_calibration_ = declare_parameter<bool>("auto_discover_calibration", true);
@@ -5600,6 +5893,7 @@ public:
       motion_service_root_ = "/dobot_bringup_ros2/srv";
     }
     movj_service_name_ = motion_service_root_ + "/MovJ";
+    get_angle_service_name_ = motion_service_root_ + "/GetAngle";
     bin_roi_move_speed_percent_ = std::clamp(
       static_cast<int>(declare_parameter<int>("bin_roi_move_speed_percent", 100)),
       1,
@@ -5650,6 +5944,7 @@ public:
       item_pose_array_pub_ = create_publisher<PoseArrayMsg>(item_pose_array_topic_, rclcpp::QoS(10));
     }
 	    movj_client_ = create_client<MovJSrv>(movj_service_name_);
+	    get_angle_client_ = create_client<GetAngleSrv>(get_angle_service_name_);
 	    createCameraExposureClients();
 	    color_sub_ = create_subscription<ImageMsg>(
       color_topic_, rclcpp::SensorDataQoS(),
@@ -5660,9 +5955,6 @@ public:
     camera_info_sub_ = create_subscription<CameraInfoMsg>(
       camera_info_topic_, rclcpp::QoS(10).best_effort(),
       std::bind(&ItemTeachNode::cameraInfoCallback, this, std::placeholders::_1));
-    joint_state_sub_ = create_subscription<JointStateMsg>(
-      joint_states_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&ItemTeachNode::jointStateCallback, this, std::placeholders::_1));
 
     createUi();
     cv::setMouseCallback(kWindowName, &ItemTeachNode::onMouseThunk, this);
@@ -5670,17 +5962,20 @@ public:
 	    render_timer_ = create_wall_timer(
 	      std::chrono::milliseconds(33),
 	      std::bind(&ItemTeachNode::renderFrame, this));
+	    robot_state_poll_timer_ = create_wall_timer(
+	      std::chrono::milliseconds(500),
+	      std::bind(&ItemTeachNode::pollRobotJointAngles, this));
 	    camera_exposure_timer_ = create_wall_timer(
 	      std::chrono::milliseconds(250),
 	      std::bind(&ItemTeachNode::applyPendingCameraExposureSettings, this));
 
     RCLCPP_INFO(
       get_logger(),
-      "item_teach ready. Color topic=%s depth topic=%s info topic=%s joints topic=%s overlay topic=%s item_tf_parent=%s z_axis_align=%s profiles_dir=%s",
+      "item_teach ready. Color topic=%s depth topic=%s info topic=%s robot joint service=%s overlay topic=%s item_tf_parent=%s z_axis_align=%s profiles_dir=%s",
       color_topic_.c_str(),
       depth_topic_.c_str(),
       camera_info_topic_.c_str(),
-      joint_states_topic_.c_str(),
+      get_angle_service_name_.c_str(),
       overlay_topic_.c_str(),
       item_tf_parent_frame_.c_str(),
       align_item_z_axis_to_depth_plane_ ? "depth-plane" : "off",
@@ -5754,6 +6049,8 @@ private:
     int image_height {0};
     std::vector<cv::Point2f> roi_points;
     std::vector<cv::Point2f> roi_points_normalized;
+    bool has_arm_joints {false};
+    std::array<double, 6> arm_joints_deg {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     bool has_arm_pose {false};
     double x {0.0};
     double y {0.0};
@@ -6313,6 +6610,7 @@ private:
     active_bin_name_.clear();
     active_bin_teach_path_.clear();
     pose_estimate_.reset();
+    latest_item_dimensions_.reset();
     pose_blob_seed_point_px_.reset();
     pose_blob_reference_.reset();
     pose_blob_reference_clicks_px_.clear();
@@ -6323,7 +6621,7 @@ private:
 
   void resetTaughtMetrics()
   {
-    // Mask-only item_teach flow: edge/area metrics are not tracked.
+    latest_item_dimensions_.reset();
   }
 
   void persistActivePoseReferenceSlot()
@@ -6369,6 +6667,7 @@ private:
       pose_blob_reference_clicks_px_.clear();
       pose_blob_seed_point_px_.reset();
       pose_estimate_.reset();
+      latest_item_dimensions_.reset();
     }
   }
 
@@ -6384,6 +6683,7 @@ private:
     pose_blob_reference_clicks_px_.clear();
     pose_blob_seed_point_px_.reset();
     pose_estimate_.reset();
+    latest_item_dimensions_.reset();
   }
 
   int filledPoseReferenceSlotCount() const
@@ -6731,6 +7031,37 @@ private:
       }
     }
 
+    const YAML::Node arm_joints = bin["arm_joints_at_save"];
+    bool joints_valid = false;
+    if (arm_joints && arm_joints.IsMap() && arm_joints["valid"])
+    {
+      try
+      {
+        joints_valid = arm_joints["valid"].as<bool>();
+      }
+      catch (const std::exception &)
+      {
+        joints_valid = false;
+      }
+    }
+    if (joints_valid)
+    {
+      const YAML::Node joints = arm_joints["joints_deg"];
+      if (joints && joints.IsSequence() && joints.size() >= entry.arm_joints_deg.size())
+      {
+        bool valid_joints = true;
+        for (std::size_t i = 0; i < entry.arm_joints_deg.size(); ++i)
+        {
+          if (!readFiniteYamlDouble(joints[i], entry.arm_joints_deg[i]))
+          {
+            valid_joints = false;
+            break;
+          }
+        }
+        entry.has_arm_joints = valid_joints;
+      }
+    }
+
     const YAML::Node arm_pose = bin["arm_pose_at_save"];
     bool pose_valid = false;
     if (arm_pose && arm_pose.IsMap() && arm_pose["valid"])
@@ -6931,9 +7262,9 @@ private:
 
   std::string sendBinRoiMove(const BinTeachRoiEntry &entry)
   {
-    if (!entry.has_arm_pose)
+    if (!entry.has_arm_joints && !entry.has_arm_pose)
     {
-      return "Bin Teach loaded; robot move unavailable (missing pose)";
+      return "Bin Teach loaded; robot move unavailable (missing joints)";
     }
     if (!movj_client_)
     {
@@ -6946,26 +7277,55 @@ private:
 
     const int speed = std::clamp(bin_roi_move_speed_percent_, 1, 100);
     auto request = std::make_shared<MovJSrv::Request>();
-    request->mode = false;
-    request->a = entry.x;
-    request->b = entry.y;
-    request->c = entry.z;
-    request->d = entry.rx;
-    request->e = entry.ry;
-    request->f = entry.rz;
+    request->mode = entry.has_arm_joints;
+    if (entry.has_arm_joints)
+    {
+      request->a = entry.arm_joints_deg[0];
+      request->b = entry.arm_joints_deg[1];
+      request->c = entry.arm_joints_deg[2];
+      request->d = entry.arm_joints_deg[3];
+      request->e = entry.arm_joints_deg[4];
+      request->f = entry.arm_joints_deg[5];
+    }
+    else
+    {
+      request->a = entry.x;
+      request->b = entry.y;
+      request->c = entry.z;
+      request->d = entry.rx;
+      request->e = entry.ry;
+      request->f = entry.rz;
+    }
     request->param_value = {"v=" + std::to_string(speed) + ",a=" + std::to_string(speed)};
 
-    RCLCPP_INFO(
-      get_logger(),
-      "Load Bin Teach MovJ -> %s pose x=%.3f y=%.3f z=%.3f rx=%.3f ry=%.3f rz=%.3f speed=%d",
-      movj_service_name_.c_str(),
-      entry.x,
-      entry.y,
-      entry.z,
-      entry.rx,
-      entry.ry,
-      entry.rz,
-      speed);
+    if (entry.has_arm_joints)
+    {
+      RCLCPP_INFO(
+        get_logger(),
+        "Load Bin Teach MovJ -> %s joints [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f] speed=%d",
+        movj_service_name_.c_str(),
+        entry.arm_joints_deg[0],
+        entry.arm_joints_deg[1],
+        entry.arm_joints_deg[2],
+        entry.arm_joints_deg[3],
+        entry.arm_joints_deg[4],
+        entry.arm_joints_deg[5],
+        speed);
+    }
+    else
+    {
+      RCLCPP_INFO(
+        get_logger(),
+        "Load Bin Teach MovJ -> %s legacy pose x=%.3f y=%.3f z=%.3f rx=%.3f ry=%.3f rz=%.3f speed=%d",
+        movj_service_name_.c_str(),
+        entry.x,
+        entry.y,
+        entry.z,
+        entry.rx,
+        entry.ry,
+        entry.rz,
+        speed);
+    }
 
     const std::string label = entry.label;
     movj_client_->async_send_request(
@@ -7004,7 +7364,9 @@ private:
         }
       });
 
-    return "Bin Teach loaded; robot moving to saved pose";
+    return entry.has_arm_joints
+      ? "Bin Teach loaded; robot moving to saved joints"
+      : "Bin Teach loaded; robot moving to legacy saved pose";
   }
 
   bool applyBinTeachRoi(int index, const cv::Size &current_size)
@@ -7969,6 +8331,40 @@ private:
     out << YAML::EndSeq;
   }
 
+  void emitTaughtItemDimensionsYaml(YAML::Emitter &out) const
+  {
+    const bool has_dimensions = latest_item_dimensions_.has_value();
+    const int sample_count = has_dimensions ? latest_item_dimensions_->sample_count : 0;
+    const double length_cm = has_dimensions ? latest_item_dimensions_->length_cm : 0.0;
+    const double width_cm = has_dimensions ? latest_item_dimensions_->width_cm : 0.0;
+    const double area_cm2 = has_dimensions ? latest_item_dimensions_->area_cm2 : 0.0;
+    const double length_mm = length_cm * kCentimetersToMillimeters;
+    const double width_mm = width_cm * kCentimetersToMillimeters;
+    const std::string dimension_source = depth_plane_from_bin_teach_
+      ? "rgb_pose_rectangle_on_bin_plane"
+      : "rgb_pose_rectangle_on_depth_plane";
+    out << YAML::Key << "taught_item_dimension_source" << YAML::Value
+        << (has_dimensions ? dimension_source : "unavailable");
+    out << YAML::Key << "taught_item_dimension_sample_count" << YAML::Value << sample_count;
+    out << YAML::Key << "item_length_mm" << YAML::Value << length_mm;
+    out << YAML::Key << "item_width_mm" << YAML::Value << width_mm;
+    out << YAML::Key << "item_dimensions_mm" << YAML::Value << YAML::Flow << YAML::BeginSeq
+        << length_mm << width_mm << YAML::EndSeq;
+    out << YAML::Key << "taught_item_average_length_cm" << YAML::Value << length_cm;
+    out << YAML::Key << "taught_item_average_width_cm" << YAML::Value << width_cm;
+    out << YAML::Key << "taught_item_average_dimensions_cm" << YAML::Value << YAML::Flow << YAML::BeginSeq
+        << length_cm << width_cm << YAML::EndSeq;
+    out << YAML::Key << "taught_item_average_length_mm" << YAML::Value << length_mm;
+    out << YAML::Key << "taught_item_average_width_mm" << YAML::Value << width_mm;
+    out << YAML::Key << "taught_item_average_dimensions_mm" << YAML::Value << YAML::Flow << YAML::BeginSeq
+        << length_mm
+        << width_mm
+        << YAML::EndSeq;
+    out << YAML::Key << "taught_item_average_area_cm2" << YAML::Value << area_cm2;
+    out << YAML::Key << "taught_item_average_area_mm2" << YAML::Value
+        << area_cm2 * kSquareCentimetersToSquareMillimeters;
+  }
+
   const BinarizedPoseEstimate2D::BlobPose2D *currentPrimaryPoseForSave() const
   {
     if (!pose_estimate_.has_value() || pose_estimate_->blob_poses.empty())
@@ -8059,7 +8455,7 @@ private:
     std::array<double, 6> joints_deg_snapshot {};
     bool has_joint_snapshot = false;
     {
-      std::lock_guard<std::mutex> lock(joint_state_mutex_);
+      std::lock_guard<std::mutex> lock(robot_state_mutex_);
       joints_deg_snapshot = latest_joint_positions_deg_;
       has_joint_snapshot = has_joint_positions_;
     }
@@ -8086,6 +8482,7 @@ private:
        "_" + date_stamp.compact_date + ".yaml");
     const std::optional<YAML::Node> preserved_tool_teach =
       loadEmbeddedToolTeachNode(dated_profile_path);
+    const std::optional<cv::Size> profile_image_size = currentColorFrameSize();
 
     YAML::Emitter out;
     out << YAML::BeginMap;
@@ -8144,6 +8541,31 @@ private:
       out << 0 << 0 << 0 << 0;
     }
     out << YAML::EndSeq;
+    if (
+      profile_image_size.has_value() &&
+      profile_image_size->width > 1 &&
+      profile_image_size->height > 1 &&
+      depth_plane_roi_bounds_.has_value())
+    {
+      out << YAML::Key << "depth_plane_roi_normalized" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+      out << std::clamp(
+        static_cast<double>(depth_plane_roi_bounds_->left) / static_cast<double>(profile_image_size->width - 1),
+        0.0,
+        1.0);
+      out << std::clamp(
+        static_cast<double>(depth_plane_roi_bounds_->top) / static_cast<double>(profile_image_size->height - 1),
+        0.0,
+        1.0);
+      out << std::clamp(
+        static_cast<double>(depth_plane_roi_bounds_->right) / static_cast<double>(profile_image_size->width - 1),
+        0.0,
+        1.0);
+      out << std::clamp(
+        static_cast<double>(depth_plane_roi_bounds_->bottom) / static_cast<double>(profile_image_size->height - 1),
+        0.0,
+        1.0);
+      out << YAML::EndSeq;
+    }
     out << YAML::Key << "roi_points" << YAML::Value << YAML::Flow << YAML::BeginSeq;
     for (const auto &point : roi_points_)
     {
@@ -8151,6 +8573,26 @@ private:
       out << static_cast<int>(std::round(point.y));
     }
     out << YAML::EndSeq;
+    if (profile_image_size.has_value() && profile_image_size->width > 1 && profile_image_size->height > 1)
+    {
+      out << YAML::Key << "image_width" << YAML::Value << profile_image_size->width;
+      out << YAML::Key << "image_height" << YAML::Value << profile_image_size->height;
+      out << YAML::Key << "roi_points_normalized" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+      for (const auto &point : roi_points_)
+      {
+        const double x_norm = std::clamp(
+          static_cast<double>(point.x) / static_cast<double>(profile_image_size->width - 1),
+          0.0,
+          1.0);
+        const double y_norm = std::clamp(
+          static_cast<double>(point.y) / static_cast<double>(profile_image_size->height - 1),
+          0.0,
+          1.0);
+        out << x_norm;
+        out << y_norm;
+      }
+      out << YAML::EndSeq;
+    }
     std::optional<PoseBlobReference2D> reference_blob_to_save = currentPoseBlobReferenceForSave();
     if (reference_blob_to_save.has_value())
     {
@@ -8242,6 +8684,7 @@ private:
       out << YAML::Key << "pose_x_length_px" << YAML::Value << static_cast<double>(primary_pose->x_length_px);
       out << YAML::Key << "pose_z_length_px" << YAML::Value << static_cast<double>(primary_pose->z_length_px);
     }
+    emitTaughtItemDimensionsYaml(out);
     out << YAML::Key << "item_name" << YAML::Value << item_name;
     out << YAML::Key << "teach_date" << YAML::Value << date_stamp.iso_date;
     if (has_joint_snapshot)
@@ -9331,72 +9774,70 @@ private:
     latest_camera_info_ = msg;
   }
 
-  void jointStateCallback(const JointStateMsg::ConstSharedPtr msg)
+  void pollRobotJointAngles()
   {
-    if (msg->position.empty())
+    if (!get_angle_client_ || get_angle_request_in_flight_)
     {
       return;
     }
-
-    constexpr double kRadToDeg = 57.29577951308232;
-    std::array<double, 6> joints_deg {};
-    std::array<bool, 6> has_named_joint {false, false, false, false, false, false};
-
-    for (std::size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i)
+    if (!get_angle_client_->service_is_ready())
     {
-      const std::string &name = msg->name[i];
-      int index = -1;
-      if (name == "joint1")
-      {
-        index = 0;
-      }
-      else if (name == "joint2")
-      {
-        index = 1;
-      }
-      else if (name == "joint3")
-      {
-        index = 2;
-      }
-      else if (name == "joint4")
-      {
-        index = 3;
-      }
-      else if (name == "joint5")
-      {
-        index = 4;
-      }
-      else if (name == "joint6")
-      {
-        index = 5;
-      }
-
-      if (index >= 0)
-      {
-        joints_deg[static_cast<std::size_t>(index)] = msg->position[i] * kRadToDeg;
-        has_named_joint[static_cast<std::size_t>(index)] = true;
-      }
-    }
-
-    bool valid_sample =
-      std::all_of(has_named_joint.begin(), has_named_joint.end(), [](const bool value) { return value; });
-    if (!valid_sample && msg->position.size() >= 6)
-    {
-      for (std::size_t i = 0; i < 6; ++i)
-      {
-        joints_deg[i] = msg->position[i] * kRadToDeg;
-      }
-      valid_sample = true;
-    }
-
-    if (!valid_sample)
-    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        5000,
+        "Robot joint snapshot service not available: %s",
+        get_angle_service_name_.c_str());
       return;
     }
 
-    std::lock_guard<std::mutex> lock(joint_state_mutex_);
-    latest_joint_positions_deg_ = joints_deg;
-    has_joint_positions_ = true;
+    get_angle_request_in_flight_ = true;
+    auto request = std::make_shared<GetAngleSrv::Request>();
+    get_angle_client_->async_send_request(
+      request,
+      [this](rclcpp::Client<GetAngleSrv>::SharedFuture future)
+      {
+        get_angle_request_in_flight_ = false;
+        try
+        {
+          const auto response = future.get();
+          if (!response || response->res < 0)
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              5000,
+              "GetAngle failed while caching teach joints from %s",
+              get_angle_service_name_.c_str());
+            return;
+          }
+
+          const auto joints_deg = parseSixDoublesFromRobotReturn(response->robot_return);
+          if (!joints_deg.has_value())
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              5000,
+              "Could not parse GetAngle reply while caching teach joints: %s",
+              response->robot_return.c_str());
+            return;
+          }
+
+          std::lock_guard<std::mutex> lock(robot_state_mutex_);
+          latest_joint_positions_deg_ = *joints_deg;
+          has_joint_positions_ = true;
+        }
+        catch (const std::exception &ex)
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            5000,
+            "GetAngle call failed while caching teach joints: %s",
+            ex.what());
+        }
+      });
   }
 
   cv::Mat buildNoCameraTopicsPlaceholder()
@@ -9855,6 +10296,20 @@ private:
       }
     }
     pose_estimate_ = pose_estimate;
+    if (current_camera_info)
+    {
+      const cv::Size plane_image_size = current_depth.empty() ? current_frame.size() : current_depth.size();
+      latest_item_dimensions_ =
+        averageItemDimensionsFromPoseEstimateOnDepthPlane(
+          pose_estimate_,
+          depth_plane_model_,
+          plane_image_size,
+          *current_camera_info);
+    }
+    else
+    {
+      latest_item_dimensions_.reset();
+    }
     pose_stage_status_ = pose_status_text;
 
     cv::Mat binarized_display_mask = color_retain_mask;
@@ -10188,7 +10643,6 @@ private:
   std::string color_topic_;
   std::string depth_topic_;
   std::string camera_info_topic_;
-  std::string joint_states_topic_;
   std::string overlay_topic_;
   std::string calibration_parent_frame_;
   std::string calibration_child_frame_;
@@ -10201,6 +10655,7 @@ private:
 	  std::string bin_teach_dir_;
 	  std::string motion_service_root_;
 	  std::string movj_service_name_;
+	  std::string get_angle_service_name_;
 	  std::string camera_control_service_root_ {"/robot_camera"};
 	  std::string latest_saved_profile_path_;
   std::string save_status_message_ {"Saved"};
@@ -10261,6 +10716,7 @@ private:
   std::string active_bin_name_;
   std::string active_bin_teach_path_;
   std::optional<BinarizedPoseEstimate2D> pose_estimate_;
+  std::optional<AverageItemDimensions> latest_item_dimensions_;
   std::optional<cv::Point> pose_blob_seed_point_px_;
   std::optional<PoseBlobReference2D> pose_blob_reference_;
   std::vector<cv::Point> pose_blob_reference_clicks_px_;
@@ -10288,6 +10744,7 @@ private:
 	  rclcpp::Publisher<ImageMsg>::SharedPtr overlay_pub_;
 	  rclcpp::Publisher<PoseArrayMsg>::SharedPtr item_pose_array_pub_;
 	  rclcpp::Client<MovJSrv>::SharedPtr movj_client_;
+	  rclcpp::Client<GetAngleSrv>::SharedPtr get_angle_client_;
 	  rclcpp::Client<SetBoolSrv>::SharedPtr color_auto_exposure_client_;
 	  rclcpp::Client<SetInt32Srv>::SharedPtr color_exposure_client_;
 	  rclcpp::Client<SetBoolSrv>::SharedPtr depth_auto_exposure_client_;
@@ -10296,12 +10753,12 @@ private:
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
   rclcpp::Subscription<CameraInfoMsg>::SharedPtr camera_info_sub_;
-	  rclcpp::Subscription<JointStateMsg>::SharedPtr joint_state_sub_;
 	  rclcpp::TimerBase::SharedPtr render_timer_;
+	  rclcpp::TimerBase::SharedPtr robot_state_poll_timer_;
 	  rclcpp::TimerBase::SharedPtr camera_exposure_timer_;
 
   std::mutex frame_mutex_;
-  std::mutex joint_state_mutex_;
+  std::mutex robot_state_mutex_;
   cv::Mat latest_frame_;
   cv::Mat latest_depth_;
   cv::Mat frozen_frame_;
@@ -10312,6 +10769,7 @@ private:
   CameraInfoMsg::ConstSharedPtr frozen_camera_info_;
   std::array<double, 6> latest_joint_positions_deg_ {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_joint_positions_ {false};
+  bool get_angle_request_in_flight_ {false};
 };
 
 int main(int argc, char **argv)

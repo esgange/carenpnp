@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -44,7 +45,7 @@
 #include <QWidget>
 
 #include <aruco_perception/msg/marker_detections.hpp>
-#include <dobot_msgs_v4/msg/tool_vector_actual.hpp>
+#include <dobot_msgs_v4/srv/get_angle.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
 #include <dobot_msgs_v4/srv/rel_mov_l_user.hpp>
 #include <dobot_msgs_v4/srv/speed_factor.hpp>
@@ -66,7 +67,7 @@
 namespace
 {
 using MarkerDetectionsMsg = aruco_perception::msg::MarkerDetections;
-using ToolVectorActualMsg = dobot_msgs_v4::msg::ToolVectorActual;
+using GetAngleSrv = dobot_msgs_v4::srv::GetAngle;
 using MovJSrv = dobot_msgs_v4::srv::MovJ;
 using RelMovLUserSrv = dobot_msgs_v4::srv::RelMovLUser;
 using SpeedFactorSrv = dobot_msgs_v4::srv::SpeedFactor;
@@ -76,12 +77,55 @@ using TransformStampedMsg = geometry_msgs::msg::TransformStamped;
 
 constexpr std::array<int, 4> kBinTeachAllowedMarkerIds{{1, 2, 3, 4}};
 constexpr int kBinTeachRequiredMarkerCount = 4;
+constexpr double kAlignJointStableToleranceDeg = 1.0;
+constexpr double kAlignJointStableSec = 0.5;
+constexpr double kAlignCommandSettleGuardSec = 1.0;
 
 using Vec2 = std::array<double, 2>;
 using Vec3 = std::array<double, 3>;
 using Quat = std::array<double, 4>;
 using Pose7 = std::array<double, 7>;
-using TcpPose = std::array<double, 6>;
+using JointAngles = std::array<double, 6>;
+
+std::optional<JointAngles> parseSixDoublesFromRobotReturn(const std::string &text)
+{
+  if (text.empty())
+  {
+    return std::nullopt;
+  }
+
+  static const std::regex brace_pattern(R"(\{([^{}]+)\})");
+  static const std::regex number_pattern(R"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)");
+
+  const auto parse_segment = [&](const std::string &segment) -> std::optional<JointAngles>
+  {
+    JointAngles values {};
+    std::size_t count = 0;
+    for (std::sregex_iterator it(segment.begin(), segment.end(), number_pattern), end; it != end; ++it)
+    {
+      if (count >= values.size())
+      {
+        return std::nullopt;
+      }
+      values[count++] = std::stod(it->str());
+    }
+    if (count == values.size())
+    {
+      return values;
+    }
+    return std::nullopt;
+  };
+
+  for (std::sregex_iterator it(text.begin(), text.end(), brace_pattern), end; it != end; ++it)
+  {
+    if (auto parsed = parse_segment((*it)[1].str()); parsed.has_value())
+    {
+      return parsed;
+    }
+  }
+
+  return parse_segment(text);
+}
 
 struct GoalPose
 {
@@ -859,7 +903,7 @@ public:
     static_platform_tf_broadcaster_(std::make_shared<tf2_ros::StaticTransformBroadcaster>(this))
   {
     marker_prefix_ = declare_parameter<std::string>("marker_prefix", "aruco_marker");
-    parent_frame_ = declare_parameter<std::string>("parent_frame", "bin_calibrated_link");
+    parent_frame_ = declare_parameter<std::string>("parent_frame", "bin_calibrated_camera_link");
     target_frame_ = declare_parameter<std::string>("target_frame", "bin_teach_target");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     gripper_frame_ = declare_parameter<std::string>("gripper_frame", "Link6");
@@ -894,8 +938,6 @@ public:
     align_visible_max_age_sec_ = declare_parameter<double>("align_visible_max_age_sec", 0.75);
     align_initial_timeout_sec_ = declare_parameter<double>("align_initial_timeout_sec", 30.0);
     align_min_base_z_mm_ = declare_parameter<double>("align_min_base_z_mm", 200.0);
-    align_goal_pos_tol_mm_ = declare_parameter<double>("align_goal_pos_tol_mm", 8.0);
-    align_goal_rot_tol_deg_ = declare_parameter<double>("align_goal_rot_tol_deg", 3.0);
     align_up_max_distance_mm_ = declare_parameter<double>("align_up_max_distance_mm", 400.0);
     align_up_speed_factor_percent_ = declare_parameter<int>("align_up_speed_factor_percent", 5);
     align_up_timeout_sec_ = declare_parameter<double>("align_up_timeout_sec", 60.0);
@@ -917,7 +959,7 @@ public:
       {
         throw std::runtime_error(
           "use_platform_calibration=true but no platform calibration file is available. "
-          "Run camera_calibration platform_teach first, or set use_platform_calibration:=false for legacy camera-relative bin teach.");
+          "Run platform_calibration first, or set use_platform_calibration:=false for legacy camera-relative bin teach.");
       }
 
       std::string reason;
@@ -946,11 +988,10 @@ public:
     relm_user_client_ = create_client<RelMovLUserSrv>(motion_service_root_ + "/RelMovLUser");
     speed_factor_client_ = create_client<SpeedFactorSrv>(motion_service_root_ + "/SpeedFactor");
     stop_client_ = create_client<StopSrv>(motion_service_root_ + "/Stop");
-
-    tcp_sub_ = create_subscription<ToolVectorActualMsg>(
-      "dobot_msgs_v4/msg/ToolVectorActual",
-      10,
-      [this](const ToolVectorActualMsg::SharedPtr msg) { tcpCallback(*msg); });
+    get_angle_client_ = create_client<GetAngleSrv>(motion_service_root_ + "/GetAngle");
+    joint_angle_poll_timer_ = create_wall_timer(
+      std::chrono::milliseconds(100),
+      [this]() { pollJointAngles(); });
     detections_sub_ = create_subscription<MarkerDetectionsMsg>(
       detections_topic_,
       rclcpp::SensorDataQoS(),
@@ -1164,10 +1205,10 @@ public:
     {
       solution.roi_points.push_back(static_cast<int>(std::lround(dot.x)));
       solution.roi_points.push_back(static_cast<int>(std::lround(dot.y)));
-      if (solution.image_width > 0 && solution.image_height > 0)
+      if (solution.image_width > 1 && solution.image_height > 1)
       {
-        solution.roi_points_normalized.push_back(dot.x / static_cast<double>(solution.image_width));
-        solution.roi_points_normalized.push_back(dot.y / static_cast<double>(solution.image_height));
+        solution.roi_points_normalized.push_back(dot.x / static_cast<double>(solution.image_width - 1));
+        solution.roi_points_normalized.push_back(dot.y / static_cast<double>(solution.image_height - 1));
       }
     }
     solution.dot_positions = *corner_dots;
@@ -1373,7 +1414,7 @@ public:
       return stream.str();
     };
 
-    const auto arm_pose = currentTcp();
+    const auto arm_joints = currentJointAngles();
     std::ostringstream text;
     text << "bin_teach:\n";
     text << "  bin_name: " << solution.bin_name << "\n";
@@ -1416,25 +1457,23 @@ public:
          << ", y: " << formatDouble(solution.quaternion[1], 9)
          << ", z: " << formatDouble(solution.quaternion[2], 9)
          << ", w: " << formatDouble(solution.quaternion[3], 9) << "}\n";
-    text << "  arm_pose_at_save:\n";
-    text << "    source_topic: dobot_msgs_v4/msg/ToolVectorActual\n";
-    text << "    base_frame: " << base_frame_ << "\n";
-    text << "    gripper_frame: " << gripper_frame_ << "\n";
-    text << "    position_units: mm\n";
+    text << "  arm_joints_at_save:\n";
+    text << "    source_service: " << motion_service_root_ << "/GetAngle\n";
     text << "    rotation_units: deg\n";
-    if (!arm_pose)
+    if (!arm_joints)
     {
       text << "    valid: false\n";
     }
     else
     {
       text << "    valid: true\n";
-      text << "    tcp: {x: " << formatDouble((*arm_pose)[0], 6)
-           << ", y: " << formatDouble((*arm_pose)[1], 6)
-           << ", z: " << formatDouble((*arm_pose)[2], 6)
-           << ", rx: " << formatDouble((*arm_pose)[3], 6)
-           << ", ry: " << formatDouble((*arm_pose)[4], 6)
-           << ", rz: " << formatDouble((*arm_pose)[5], 6) << "}\n";
+      text << "    joints_deg: ["
+           << formatDouble((*arm_joints)[0], 6) << ", "
+           << formatDouble((*arm_joints)[1], 6) << ", "
+           << formatDouble((*arm_joints)[2], 6) << ", "
+           << formatDouble((*arm_joints)[3], 6) << ", "
+           << formatDouble((*arm_joints)[4], 6) << ", "
+           << formatDouble((*arm_joints)[5], 6) << "]\n";
     }
     if (!solution.roi_points.empty())
     {
@@ -1519,9 +1558,9 @@ public:
     return path;
   }
 
-  std::optional<TcpPose> currentTcp() const
+  std::optional<JointAngles> currentJointAngles() const
   {
-    return latest_tcp_;
+    return latest_joint_angles_;
   }
 
   Pose7 lookupPoseMm(const std::string &parent_frame, const std::string &child_frame, double timeout_sec = 0.15) const
@@ -1566,80 +1605,14 @@ public:
       static_cast<double>(q.w)}};
   }
 
-  Pose7 currentGripperPoseMm() const
-  {
-    const auto tcp = currentTcp();
-    if (!tcp)
-    {
-      throw std::runtime_error("No live TCP pose yet on dobot_msgs_v4/msg/ToolVectorActual.");
-    }
-    const Quat q = rpyDegToQuaternion((*tcp)[3], (*tcp)[4], (*tcp)[5]);
-    return Pose7{{(*tcp)[0], (*tcp)[1], (*tcp)[2], q[0], q[1], q[2], q[3]}};
-  }
-
-  Pose7 currentCameraPoseMm() const
-  {
-    const Pose7 gripper_pose = currentGripperPoseMm();
-    const Pose7 gripper_to_camera = lookupPoseMm(gripper_frame_, camera_frame_);
-    return transformPoseCompose(gripper_pose, gripper_to_camera);
-  }
-
-  Pose7 currentCameraPoseMmNoWait() const
-  {
-    const Pose7 gripper_pose = currentGripperPoseMm();
-    const Pose7 gripper_to_camera = lookupPoseMmNoWait(gripper_frame_, camera_frame_);
-    return transformPoseCompose(gripper_pose, gripper_to_camera);
-  }
-
   Pose7 lookupBaseToFramePoseMm(const std::string &child_frame, double timeout_sec = 0.15) const
   {
-    try
-    {
-      return lookupPoseMm(base_frame_, child_frame, timeout_sec);
-    }
-    catch (const tf2::TransformException &ex)
-    {
-      if (child_frame == gripper_frame_)
-      {
-        return currentGripperPoseMm();
-      }
-      if (child_frame == camera_frame_)
-      {
-        return currentCameraPoseMm();
-      }
-      try
-      {
-        const Pose7 base_to_camera = currentCameraPoseMm();
-        const Pose7 camera_to_child = lookupPoseMm(camera_frame_, child_frame, timeout_sec);
-        return transformPoseCompose(base_to_camera, camera_to_child);
-      }
-      catch (...)
-      {
-        throw;
-      }
-    }
+    return lookupPoseMm(base_frame_, child_frame, timeout_sec);
   }
 
   Pose7 lookupBaseToFramePoseMmNoWait(const std::string &child_frame) const
   {
-    try
-    {
-      return lookupPoseMmNoWait(base_frame_, child_frame);
-    }
-    catch (const tf2::TransformException &)
-    {
-      if (child_frame == gripper_frame_)
-      {
-        return currentGripperPoseMm();
-      }
-      if (child_frame == camera_frame_)
-      {
-        return currentCameraPoseMmNoWait();
-      }
-      const Pose7 base_to_camera = currentCameraPoseMmNoWait();
-      const Pose7 camera_to_child = lookupPoseMmNoWait(camera_frame_, child_frame);
-      return transformPoseCompose(base_to_camera, camera_to_child);
-    }
+    return lookupPoseMmNoWait(base_frame_, child_frame);
   }
 
   static bool isPlatformCalibrationFilename(const std::filesystem::path &path)
@@ -1832,7 +1805,7 @@ public:
   std::pair<std::vector<MarkerData>, std::string> markersInTeachFrame(
     const std::vector<MarkerData> &markers,
     const std::string &source_frame,
-    bool allow_tcp_fallback = true) const
+    bool allow_tf_fallback = true) const
   {
     if (!use_platform_calibration_)
     {
@@ -1869,7 +1842,7 @@ public:
     }
     catch (const tf2::TransformException &tf_ex)
     {
-      if (allow_tcp_fallback && platform_parent_frame_ == base_frame_ && source_frame == camera_frame_)
+      if (allow_tf_fallback && platform_parent_frame_ == base_frame_ && source_frame == camera_frame_)
       {
         try
         {
@@ -1934,7 +1907,8 @@ public:
 
   std::string markerRequirementText() const
   {
-    return std::to_string(required_marker_count_) + " visible bin markers with IDs " + formatMarkerIds(allowed_marker_ids_, "or");
+    return std::to_string(required_marker_count_) + " visible bin marker detections with IDs " +
+      formatMarkerIds(allowed_marker_ids_, "or");
   }
 
   std::vector<MarkerData> selectVisibleBinMarkers(const std::vector<MarkerData> &markers) const
@@ -2012,7 +1986,7 @@ public:
       output.details.push_back(
         "Need " + markerRequirementText() + "; currently see " +
         std::to_string(output.visible.size()) + "/" + std::to_string(required_marker_count_) +
-        " allowed marker(s).");
+        " allowed marker detection(s).");
     }
     else if (static_cast<int>(output.visible.size()) > required_marker_count_)
     {
@@ -2102,10 +2076,6 @@ public:
     latest_target_solution_ = target_solution;
     publishSolution(target_solution);
 
-    if (!currentTcp())
-    {
-      throw std::runtime_error("No live TCP pose yet on dobot_msgs_v4/msg/ToolVectorActual.");
-    }
     if (!movj_client_->wait_for_service(std::chrono::milliseconds(500)))
     {
       throw std::runtime_error("Motion service is not ready: " + motion_service_root_ + "/MovJ");
@@ -2219,19 +2189,14 @@ public:
     return std::fabs(normalized - 180.0);
   }
 
-  bool goalReached(const std::optional<TcpPose> &current_tcp, const std::optional<GoalPose> &target_pose) const
+  static double jointDeltaDeg(const JointAngles &lhs, const JointAngles &rhs)
   {
-    if (!current_tcp || !target_pose)
+    double max_delta = 0.0;
+    for (std::size_t i = 0; i < lhs.size(); ++i)
     {
-      return false;
+      max_delta = std::max(max_delta, angleErrorDeg(lhs[i], rhs[i]));
     }
-    if (std::fabs((*current_tcp)[0] - target_pose->x) > align_goal_pos_tol_mm_) { return false; }
-    if (std::fabs((*current_tcp)[1] - target_pose->y) > align_goal_pos_tol_mm_) { return false; }
-    if (std::fabs((*current_tcp)[2] - target_pose->z) > align_goal_pos_tol_mm_) { return false; }
-    if (angleErrorDeg((*current_tcp)[3], target_pose->rx) > align_goal_rot_tol_deg_) { return false; }
-    if (angleErrorDeg((*current_tcp)[4], target_pose->ry) > align_goal_rot_tol_deg_) { return false; }
-    if (angleErrorDeg((*current_tcp)[5], target_pose->rz) > align_goal_rot_tol_deg_) { return false; }
-    return true;
+    return max_delta;
   }
 
   std::pair<bool, std::vector<std::string>> markersVisibleRecent(
@@ -2373,15 +2338,68 @@ private:
     }
   }
 
-  void tcpCallback(const ToolVectorActualMsg &msg)
+  void pollJointAngles()
   {
-    latest_tcp_ = TcpPose{{
-      static_cast<double>(msg.x),
-      static_cast<double>(msg.y),
-      static_cast<double>(msg.z),
-      static_cast<double>(msg.rx),
-      static_cast<double>(msg.ry),
-      static_cast<double>(msg.rz)}};
+    if (get_angle_request_in_flight_)
+    {
+      return;
+    }
+    if (!get_angle_client_ || !get_angle_client_->service_is_ready())
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        5000,
+        "Joint angle service is not ready: %s/GetAngle",
+        motion_service_root_.c_str());
+      return;
+    }
+
+    auto request = std::make_shared<GetAngleSrv::Request>();
+    get_angle_request_in_flight_ = true;
+    get_angle_client_->async_send_request(
+      request,
+      [this](rclcpp::Client<GetAngleSrv>::SharedFuture future)
+      {
+        get_angle_request_in_flight_ = false;
+        try
+        {
+          const auto response = future.get();
+          if (!response || response->res < 0)
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              5000,
+              "GetAngle failed while caching robot joints: res=%d, return=%s",
+              response ? response->res : -999,
+              response ? response->robot_return.c_str() : "");
+            return;
+          }
+
+          const auto joints = parseSixDoublesFromRobotReturn(response->robot_return);
+          if (!joints)
+          {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(),
+              *get_clock(),
+              5000,
+              "Could not parse GetAngle reply while caching robot joints: %s",
+              response->robot_return.c_str());
+            return;
+          }
+          latest_joint_angles_ = *joints;
+        }
+        catch (const std::exception &exc)
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            5000,
+            "GetAngle call failed while caching robot joints: %s",
+            exc.what());
+        }
+      });
   }
 
   QImage imageMsgToQImage(const ImageMsg &msg, const std::string &source_name)
@@ -2617,13 +2635,12 @@ private:
   bool use_aruco_overlay_{false};
   std::string detections_topic_;
   std::string motion_service_root_;
+  bool get_angle_request_in_flight_{false};
   double align_distance_mm_{300.0};
   int align_pose_speed_percent_{100};
   double align_visible_max_age_sec_{0.75};
   double align_initial_timeout_sec_{30.0};
   double align_min_base_z_mm_{200.0};
-  double align_goal_pos_tol_mm_{8.0};
-  double align_goal_rot_tol_deg_{3.0};
   double align_up_max_distance_mm_{400.0};
   int align_up_speed_factor_percent_{5};
   double align_up_timeout_sec_{60.0};
@@ -2639,7 +2656,7 @@ private:
   std::optional<Solution> latest_solution_;
   std::optional<Solution> latest_target_solution_;
   std::optional<GoalPose> latest_align_goal_;
-  std::optional<TcpPose> latest_tcp_;
+  std::optional<JointAngles> latest_joint_angles_;
   std::optional<DetectionFrame> latest_detection_frame_;
   QImage latest_camera_qimage_;
   std::optional<CameraFrameInfo> latest_camera_frame_;
@@ -2651,7 +2668,8 @@ private:
   rclcpp::Client<RelMovLUserSrv>::SharedPtr relm_user_client_;
   rclcpp::Client<SpeedFactorSrv>::SharedPtr speed_factor_client_;
   rclcpp::Client<StopSrv>::SharedPtr stop_client_;
-  rclcpp::Subscription<ToolVectorActualMsg>::SharedPtr tcp_sub_;
+  rclcpp::Client<GetAngleSrv>::SharedPtr get_angle_client_;
+  rclcpp::TimerBase::SharedPtr joint_angle_poll_timer_;
   rclcpp::Subscription<MarkerDetectionsMsg>::SharedPtr detections_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr color_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr overlay_sub_;
@@ -3008,6 +3026,30 @@ private:
     align_deadline_ = steadyNow() + std::chrono::seconds(3);
   }
 
+  bool alignJointsStable(const std::chrono::steady_clock::time_point &now)
+  {
+    const auto joints = node_->currentJointAngles();
+    if (!joints)
+    {
+      return false;
+    }
+    if (!align_stable_anchor_joints_)
+    {
+      align_stable_anchor_joints_ = *joints;
+      align_stable_since_ = now;
+      return false;
+    }
+    const double delta_deg = BinTeachNode::jointDeltaDeg(*joints, *align_stable_anchor_joints_);
+    if (delta_deg > kAlignJointStableToleranceDeg)
+    {
+      align_stable_anchor_joints_ = *joints;
+      align_stable_since_ = now;
+      return false;
+    }
+    const auto stable_duration = std::chrono::duration<double>(now - align_stable_since_).count();
+    return now >= align_stable_not_before_ && stable_duration >= kAlignJointStableSec;
+  }
+
   void onAlignPoseCommandDone(rclcpp::Client<MovJSrv>::SharedFuture future)
   {
     try
@@ -3023,8 +3065,14 @@ private:
         return;
       }
       align_state_ = "waiting_pose_reached";
-      align_deadline_ = steadyNow() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(node_->alignInitialTimeoutSec()));
-      log("[align] " + alignDistanceLabel() + " full-orientation pose accepted. Waiting for robot to reach it...", 10.0);
+      const auto now = steadyNow();
+      align_deadline_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(node_->alignInitialTimeoutSec()));
+      align_stable_anchor_joints_.reset();
+      align_stable_since_ = now;
+      align_stable_not_before_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(kAlignCommandSettleGuardSec));
+      log("[align] " + alignDistanceLabel() + " full-orientation pose accepted. Waiting for joints to settle...", 10.0);
     }
     catch (const std::exception &ex)
     {
@@ -3078,9 +3126,9 @@ private:
     }
     if (align_state_ == "waiting_pose_reached")
     {
-      if (node_->goalReached(node_->currentTcp(), align_goal_))
+      if (alignJointsStable(now))
       {
-        log("[align] " + alignDistanceLabel() + " pose reached.", 10.0);
+        log("[align] " + alignDistanceLabel() + " MovJ joints settled.", 10.0);
         startSlowUpMotion();
         return;
       }
@@ -3342,8 +3390,11 @@ private:
     align_state_ = "idle";
     align_goal_.reset();
     align_marker_ids_.reset();
+    align_stable_anchor_joints_.reset();
     align_deadline_ = steadyNow();
     align_total_deadline_ = steadyNow();
+    align_stable_since_ = steadyNow();
+    align_stable_not_before_ = steadyNow();
   }
 
   void saveBinTeach()
@@ -3377,6 +3428,9 @@ private:
   std::string align_state_{"idle"};
   std::optional<GoalPose> align_goal_;
   std::optional<std::vector<int>> align_marker_ids_;
+  std::optional<JointAngles> align_stable_anchor_joints_;
+  std::chrono::steady_clock::time_point align_stable_since_;
+  std::chrono::steady_clock::time_point align_stable_not_before_;
   std::chrono::steady_clock::time_point align_deadline_;
   std::chrono::steady_clock::time_point align_total_deadline_;
   std::chrono::steady_clock::time_point status_hold_until_;

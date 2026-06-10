@@ -143,7 +143,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "calibration_child_frame",
-            default_value="bin_calibrated_link",
+            default_value="bin_calibrated_camera_link",
         ),
         DeclareLaunchArgument(
             "calibration_dir",

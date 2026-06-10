@@ -26,6 +26,7 @@ target_include_directories(tray_teach_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(tray_teach_node
+  dobot_msgs_v4
   rclcpp
   sensor_msgs
   std_srvs

@@ -51,7 +51,6 @@ ros2 run tray_intercept tray_intercept
 | --- | --- | --- |
 | `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | `tray_detect` motion estimate. |
 | `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | Live 2D tray origin and X/Y axes for the GUI preview. |
-| `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | DOBOT bringup TCP feedback. |
 
 The GUI automatically calls `tray_detect/get_tray_dimensions` to keep the tray
 preview size synced when the service is available.
@@ -74,11 +73,13 @@ Service exposed by this package:
 
 Robot services called under `/dobot_bringup_ros2/srv`:
 
+- `GetPose`
 - `CP`
 - `SpeedFactor`
 - `Stop`
 - `MovL`
 - `MovLIO`
+- `DO`
 
 Example:
 
@@ -101,13 +102,52 @@ When armed, the node:
 Troubleshoot mode publishes goal TFs only and does not send robot motion.
 The tray intercept move uses a fixed `650 mm/s` EE speed; the
 `ee_intercept_speed_mm_s` service field is kept for compatibility. The GUI
-angle control sets a manual `-90..90 deg` final EE pose angle: negative rotates
-CCW, positive rotates CW, and zero preserves the current TCP orientation instead
-of aligning the EE to the tray axes. The tray-direction follow move still uses
-detected tray speed, and post-follow Z-up uses the configured arm max speed.
+angle control sets a manual `-90..90 deg` tray-Y angle offset: negative rotates
+CCW, positive rotates CW, and zero aligns the TCP yaw to the closest parallel
+tray Y-axis direction. The tray-direction follow move still uses detected tray
+speed, and post-follow Z-up uses the configured arm max speed.
 The tray standoff Z offset is applied in robot/base +Z, so positive Z remains
 an upward standoff even if the detected tray frame has a downward natural Z.
 Tray X/Y offsets are projected into the robot base XY plane before motion.
+
+## Release IO
+
+When release grip is enabled, tray intercept opens the gripper during the
+follow stage and uses the suction exhaust output. The moving-tray path uses
+`MovLIO` so the IO changes are queued with the follow motion instead of stopping
+the robot. `DO4` is pulsed for about `300 ms`; the moving-tray path computes a
+distance-percent `MovLIO` trigger to turn exhaust back off during the same
+follow move.
+
+Release at the start of tray follow:
+
+| Output | State |
+| --- | --- |
+| `DO1` gripper close | `OFF` |
+| `DO3` suction | `OFF` |
+| `DO4` suction exhaust | `ON` |
+| `DO2` gripper open | `ON` |
+
+Exhaust pulse during tray follow:
+
+| Output | State |
+| --- | --- |
+| `DO4` suction exhaust | `OFF` after the computed 300 ms pulse point |
+
+Post-follow cleanup returns the gripper outputs to neutral:
+
+| Output | State |
+| --- | --- |
+| `DO1` gripper close | `OFF` |
+| `DO2` gripper open | `OFF` |
+| `DO3` suction | `OFF` |
+| `DO4` suction exhaust | `OFF` |
+
+For stationary or near-zero follow distance, the node waits until the intercept
+pose is reached, sends the same release outputs with `DO`, turns `DO4` back off
+after the 300 ms pulse while keeping `DO2` open, waits the remaining release
+settling time, then runs the same neutral cleanup. Suction DI feedback is not used by
+`tray_intercept`.
 
 The preview origin is fixed at the lower-left tray corner. X/Y preview clicks
 are converted from that displayed bottom origin and sent directly in the

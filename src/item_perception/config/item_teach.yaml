@@ -3,7 +3,6 @@ item_teach:
     color_topic: /robot_camera/color/image_raw
     depth_topic: /robot_camera/depth/image_raw
     camera_info_topic: /robot_camera/color/camera_info
-    joint_states_topic: /joint_states_robot
     overlay_topic: bin_overlay
     publish_overlay: true
     align_item_z_axis_to_depth_plane: true
