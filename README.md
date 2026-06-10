@@ -185,6 +185,11 @@ panel. Edit the value there and press **Save** to update `ROBOT_IP_ADDRESS` in
 `station_config`; stop and relaunch Robot Bringup after changing it. The LAN2
 debug/default controller IP is `192.168.200.1`.
 
+The orchestrator camera feeds are opened from the **Camera Views** section with
+**Open Camera Window**. The camera viewer stays in its own window so the main
+operator controls remain visible; clicking the button again brings the camera
+window to the front.
+
 `ROS_DOMAIN_ID` is normally inherited from the shell environment. Set it before
 launching if you need a non-default domain:
 

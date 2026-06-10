@@ -134,6 +134,11 @@ Bringup reads `station_config` when it launches, so stop and relaunch Robot
 Bringup after changing the IP. For direct LAN2 debug, the controller IP is
 normally `192.168.200.1`; set the PC wired adapter to the same `/24` subnet.
 
+The right-side **Camera Views** section opens the bin/tray detect overlays in a
+separate **Camera Detect Views** window. Press **Open Camera Window** to create
+the viewer; pressing it again brings the existing viewer to the front. Close the
+camera viewer from that window when it is no longer needed.
+
 Switching the Robot Cell Orchestrator GUI between **Offline** and **Online**
 only changes the orchestration mode. It does not launch or stop robot,
 perception, RViz, or camera nodes. Start and stop support nodes from the

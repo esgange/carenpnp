@@ -1331,6 +1331,7 @@ class RobotCellOrchestratorGui:
         self._camera_window: tk.Toplevel | None = None
         self._camera_viewer_frame: tk.Frame | None = None
         self._view_cameras_button: tk.Button | None = None
+        self._right_scroll_canvas: tk.Canvas | None = None
         self._camera_viewer_visible = False
         self._camera_canvases: dict[str, tk.Canvas] = {}
         self._camera_image_refs: dict[str, tk.PhotoImage] = {}
@@ -1371,6 +1372,59 @@ class RobotCellOrchestratorGui:
         self.root.after(CAMERA_VIEW_REFRESH_MS, self._periodic_camera_view_refresh)
         self.root.after(READINESS_SCAN_MS, self._periodic_readiness_scan)
         self.root.after(PROCESS_SCAN_MS, self._periodic_process_scan)
+
+    def _make_scrollable_side_panel(self, parent: tk.Widget) -> tuple[tk.Frame, tk.Frame]:
+        container = tk.Frame(parent)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        content = tk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=content, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self._right_scroll_canvas = canvas
+
+        def refresh_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox('all'))
+
+        def match_content_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=max(1, int(event.width)))
+
+        def scroll_units(event: tk.Event) -> int:
+            if getattr(event, 'num', None) == 4:
+                return -3
+            if getattr(event, 'num', None) == 5:
+                return 3
+            delta = getattr(event, 'delta', 0)
+            return int(-1 * (delta / 120)) if delta else 0
+
+        def on_mousewheel(event: tk.Event) -> None:
+            units = scroll_units(event)
+            if units:
+                canvas.yview_scroll(units, 'units')
+
+        def bind_wheel(_event: tk.Event) -> None:
+            canvas.bind_all('<MouseWheel>', on_mousewheel)
+            canvas.bind_all('<Button-4>', on_mousewheel)
+            canvas.bind_all('<Button-5>', on_mousewheel)
+
+        def unbind_wheel(_event: tk.Event) -> None:
+            canvas.unbind_all('<MouseWheel>')
+            canvas.unbind_all('<Button-4>')
+            canvas.unbind_all('<Button-5>')
+
+        content.bind('<Configure>', refresh_scroll_region)
+        canvas.bind('<Configure>', match_content_width)
+        container.bind('<Enter>', bind_wheel)
+        container.bind('<Leave>', unbind_wheel)
+        canvas.bind('<Enter>', bind_wheel)
+        canvas.bind('<Leave>', unbind_wheel)
+        content.bind('<Enter>', bind_wheel)
+        content.bind('<Leave>', unbind_wheel)
+        return container, content
 
     @property
     def runtime_dir(self) -> Path:
@@ -1961,8 +2015,8 @@ class RobotCellOrchestratorGui:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=12, state=tk.DISABLED)
         self.log_text.grid(row=0, column=0, sticky='nsew')
 
-        right = tk.Frame(outer)
-        right.grid(row=0, column=1, rowspan=5, sticky='nsew')
+        right_container, right = self._make_scrollable_side_panel(outer)
+        right_container.grid(row=0, column=1, rowspan=5, sticky='nsew')
         right.columnconfigure(0, weight=1)
 
         station_frame = tk.LabelFrame(right, text='Robot Connection', padx=10, pady=8)
@@ -2062,7 +2116,7 @@ class RobotCellOrchestratorGui:
         camera_button_frame.columnconfigure(0, weight=1)
         self._view_cameras_button = tk.Button(
             camera_button_frame,
-            text='View Cameras',
+            text='Open Camera Window',
             command=self._view_cameras_clicked,
             width=24,
         )
@@ -2101,7 +2155,9 @@ class RobotCellOrchestratorGui:
 
     def _view_cameras_clicked(self) -> None:
         if self._camera_window is not None and self._camera_window.winfo_exists():
-            self._close_camera_window()
+            self._camera_window.deiconify()
+            self._camera_window.lift()
+            self._camera_window.focus_set()
             return
 
         window = tk.Toplevel(self.root)
@@ -2115,7 +2171,7 @@ class RobotCellOrchestratorGui:
         self._camera_viewer_visible = True
         if self._view_cameras_button is not None:
             self._view_cameras_button.configure(
-                text='Close Cameras',
+                text='Show Camera Window',
                 state=tk.NORMAL,
                 bg=RUNNING_BUTTON_BG,
                 activebackground=RUNNING_BUTTON_BG,
@@ -2133,7 +2189,7 @@ class RobotCellOrchestratorGui:
         self._camera_rendered_views.clear()
         if self._view_cameras_button is not None:
             self._view_cameras_button.configure(
-                text='View Cameras',
+                text='Open Camera Window',
                 state=tk.NORMAL,
                 bg=self.root.cget('bg'),
                 activebackground=self.root.cget('bg'),

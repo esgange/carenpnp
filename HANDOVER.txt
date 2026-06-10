@@ -54,6 +54,10 @@ Robot Cell Orchestrator shows this value in the right-side Robot Connection
 panel. Use Save there to update station_config, then stop and relaunch Robot
 Bringup so it reconnects to the new IP.
 
+The orchestrator opens bin/tray detect overlays from Camera Views in a separate
+Camera Detect Views window. Use Open Camera Window to create or refocus that
+viewer without hiding the main operator controls.
+
 Before launching robot bringup, verify the link:
 
    ping 192.168.200.1
