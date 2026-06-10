@@ -5,9 +5,10 @@ launching two Orbbec cameras by serial number.
 
 When the GUI starts, it reads the saved camera slots and automatically scans for
 connected Orbbec devices. Each configured slot is checked by serial number. If
-only one configured camera is connected, the GUI warns that only one camera is
-connected and still launches the connected camera. If no configured cameras are
-connected, the GUI warns the operator and does not launch any camera nodes.
+only one configured camera is connected, the GUI logs which camera is missing and
+still launches the connected camera without waiting for a dialog click. If no
+configured cameras are connected, the GUI reports the condition and does not
+launch any camera nodes.
 Detected cameras are launched one at a time: the second camera starts only after
 the first camera is verified by its ROS image topics.
 
@@ -99,13 +100,18 @@ The default slot names are:
 | 1 | `bin_camera` | `/bin_camera/color/image_raw`, `/bin_camera/depth/image_raw` |
 | 2 | `robot_camera` | `/robot_camera/color/image_raw`, `/robot_camera/depth/image_raw` |
 
+On startup auto-launch, any warnings about missing configured cameras are written
+to the scan log without blocking; if at least one configured camera is detected,
+that camera starts immediately. On manual `Launch Cameras`, warnings are still
+shown to the operator before launch continues.
+
 On startup and on manual `Launch Cameras`, the GUI:
 
 1. Scans connected Orbbec devices with `ros2 run orbbec_camera list_devices_node`.
 2. Compares detected serial numbers with configured slots.
-3. If no configured cameras are connected, warns the operator and launches
+3. If no configured cameras are connected, reports the condition and launches
    nothing.
-4. If only one configured camera is connected, warns the operator which camera
+4. If only one configured camera is connected, reports which camera
    is missing and launches only the connected camera.
 5. Launches detected configured slots sequentially, one terminal per camera.
    The terminal title and banner identify the exact camera node running in that

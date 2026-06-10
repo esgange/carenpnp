@@ -82,6 +82,11 @@ Manual lab flow:
    ros2 launch tray_perception tray_detect.launch.py
    ros2 launch tray_intercept tray_intercept.launch.py
 
+The Orbbec camera launcher auto-scans saved camera serial mappings on startup.
+If at least one configured camera is detected, it launches valid camera nodes
+immediately. Missing configured cameras are written to the launcher scan log and
+do not block startup behind a warning click.
+
 Offline/client PC deployment
 ----------------------------
 

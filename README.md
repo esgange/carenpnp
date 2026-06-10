@@ -218,6 +218,11 @@ ros2 launch tray_perception tray_detect.launch.py
 ros2 launch tray_intercept tray_intercept.launch.py
 ```
 
+The Orbbec camera launcher scans the saved camera serial mappings on startup.
+When at least one configured camera is detected, it starts valid camera nodes
+immediately; missing configured cameras are logged in the launcher instead of
+blocking startup behind a warning click.
+
 Headless production support stack:
 
 ```bash

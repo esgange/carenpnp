@@ -30,6 +30,18 @@ Recommended full workflow:
 ros2 launch camera_calibration camera_calibration.launch.py
 ```
 
+Start the Orbbec camera launcher before calibration when the cameras are not
+already running:
+
+```bash
+ros2 launch orbbec_camera_launcher camera_launcher.launch.py
+```
+
+The camera launcher scans saved serial-number mappings on startup. If at least
+one configured camera is detected, it starts the camera node immediately; missing
+configured cameras are reported in the launcher scan log instead of blocking on a
+warning dialog.
+
 GUI-only launch:
 
 ```bash

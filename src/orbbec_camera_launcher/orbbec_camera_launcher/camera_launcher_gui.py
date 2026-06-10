@@ -771,7 +771,8 @@ class CameraLauncherApp:
         errors = self._mapping_errors()
         if errors:
             title = 'Auto launch skipped' if auto else 'Camera mapping incomplete'
-            messagebox.showwarning(title, '\n'.join(errors))
+            if not auto:
+                messagebox.showwarning(title, '\n'.join(errors))
             self._append_scan_text('\nCamera launch skipped:\n' + '\n'.join(errors) + '\n')
             self._update_ui_state()
             return
@@ -780,10 +781,10 @@ class CameraLauncherApp:
         if not pairs:
             message = 'No configured camera slots have both serial number and camera name.'
             if auto:
-                messagebox.showwarning('Auto launch skipped', message)
+                self._append_scan_text(f'\nAuto launch skipped: {message}\n')
             else:
                 messagebox.showerror('No cameras configured', message)
-            self._append_scan_text(f'\n{message}\n')
+                self._append_scan_text(f'\n{message}\n')
             self._update_ui_state()
             return
 
@@ -856,7 +857,8 @@ class CameraLauncherApp:
                 message = 'No camera connected. No camera nodes were launched.'
             if warnings:
                 message = message + '\n\n' + '\n'.join(warnings)
-            messagebox.showwarning('No camera connected', message)
+            if not auto:
+                messagebox.showwarning('No camera connected', message)
             self._append_scan_text('\n' + message + '\n')
             self._update_ui_state()
             self.status_var.set('No camera connected')
@@ -873,13 +875,18 @@ class CameraLauncherApp:
             )
             if unconfigured:
                 message += '\n\n' + '\n'.join(warnings[: 1 + len(unconfigured)])
-            messagebox.showwarning('Partial camera startup', message)
+            if not auto:
+                messagebox.showwarning('Partial camera startup', message)
+            else:
+                self.status_var.set('Auto launching connected configured camera(s)')
             self._append_scan_text('\n' + message + '\n')
         elif warnings:
-            messagebox.showwarning(
-                'Partial camera startup',
-                '\n'.join(warnings) + '\n\nLaunching detected configured camera(s).',
-            )
+            message = '\n'.join(warnings) + '\n\nLaunching detected configured camera(s).'
+            if not auto:
+                messagebox.showwarning('Partial camera startup', message)
+            else:
+                self.status_var.set('Auto launching connected configured camera(s)')
+            self._append_scan_text('\n' + message + '\n')
 
         self._launch_camera_pairs(launch_pairs)
 
