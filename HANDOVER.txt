@@ -32,6 +32,28 @@ Fresh machine setup
    source station_config
    set +a
 
+Robot network / LAN2 debug
+--------------------------
+
+When connecting directly to the DOBOT controller on LAN2 for debug, use the
+robot IPv4 address:
+
+   192.168.200.1
+
+Set the PC wired adapter to the same subnet, for example:
+
+   IP address: 192.168.200.10
+   Netmask:    255.255.255.0
+   Gateway:    leave empty, or use 192.168.200.1 if required
+
+The station config for a LAN2 debug connection should include:
+
+   ROBOT_IP_ADDRESS=192.168.200.1
+
+Before launching robot bringup, verify the link:
+
+   ping 192.168.200.1
+
 Main runtime entry points
 -------------------------
 
