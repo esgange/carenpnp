@@ -10,7 +10,7 @@
 ROS_LOCALHOST_ONLY=true
 
 # DOBOT controller connection.
-ROBOT_IP_ADDRESS=192.168.20.202
+ROBOT_IP_ADDRESS=192.168.200.1
 ROBOT_TYPE=cr10
 
 # Per-arm identity used by the optional external bridge.

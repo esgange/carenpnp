@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import queue
 import shlex
@@ -127,6 +128,8 @@ CALIBRATION_PATTERNS = {
 CALIBRATION_EYE_ON_HAND = 'Eye-on-hand'
 CALIBRATION_EYE_TO_HAND = 'Eye-to-hand'
 CALIBRATION_PLATFORM = 'Platform'
+ROBOT_IP_CONFIG_KEY = 'ROBOT_IP_ADDRESS'
+ROBOT_LAN2_DEFAULT_IP = '192.168.200.1'
 
 
 def _looks_like_workspace_root(path: Path) -> bool:
@@ -305,6 +308,59 @@ def key_value_config(path: Path) -> dict[str, str]:
     except Exception:
         return {}
     return values
+
+
+def update_key_value_config(path: Path, key: str, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+    except FileNotFoundError:
+        lines = []
+
+    updated = False
+    output: list[str] = []
+    for raw_line in lines:
+        newline = '\n' if raw_line.endswith('\n') else ''
+        content = raw_line[:-1] if newline else raw_line
+        stripped = content.strip()
+        if not stripped or stripped.startswith('#') or '=' not in stripped:
+            output.append(raw_line)
+            continue
+
+        leading = content[:len(content) - len(content.lstrip())]
+        body = content.lstrip()
+        export_prefix = ''
+        if body.startswith('export '):
+            export_prefix = 'export '
+            body = body[len('export '):].strip()
+        raw_key, _raw_value = body.split('=', 1)
+        if raw_key.strip() == key:
+            output.append(f'{leading}{export_prefix}{key}={value}{newline}')
+            updated = True
+        else:
+            output.append(raw_line)
+
+    if not updated:
+        if output and not output[-1].endswith('\n'):
+            output[-1] += '\n'
+        if output and output[-1].strip():
+            output.append('\n')
+        output.append(f'{key}={value}\n')
+
+    path.write_text(''.join(output), encoding='utf-8')
+
+
+def normalize_ipv4_address(value: str) -> str | None:
+    candidate = str(value or '').strip()
+    if not candidate:
+        return None
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if address.version != 4:
+        return None
+    return str(address)
 
 
 def _load_yaml_mapping(path: Path) -> dict | None:
@@ -1260,6 +1316,9 @@ class RobotCellOrchestratorGui:
         self._cell_bridge_process_group: int | None = None
         self._cell_bridge_mode: str | None = None
         self._cell_bridge_button: tk.Button | None = None
+        self._robot_ip_entry: tk.Entry | None = None
+        self._robot_ip_save_button: tk.Button | None = None
+        self._robot_ip_reload_button: tk.Button | None = None
         self._calibration_buttons: dict[str, tk.Button] = {}
         self._calibration_clear_buttons: dict[str, tk.Button] = {}
         self._service_labels: dict[str, tk.Label] = {}
@@ -1280,6 +1339,7 @@ class RobotCellOrchestratorGui:
         self.status_var = tk.StringVar(value='Idle')
         self.robot_status_var = tk.StringVar(value=ROBOT_STATUS_LABELS[self._robot_status])
         self.mode_var = tk.StringVar(value='Offline')
+        self.robot_ip_var = tk.StringVar(value=self._station_robot_ip_or_default())
         self.calibration_status_var = tk.StringVar(value='Calibration: scanning...')
         self.teach_status_var = tk.StringVar(value='Teach files: scanning...')
         self.runtime_status_var = tk.StringVar(value='Runtime: scanning...')
@@ -1355,6 +1415,66 @@ class RobotCellOrchestratorGui:
     @property
     def station_config_file(self) -> Path:
         return workspace_path('station_config')
+
+    def _station_robot_ip(self) -> str:
+        return key_value_config(self.station_config_file).get(ROBOT_IP_CONFIG_KEY, '').strip()
+
+    def _station_robot_ip_or_default(self) -> str:
+        return self._station_robot_ip() or ROBOT_LAN2_DEFAULT_IP
+
+    def _reload_robot_ip_clicked(self) -> None:
+        self.robot_ip_var.set(self._station_robot_ip_or_default())
+        self._log(f'Reloaded robot IP from station_config: {self.robot_ip_var.get().strip()}')
+
+    def _save_robot_ip_clicked(self) -> None:
+        if self._running:
+            messagebox.showwarning(
+                'Cycle Running',
+                'Stop the current cycle before changing the robot IP address.',
+                parent=self.root,
+            )
+            return
+
+        raw_ip = self.robot_ip_var.get().strip()
+        normalized_ip = normalize_ipv4_address(raw_ip)
+        if normalized_ip is None:
+            messagebox.showerror(
+                'Invalid Robot IP',
+                f'Enter a valid IPv4 address for {ROBOT_IP_CONFIG_KEY}.',
+                parent=self.root,
+            )
+            self._log(f'Invalid robot IP rejected: {raw_ip!r}')
+            return
+
+        previous_ip = self._station_robot_ip()
+        try:
+            update_key_value_config(self.station_config_file, ROBOT_IP_CONFIG_KEY, normalized_ip)
+        except Exception as exc:
+            messagebox.showerror(
+                'Robot IP Save Failed',
+                f'Could not update {self.station_config_file}: {exc}',
+                parent=self.root,
+            )
+            self._log(f'Failed to save robot IP {normalized_ip}: {exc}')
+            return
+
+        self.robot_ip_var.set(normalized_ip)
+        self._log(f'Saved robot IP: {previous_ip or "unset"} -> {normalized_ip}')
+        if self._launch_processes.get('robot_bringup') is not None:
+            messagebox.showinfo(
+                'Restart Robot Bringup',
+                'Robot IP saved. Stop and relaunch Robot Bringup to connect to the new controller IP.',
+                parent=self.root,
+            )
+
+    def _refresh_robot_ip_controls(self) -> None:
+        setting_state = tk.DISABLED if self._running else tk.NORMAL
+        if self._robot_ip_entry is not None:
+            self._robot_ip_entry.configure(state=setting_state)
+        if self._robot_ip_save_button is not None:
+            self._robot_ip_save_button.configure(state=setting_state)
+        if self._robot_ip_reload_button is not None:
+            self._robot_ip_reload_button.configure(state=setting_state)
 
     @property
     def cell_bridge_source_dir(self) -> Path:
@@ -1845,8 +1965,36 @@ class RobotCellOrchestratorGui:
         right.grid(row=0, column=1, rowspan=5, sticky='nsew')
         right.columnconfigure(0, weight=1)
 
+        station_frame = tk.LabelFrame(right, text='Robot Connection', padx=10, pady=8)
+        station_frame.grid(row=0, column=0, sticky='ew')
+        station_frame.columnconfigure(1, weight=1)
+        tk.Label(station_frame, text='Robot IP').grid(row=0, column=0, sticky='w')
+        self._robot_ip_entry = tk.Entry(station_frame, textvariable=self.robot_ip_var, width=16)
+        self._robot_ip_entry.grid(row=0, column=1, sticky='ew', padx=(8, 6))
+        self._robot_ip_entry.bind('<Return>', lambda _event: self._save_robot_ip_clicked())
+        self._robot_ip_save_button = tk.Button(
+            station_frame,
+            text='Save',
+            command=self._save_robot_ip_clicked,
+            width=7,
+        )
+        self._robot_ip_save_button.grid(row=0, column=2, sticky='ew', padx=(0, 4))
+        self._robot_ip_reload_button = tk.Button(
+            station_frame,
+            text='Reload',
+            command=self._reload_robot_ip_clicked,
+            width=7,
+        )
+        self._robot_ip_reload_button.grid(row=0, column=3, sticky='ew')
+        tk.Label(
+            station_frame,
+            text=f'LAN2 default: {ROBOT_LAN2_DEFAULT_IP}',
+            anchor='w',
+            fg='#4a4a4a',
+        ).grid(row=1, column=0, columnspan=4, sticky='ew', pady=(4, 0))
+
         dropdown_frame = tk.LabelFrame(right, text='Offline Teach Selection', padx=10, pady=8)
-        dropdown_frame.grid(row=0, column=0, sticky='ew')
+        dropdown_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
         dropdown_frame.columnconfigure(1, weight=1)
         dropdown_frame.columnconfigure(2, weight=0)
         self._make_teach_picker_button(dropdown_frame, 'Bin', TEACH_KIND_BIN, self.bin_teach_var, self.bin_teach_dir, 0)
@@ -1854,7 +2002,7 @@ class RobotCellOrchestratorGui:
         self._make_teach_picker_button(dropdown_frame, 'Tray', TEACH_KIND_TRAY, self.tray_teach_var, self.tray_teach_dir, 2)
 
         calibration_frame = tk.LabelFrame(right, text='Calibration Files', padx=10, pady=8)
-        calibration_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
+        calibration_frame.grid(row=2, column=0, sticky='ew', pady=(10, 0))
         calibration_frame.columnconfigure(1, weight=1)
         calibration_frame.columnconfigure(2, weight=0)
         self._make_calibration_picker_button(
@@ -1877,7 +2025,7 @@ class RobotCellOrchestratorGui:
         )
 
         bridge_frame = tk.LabelFrame(right, text='External Bridge', padx=10, pady=8)
-        bridge_frame.grid(row=2, column=0, sticky='ew', pady=(10, 0))
+        bridge_frame.grid(row=3, column=0, sticky='ew', pady=(10, 0))
         bridge_frame.columnconfigure(0, weight=1)
         self._cell_bridge_button = tk.Button(
             bridge_frame,
@@ -1888,7 +2036,7 @@ class RobotCellOrchestratorGui:
         self._cell_bridge_button.grid(row=0, column=0, sticky='ew')
 
         launch_frame = tk.LabelFrame(right, text='Node Launcher', padx=10, pady=8)
-        launch_frame.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        launch_frame.grid(row=4, column=0, sticky='ew', pady=(10, 0))
         launch_frame.columnconfigure(0, weight=1)
         self._node_launcher_headless_button = tk.Checkbutton(
             launch_frame,
@@ -1910,7 +2058,7 @@ class RobotCellOrchestratorGui:
             self._launch_buttons[key] = button
 
         camera_button_frame = tk.LabelFrame(right, text='Camera Views', padx=10, pady=8)
-        camera_button_frame.grid(row=4, column=0, sticky='ew', pady=(10, 0))
+        camera_button_frame.grid(row=5, column=0, sticky='ew', pady=(10, 0))
         camera_button_frame.columnconfigure(0, weight=1)
         self._view_cameras_button = tk.Button(
             camera_button_frame,
@@ -2142,11 +2290,13 @@ class RobotCellOrchestratorGui:
         current = self._resolve_calibration_path(kind, variable.get())
         initial_dir = current.parent if current is not None else workspace_path('calibration')
         initial_dir.mkdir(parents=True, exist_ok=True)
+        pattern = CALIBRATION_PATTERNS.get(kind, '*.yaml')
+        expected_label = f'{kind} calibration ({pattern})'
         selected = filedialog.askopenfilename(
             parent=self.root,
             title=f'Select {kind} calibration file',
             initialdir=str(initial_dir),
-            filetypes=(('YAML files', '*.yaml *.yml'), ('All files', '*')),
+            filetypes=((expected_label, pattern),),
         )
         if not selected:
             return
@@ -2573,6 +2723,7 @@ class RobotCellOrchestratorGui:
             )
 
         self._refresh_calibration_button_texts()
+        self._refresh_robot_ip_controls()
         for service_name, ready in self.node.service_readiness_map().items():
             label = self._service_labels.get(service_name)
             if label is not None:
@@ -3525,6 +3676,7 @@ class RobotCellOrchestratorGui:
         self.tray_ee_angle_spinbox.configure(state=setting_state)
         self.offline_button.configure(state=setting_state)
         self.online_button.configure(state=setting_state)
+        self._refresh_robot_ip_controls()
         self._refresh_step_controls()
         self._refresh_teach_button_texts()
         self._refresh_calibration_button_texts()

@@ -128,6 +128,12 @@ X/Y/RZ offsets, and the Robot Cell Orchestrator window geometry. The Auto Repick
 checkbox calls `item_pick/set_auto_repick` and is applied again at the start of
 each pick side.
 
+The right-side **Robot Connection** panel shows `ROBOT_IP_ADDRESS` from the root
+`station_config`. Edit the IP and press **Save** to update that file. Robot
+Bringup reads `station_config` when it launches, so stop and relaunch Robot
+Bringup after changing the IP. For direct LAN2 debug, the controller IP is
+normally `192.168.200.1`; set the PC wired adapter to the same `/24` subnet.
+
 Switching the Robot Cell Orchestrator GUI between **Offline** and **Online**
 only changes the orchestration mode. It does not launch or stop robot,
 perception, RViz, or camera nodes. Start and stop support nodes from the
@@ -206,6 +212,11 @@ The selections are persisted in
 `config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml`.
 The orchestrator passes the selected paths explicitly to calibration consumers;
 it does not choose the newest or legacy calibration automatically.
+Each calibration picker filters the file dialog to the matching filename class:
+`axab_calibration_eyeonhand_*.yaml` for Eye-on-hand,
+`axab_calibration_eyetohand_*.yaml` for Eye-to-hand, and
+`platform_calibration_*.yaml` for Platform. After selection, the YAML metadata is
+still checked so a wrongly named file is rejected.
 
 The external online start API is:
 

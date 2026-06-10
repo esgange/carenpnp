@@ -50,6 +50,10 @@ The station config for a LAN2 debug connection should include:
 
    ROBOT_IP_ADDRESS=192.168.200.1
 
+Robot Cell Orchestrator shows this value in the right-side Robot Connection
+panel. Use Save there to update station_config, then stop and relaunch Robot
+Bringup so it reconnects to the new IP.
+
 Before launching robot bringup, verify the link:
 
    ping 192.168.200.1

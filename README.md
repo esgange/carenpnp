@@ -170,7 +170,7 @@ Important fields:
 
 ```bash
 ROS_LOCALHOST_ONLY=true
-ROBOT_IP_ADDRESS=192.168.20.202
+ROBOT_IP_ADDRESS=192.168.200.1
 ROBOT_TYPE=cr10
 ARM_NUMBER=1
 ROBOT_ARM_ID=arm_01
@@ -179,6 +179,11 @@ ROBOT_ARM_ID=arm_01
 `ROS_LOCALHOST_ONLY=true` keeps ROS discovery on this PC. The launch files also
 set `ROS_LOCALHOST_ONLY=1` for the orchestrated nodes, so the default cell
 runtime stays local unless you deliberately change the station config.
+
+Robot Cell Orchestrator also exposes this robot IP in its **Robot Connection**
+panel. Edit the value there and press **Save** to update `ROBOT_IP_ADDRESS` in
+`station_config`; stop and relaunch Robot Bringup after changing it. The LAN2
+debug/default controller IP is `192.168.200.1`.
 
 `ROS_DOMAIN_ID` is normally inherited from the shell environment. Set it before
 launching if you need a non-default domain:
@@ -266,8 +271,14 @@ the IP. You can still override a calibration path explicitly with launch
 arguments such as:
 
 ```bash
-calibration_file:=/abs/path/to/axab_calibration_eyeonhand_09062026_192.168.20.202.yaml
+calibration_file:=/abs/path/to/axab_calibration_eyeonhand_09062026_192.168.200.1.yaml
 ```
+
+Robot Cell Orchestrator calibration pickers filter by the expected file class:
+eye-on-hand pickers show `axab_calibration_eyeonhand_*.yaml`, eye-to-hand
+pickers show `axab_calibration_eyetohand_*.yaml`, and platform pickers show
+`platform_calibration_*.yaml`. The selected file is still validated by YAML
+metadata before it is accepted.
 
 ## Item Detect To Item Pick Handoff
 
