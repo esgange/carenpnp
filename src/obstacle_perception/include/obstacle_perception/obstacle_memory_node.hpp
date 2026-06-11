@@ -77,7 +77,7 @@ private:
   bool skip_if_live_{true};
   double blue_tint_{0.3};
   bool frustum_enable_{true};
-  std::string frustum_frame_{"calibrated_camera_link"};
+  std::string frustum_frame_{"arm_calibrated_camera_link"};
   double frustum_near_{0.1};
   double frustum_far_{3.0};
   double frustum_hfov_deg_{70.0};

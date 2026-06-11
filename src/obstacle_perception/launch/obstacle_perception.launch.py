@@ -95,6 +95,7 @@ def generate_launch_description():
     calibration_child_frame = LaunchConfiguration("calibration_child_frame")
     calibration_dir = LaunchConfiguration("calibration_dir")
     calibration_file = LaunchConfiguration("calibration_file")
+    robot_ip_address = LaunchConfiguration("robot_ip_address")
 
     return LaunchDescription(
         [
@@ -123,7 +124,7 @@ def generate_launch_description():
             DeclareLaunchArgument("memory_blue_tint", default_value="0.3"),
             DeclareLaunchArgument("memory_skip_live_volume", default_value="true"),
             DeclareLaunchArgument("frustum_enable", default_value="true"),
-            DeclareLaunchArgument("frustum_frame", default_value="calibrated_camera_link"),
+            DeclareLaunchArgument("frustum_frame", default_value="arm_calibrated_camera_link"),
             DeclareLaunchArgument("frustum_near", default_value="0.1"),
             DeclareLaunchArgument("frustum_far", default_value="3.0"),
             DeclareLaunchArgument("frustum_hfov_deg", default_value="65.0"),
@@ -137,7 +138,7 @@ def generate_launch_description():
             DeclareLaunchArgument("publish_pointcloud", default_value="true"),
             DeclareLaunchArgument("publish_markers", default_value="true"),
             DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
-            DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
+            DeclareLaunchArgument("calibration_child_frame", default_value="arm_calibrated_camera_link"),
             DeclareLaunchArgument(
                 "calibration_dir", default_value=_repo_path("calibration")
             ),
@@ -145,6 +146,11 @@ def generate_launch_description():
                 "calibration_file",
                 default_value="",
                 description="Optional explicit calibration YAML; empty means auto-discover newest eye-on-hand calibration in calibration_dir.",
+            ),
+            DeclareLaunchArgument(
+                "robot_ip_address",
+                default_value="",
+                description="Robot controller IP for calibration file discovery. Empty uses ROBOT_IP_ADDRESS/station_config.",
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
@@ -160,6 +166,7 @@ def generate_launch_description():
                     "child_frame": calibration_child_frame,
                     "calibration_dir": calibration_dir,
                     "calibration_file": calibration_file,
+                    "robot_ip_address": robot_ip_address,
                     "show_overlay_window": "false",
                     "color_topic": color_topic,
                     "depth_topic": depth_topic,

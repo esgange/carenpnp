@@ -45,12 +45,16 @@ ros2 launch obstacle_perception obstacle_perception.launch.py \
 The launch file starts:
 
 - `aruco_perception.launch.py` with calibration enabled, so
-  `Link6 -> calibrated_camera_link` is published from the latest calibration;
+  `Link6 -> arm_calibrated_camera_link` is published from the latest calibration;
 - `obstacle_perception_node` for live obstacles;
 - `obstacle_memory_node` when `enable_memory=true`.
 
 If calibration is enabled and no usable calibration YAML exists, launch fails
 early with a clear error.
+
+Because this launch includes `aruco_perception`, robot IP `192.168.200.1`
+requires the operator to choose the eye-on-hand calibration. Pass
+`calibration_file:=<path>` for headless operation.
 
 ## Inputs
 
@@ -71,7 +75,7 @@ Camera topics can be overridden with `color_topic`, `depth_topic`, and
 | `/obstacles/markers` | `visualization_msgs/msg/MarkerArray` | Live voxel markers. |
 | `/obstacles/memory_points` | `sensor_msgs/msg/PointCloud2` | Persistent memory cloud when enabled. |
 
-Live outputs are published in `calibrated_camera_link` by default. Memory output
+Live outputs are published in `arm_calibrated_camera_link` by default. Memory output
 is transformed into `target_frame`, which defaults to `base_link`.
 
 ## Important Parameters
@@ -113,7 +117,7 @@ Memory node:
 ros2 topic hz /obstacles/points
 ros2 topic hz /obstacles/markers
 ros2 topic hz /obstacles/memory_points
-ros2 run tf2_ros tf2_echo Link6 calibrated_camera_link
+ros2 run tf2_ros tf2_echo Link6 arm_calibrated_camera_link
 ```
 
 ## Notes

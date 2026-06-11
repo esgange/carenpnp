@@ -35,6 +35,7 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/robot_identity.hpp>
 #include <dobot_common/workspace_paths.hpp>
 
 namespace
@@ -5851,6 +5852,8 @@ public:
       "calibration_child_frame", "bin_calibrated_camera_link");
     calibration_dir_ = declare_parameter<std::string>("calibration_dir", defaultCalibrationDir());
     calibration_file_ = declare_parameter<std::string>("calibration_file", "");
+    robot_ip_address_ = dobot_common::robot_identity::resolveRobotIpAddress(
+      declare_parameter<std::string>("robot_ip_address", ""), __FILE__);
     auto_discover_calibration_ = declare_parameter<bool>("auto_discover_calibration", true);
     const std::string requested_item_tf_parent_frame =
       declare_parameter<std::string>("item_tf_parent_frame", calibration_child_frame_);
@@ -5905,15 +5908,23 @@ public:
 
     if (use_calibration_)
     {
-      if (calibration_file_.empty() && auto_discover_calibration_)
+      if (
+        calibration_file_.empty() &&
+        auto_discover_calibration_ &&
+        !dobot_common::robot_identity::requiresManualCalibrationSelection(robot_ip_address_))
       {
         calibration_file_ = findLatestCalibrationFile();
       }
       if (calibration_file_.empty())
       {
+        const bool manual_selection_required =
+          dobot_common::robot_identity::requiresManualCalibrationSelection(robot_ip_address_);
         throw std::runtime_error(
-                "use_calibration=true but no calibration file is available. "
-                "Set calibration_file or add a YAML to calibration_dir.");
+                "use_calibration=true but no calibration file is available. " +
+                std::string(
+                  manual_selection_required
+                  ? "Robot IP 192.168.200.1 requires calibration_file to be selected explicitly."
+                  : "Set calibration_file or add a YAML to calibration_dir."));
       }
 
       std::string reason;
@@ -10648,6 +10659,7 @@ private:
   std::string calibration_child_frame_;
   std::string calibration_dir_;
   std::string calibration_file_;
+  std::string robot_ip_address_;
   std::string item_tf_parent_frame_;
   std::string item_pose_array_topic_;
   std::string profiles_dir_;

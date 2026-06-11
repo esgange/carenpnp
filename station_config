@@ -17,5 +17,5 @@ ARM_NUMBER=1
 
 # Robot bringup. Robot Cell Orchestrator passes this file to cr_robot_ros2.
 ROS_LOCALHOST_ONLY=true
-ROBOT_IP_ADDRESS=192.168.200.1
+ROBOT_IP_ADDRESS=192.168.20.201
 ROBOT_TYPE=cr10

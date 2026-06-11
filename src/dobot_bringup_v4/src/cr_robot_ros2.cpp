@@ -127,6 +127,7 @@ void CRRobotRos2::init()
     std::string serviceRelJointMovJ = kRobotName + "/dobot_bringup_ros2/srv/RelJointMovJ";
     std::string serviceGetCurrentCommandId = kRobotName + "/dobot_bringup_ros2/srv/GetCurrentCommandId";
     std::string topicFeedInfo = kRobotName + "/dobot_bringup_ros2/msg/FeedInfo";
+    std::string topic200mSDIStatus = kRobotName + "/dobot_bringup_ros2/DIStatus_200mS";
 
     kServiceEnableRobot = this->create_service<dobot_msgs_v4::srv::EnableRobot>(serviceEnableRobot, std::bind(&CRRobotRos2::EnableRobot, this, std::placeholders::_1, std::placeholders::_2));
     kServiceDisableRobot = this->create_service<dobot_msgs_v4::srv::DisableRobot>(serviceDisableRobot, std::bind(&CRRobotRos2::DisableRobot, this, std::placeholders::_1, std::placeholders::_2));
@@ -221,8 +222,77 @@ void CRRobotRos2::init()
     commander_ = std::make_shared<CRCommanderRos2>(robotIp);
     commander_->init();
     kPublisherInfo = this->create_publisher<std_msgs::msg::String>(topicFeedInfo, 10);
+    kPublisher200mSDIStatus = this->create_publisher<std_msgs::msg::String>(topic200mSDIStatus, 10);
     threadPubFeedBackInfo = std::thread(&CRRobotRos2::pubFeedBackInfo, this);
     threadPubFeedBackInfo.detach();
+    threadPub200mSDIStatus = std::thread(&CRRobotRos2::pub200mSDIStatus, this, robotIp);
+    threadPub200mSDIStatus.detach();
+}
+
+void CRRobotRos2::pub200mSDIStatus(const std::string robotIp)
+{
+    rclcpp::Rate reconnectRate(1);
+
+    while (rclcpp::ok())
+    {
+        TcpClient slowFeedbackTcp(robotIp, 30005);
+
+        try
+        {
+            slowFeedbackTcp.connect();
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Publishing 200 ms DI status from %s:30005 on /dobot_bringup_ros2/DIStatus_200mS",
+                robotIp.c_str());
+
+            while (rclcpp::ok() && slowFeedbackTcp.isConnect())
+            {
+                RealTimeData slowFeedbackData{};
+                uint32_t hasRead = 0;
+                auto *rawData = reinterpret_cast<uint8_t *>(&slowFeedbackData);
+
+                if (!slowFeedbackTcp.tcpRecv(rawData, sizeof(RealTimeData), hasRead, 1000))
+                {
+                    continue;
+                }
+
+                if (hasRead != sizeof(RealTimeData) || slowFeedbackData.len != sizeof(RealTimeData))
+                {
+                    RCLCPP_WARN(
+                        this->get_logger(),
+                        "Skipping 30005 feedback packet: len=%u, bytes_read=%u",
+                        slowFeedbackData.len,
+                        hasRead);
+                    continue;
+                }
+
+                nlohmann::json root;
+                root["digital_input_bits"] = slowFeedbackData.digital_input_bits;
+                root["source_port"] = 30005;
+
+                std_msgs::msg::String msg;
+                msg.data = root.dump();
+                kPublisher200mSDIStatus->publish(msg);
+            }
+        }
+        catch (const TcpClientException &err)
+        {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "30005 DI status stream disconnected: %s",
+                err.what());
+        }
+        catch (const std::exception &err)
+        {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "30005 DI status stream error: %s",
+                err.what());
+        }
+
+        slowFeedbackTcp.close();
+        reconnectRate.sleep();
+    }
 }
 
 void CRRobotRos2::pubFeedBackInfo()

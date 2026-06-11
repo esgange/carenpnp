@@ -1,1 +1,1 @@
-/home/erds/DOBOT_pickn_place/teach/item_teach/item_paper_cutlery_bin_blue_bin_08052026.yaml
+/home/erds/DOBOT_pickn_place/teach/item_teach_yolo/item_paper_cutlery_bin_green_bin_11062026/item_paper_cutlery_bin_green_bin_11062026.yaml

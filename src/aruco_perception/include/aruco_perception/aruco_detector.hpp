@@ -107,6 +107,7 @@ private:
   std::string camera_frame_id_;
   bool use_calibration_{true};
   bool publish_static_calibration_tf_{true};
+  bool publish_marker_tfs_{true};
   std::string calibration_file_;
   std::string calibration_parent_frame_;
   std::string calibration_child_frame_;

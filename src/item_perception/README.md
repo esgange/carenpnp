@@ -57,7 +57,7 @@ When DOBOT bringup is running, `bin_teach` caches the current robot joints from
 `arm_joints_at_save` in saved bin profiles. `item_teach` recalls those joints
 with `MovJ` when loading a bin-teach profile.
 
-By default, `bin_teach` now auto-loads the current platform calibration from:
+By default, `bin_teach` auto-loads the current platform calibration from:
 
 ```text
 WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>_<ddmmyyyy>_<robot_ip>.yaml
@@ -73,6 +73,11 @@ Set `use_platform_calibration:=false` only when you intentionally want a
 camera-relative bin-teach workflow.
 Set `platform_calibration_file:=/abs/path/to/file.yaml` only when you want to
 override auto-discovery.
+
+When the active robot IP is `192.168.200.1`, auto-discovery is disabled:
+`bin_teach` asks for the eye-to-hand and platform files, while `item_teach` and
+`item_detect` ask for the eye-to-hand file. Headless launches must pass the
+required file paths explicitly.
 
 Common launch overrides:
 
@@ -108,10 +113,12 @@ starts another window and also keeps Seek ON.
 
 ## Calibration
 
-Both nodes default to the current eye-on-hand calibration workflow.
+Both nodes default to the current eye-to-hand calibration workflow.
 
 - Calibration files are discovered from `WORKSPACE_ROOT/calibration` unless
   `calibration_file` is provided.
+- For robot IP `192.168.200.1`, launch requires operator selection instead of
+  choosing the newest file.
 - `item_teach` and `item_detect` publish the static calibration transform in-node
   when calibration is enabled.
 - Item poses are parented to `arm_calibrated_camera_link`.

@@ -3,7 +3,12 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetLaunchConfiguration,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -36,6 +41,59 @@ def _workspace_root() -> Path:
 
 def _repo_path(*parts: str) -> str:
     return str(_workspace_root().joinpath(*parts))
+
+
+def _calibration_selection_helper():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / "src" / "dobot_bringup_v4" / "launch" / "calibration_selection.py",
+            parent / "install" / "cr_robot_ros2" / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+            parent / "cr_robot_ros2" / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+            parent / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location("_dobot_calibration_selection", helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+    raise RuntimeError("Could not find calibration_selection.py helper")
+
+
+def _manual_platform_calibration_setup(context, *args, **kwargs):
+    del args, kwargs
+    use_platform = LaunchConfiguration("use_platform_calibration").perform(context).strip().lower()
+    explicit_file = LaunchConfiguration("platform_calibration_file").perform(context).strip()
+    if use_platform not in ("1", "true", "yes", "on") or explicit_file:
+        return []
+
+    selection = _calibration_selection_helper()
+    robot_ip_address = selection.resolve_robot_ip_address(
+        LaunchConfiguration("robot_ip_address").perform(context)
+    )
+    if not selection.requires_manual_selection(robot_ip_address):
+        return []
+
+    selected_file = selection.choose_required_calibration(
+        calibration_dir=LaunchConfiguration("platform_calibration_dir").perform(context),
+        filename_pattern="platform_calibration_*.yaml",
+        calibration_label="platform calibration",
+        launch_label="item_perception_yolo/bin_teach.launch",
+        robot_ip_address=robot_ip_address,
+        launch_argument_name="platform_calibration_file",
+    )
+    return [
+        SetLaunchConfiguration("platform_calibration_file", selected_file),
+        SetLaunchConfiguration("auto_discover_platform_calibration", "false"),
+    ]
+
 
 def _ros_domain_action():
     import importlib.util
@@ -79,6 +137,7 @@ def generate_launch_description():
     auto_discover_platform_calibration = LaunchConfiguration("auto_discover_platform_calibration")
     platform_calibration_dir = LaunchConfiguration("platform_calibration_dir")
     platform_calibration_file = LaunchConfiguration("platform_calibration_file")
+    robot_ip_address = LaunchConfiguration("robot_ip_address")
     marker_prefix = LaunchConfiguration("marker_prefix")
     overlay_topic = LaunchConfiguration("overlay_topic")
     detections_topic = LaunchConfiguration("detections_topic")
@@ -117,6 +176,7 @@ def generate_launch_description():
             "child_frame": calibration_child_frame,
             "calibration_dir": calibration_dir,
             "calibration_file": calibration_file,
+            "robot_ip_address": robot_ip_address,
             "show_overlay_window": show_aruco_overlay,
             "publish_overlay": publish_aruco_overlay,
             "overlay_rate_hz": aruco_overlay_rate_hz,
@@ -142,6 +202,7 @@ def generate_launch_description():
             "auto_discover_platform_calibration": auto_discover_platform_calibration,
             "platform_calibration_dir": platform_calibration_dir,
             "platform_calibration_file": platform_calibration_file,
+            "robot_ip_address": robot_ip_address,
             "color_topic": color_topic,
             "marker_prefix": marker_prefix,
             "overlay_topic": overlay_topic,
@@ -173,18 +234,23 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_info_topic", default_value="/robot_camera/color/camera_info"),
         DeclareLaunchArgument("use_calibration", default_value="true"),
         DeclareLaunchArgument("calibration_parent_frame", default_value="Link6"),
-        DeclareLaunchArgument("calibration_child_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("calibration_child_frame", default_value="arm_calibrated_camera_link"),
         DeclareLaunchArgument("calibration_dir", default_value=_repo_path("calibration")),
         DeclareLaunchArgument("calibration_file", default_value=""),
         DeclareLaunchArgument("target_frame", default_value="bin_teach_target"),
-        DeclareLaunchArgument("marker_parent_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("marker_parent_frame", default_value="arm_calibrated_camera_link"),
         DeclareLaunchArgument("base_frame", default_value="base_link"),
         DeclareLaunchArgument("gripper_frame", default_value="Link6"),
-        DeclareLaunchArgument("camera_frame", default_value="calibrated_camera_link"),
+        DeclareLaunchArgument("camera_frame", default_value="arm_calibrated_camera_link"),
         DeclareLaunchArgument("use_platform_calibration", default_value="true"),
         DeclareLaunchArgument("auto_discover_platform_calibration", default_value="true"),
         DeclareLaunchArgument("platform_calibration_dir", default_value=_repo_path("calibration")),
         DeclareLaunchArgument("platform_calibration_file", default_value=""),
+        DeclareLaunchArgument(
+            "robot_ip_address",
+            default_value="",
+            description="Robot controller IP used for calibration selection. Empty uses ROBOT_IP_ADDRESS/station_config.",
+        ),
         DeclareLaunchArgument("marker_prefix", default_value="aruco_marker"),
         DeclareLaunchArgument("overlay_topic", default_value="/aruco_overlay"),
         DeclareLaunchArgument("detections_topic", default_value="/aruco_detections"),
@@ -214,6 +280,7 @@ def generate_launch_description():
         DeclareLaunchArgument("align_up_timeout_sec", default_value="60.0"),
         DeclareLaunchArgument("align_up_user_index", default_value="0"),
         DeclareLaunchArgument("align_restore_speed_factor_percent", default_value="100"),
+        OpaqueFunction(function=_manual_platform_calibration_setup),
         aruco_launch,
         bin_teach,
     ])

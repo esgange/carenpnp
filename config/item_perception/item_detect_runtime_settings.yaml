@@ -1,5 +1,5 @@
-view_mode: rgb
+view_mode: binarized
 overlay_enabled: true
-blob_tolerance_percent: 50
+blob_tolerance_percent: 30
 seek_window_sec: 60
 seek_decay_sec: 1

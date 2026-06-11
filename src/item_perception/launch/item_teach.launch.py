@@ -3,7 +3,7 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetLaunchConfiguration
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -43,6 +43,58 @@ def _workspace_root() -> Path:
 def _repo_path(*parts: str) -> str:
     return str(_workspace_root().joinpath(*parts))
 
+
+def _calibration_selection_helper():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / "src" / "dobot_bringup_v4" / "launch" / "calibration_selection.py",
+            parent / "install" / "cr_robot_ros2" / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+            parent / "cr_robot_ros2" / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+            parent / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location("_dobot_calibration_selection", helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+    raise RuntimeError("Could not find calibration_selection.py helper")
+
+
+def _manual_calibration_setup(context, *args, **kwargs):
+    del args, kwargs
+    use_calibration = LaunchConfiguration("use_calibration").perform(context).strip().lower()
+    explicit_file = LaunchConfiguration("calibration_file").perform(context).strip()
+    if use_calibration not in ("1", "true", "yes", "on") or explicit_file:
+        return []
+
+    selection = _calibration_selection_helper()
+    robot_ip_address = selection.resolve_robot_ip_address(
+        LaunchConfiguration("robot_ip_address").perform(context)
+    )
+    if not selection.requires_manual_selection(robot_ip_address):
+        return []
+
+    selected_file = selection.choose_required_calibration(
+        calibration_dir=LaunchConfiguration("calibration_dir").perform(context),
+        filename_pattern="axab_calibration_eyetohand_*.yaml",
+        calibration_label="eye-to-hand calibration",
+        launch_label="item_teach.launch",
+        robot_ip_address=robot_ip_address,
+    )
+    return [
+        SetLaunchConfiguration("calibration_file", selected_file),
+        SetLaunchConfiguration("auto_discover_calibration", "false"),
+    ]
+
+
 def _ros_domain_action():
     import importlib.util
 
@@ -81,6 +133,7 @@ def generate_launch_description():
     calibration_child_frame = LaunchConfiguration("calibration_child_frame")
     calibration_dir = LaunchConfiguration("calibration_dir")
     calibration_file = LaunchConfiguration("calibration_file")
+    robot_ip_address = LaunchConfiguration("robot_ip_address")
     auto_discover_calibration = ParameterValue(
         LaunchConfiguration("auto_discover_calibration"),
         value_type=bool,
@@ -154,6 +207,11 @@ def generate_launch_description():
             default_value="",
         ),
         DeclareLaunchArgument(
+            "robot_ip_address",
+            default_value="",
+            description="Robot controller IP used to decide whether manual calibration selection is required.",
+        ),
+        DeclareLaunchArgument(
             "auto_discover_calibration",
             default_value="true",
         ),
@@ -205,6 +263,7 @@ def generate_launch_description():
             "bin_roi_move_speed_percent",
             default_value="100",
         ),
+        OpaqueFunction(function=_manual_calibration_setup),
         Node(
             package="item_perception",
             executable="item_teach",
@@ -222,6 +281,7 @@ def generate_launch_description():
                     "calibration_child_frame": calibration_child_frame,
                     "calibration_dir": calibration_dir,
                     "calibration_file": calibration_file,
+                    "robot_ip_address": robot_ip_address,
                     "auto_discover_calibration": auto_discover_calibration,
                     "publish_item_pose_array": publish_item_pose_array,
                     "item_pose_array_topic": item_pose_array_topic,

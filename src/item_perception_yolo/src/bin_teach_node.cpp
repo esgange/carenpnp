@@ -61,6 +61,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/robot_identity.hpp>
 #include <dobot_common/workspace_paths.hpp>
 
 namespace
@@ -859,7 +860,7 @@ public:
     static_platform_tf_broadcaster_(std::make_shared<tf2_ros::StaticTransformBroadcaster>(this))
   {
     marker_prefix_ = declare_parameter<std::string>("marker_prefix", "aruco_marker");
-    parent_frame_ = declare_parameter<std::string>("parent_frame", "calibrated_camera_link");
+    parent_frame_ = declare_parameter<std::string>("parent_frame", "arm_calibrated_camera_link");
     target_frame_ = declare_parameter<std::string>("target_frame", "bin_teach_target");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     gripper_frame_ = declare_parameter<std::string>("gripper_frame", "Link6");
@@ -871,6 +872,8 @@ public:
       "platform_calibration_dir",
       defaultPlatformCalibrationDir().string());
     platform_calibration_file_ = declare_parameter<std::string>("platform_calibration_file", "");
+    robot_ip_address_ = dobot_common::robot_identity::resolveRobotIpAddress(
+      declare_parameter<std::string>("robot_ip_address", ""), __FILE__);
     color_topic_ = declare_parameter<std::string>("color_topic", "/robot_camera/color/image_raw");
     const std::string default_output_dir =
       dobot_common::paths::workspacePath({"teach", "bin_teach"}, __FILE__).string();
@@ -909,7 +912,10 @@ public:
 
     if (use_platform_calibration_)
     {
-      if (platform_calibration_file_.empty() && auto_discover_platform_calibration_)
+      if (
+        platform_calibration_file_.empty() &&
+        auto_discover_platform_calibration_ &&
+        !dobot_common::robot_identity::requiresManualCalibrationSelection(robot_ip_address_))
       {
         platform_calibration_file_ = findLatestPlatformCalibrationFile();
       }
@@ -917,7 +923,8 @@ public:
       {
         throw std::runtime_error(
           "use_platform_calibration=true but no platform calibration file is available. "
-          "Run camera_calibration platform_teach first, or set use_platform_calibration:=false for legacy camera-relative bin teach.");
+          "Select platform_calibration_file explicitly, run platform_calibration first, "
+          "or set use_platform_calibration:=false for legacy camera-relative bin teach.");
       }
 
       std::string reason;
@@ -2604,6 +2611,7 @@ private:
   bool auto_discover_platform_calibration_{true};
   std::string platform_calibration_dir_;
   std::string platform_calibration_file_;
+  std::string robot_ip_address_;
   bool platform_calibration_loaded_{false};
   std::string platform_name_;
   std::string platform_parent_frame_;

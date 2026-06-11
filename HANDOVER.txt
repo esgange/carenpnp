@@ -1,0 +1,151 @@
+DOBOT Pick and Place - Handover Notes
+=====================================
+
+Target platform
+---------------
+
+This workspace is intended to run natively on Ubuntu 22.04 with ROS 2 Humble.
+The core robot/camera cell should build from apt/ROS dependencies. Docker, pip,
+PyTorch, YOLO, and SAM2 are optional and should only be used for the YOLO item
+perception path or the RabbitMQ external bridge.
+
+Fresh machine setup
+-------------------
+
+1. Install Ubuntu 22.04 and ROS 2 Humble.
+2. Install the small build/tooling set listed in README.md.
+3. From the workspace root:
+
+   source /opt/ros/humble/setup.bash
+   rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
+   colcon build --symlink-install
+   source install/setup.bash
+
+4. Create local station config without overwriting an existing one:
+
+   cp -n station_config.example station_config
+   nano station_config
+
+5. Source the station config in every runtime terminal:
+
+   set -a
+   source station_config
+   set +a
+
+Robot network / LAN2 debug
+--------------------------
+
+When connecting directly to the DOBOT controller on LAN2 for debug, use the
+robot IPv4 address:
+
+   192.168.200.1
+
+Set the PC wired adapter to the same subnet, for example:
+
+   IP address: 192.168.200.10
+   Netmask:    255.255.255.0
+   Gateway:    leave empty, or use 192.168.200.1 if required
+
+The station config for a LAN2 debug connection should include:
+
+   ROBOT_IP_ADDRESS=192.168.200.1
+
+Robot Cell Orchestrator shows this value in the right-side Robot Connection
+panel. Use Save there to update station_config, then stop and relaunch Robot
+Bringup so it reconnects to the new IP.
+
+The orchestrator opens bin/tray detect overlays from Camera Views in a separate
+Camera Detect Views window. Use Open Camera Window to create or refocus that
+viewer without hiding the main operator controls.
+
+Before launching robot bringup, verify the link:
+
+   ping 192.168.200.1
+
+Main runtime entry points
+-------------------------
+
+Operator GUI:
+
+   ros2 launch robot_cell_orchestrator robot_cell_orchestrator.launch.py
+
+Headless production support stack:
+
+   ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py mode:=online
+
+Manual lab flow:
+
+   ros2 launch orbbec_camera_launcher camera_launcher.launch.py
+   ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py station_config:=station_config
+   ros2 launch item_perception item_detect.launch.py
+   ros2 launch item_pick item_pick.launch.py
+   ros2 launch tray_perception tray_detect.launch.py
+   ros2 launch tray_intercept tray_intercept.launch.py
+
+The Orbbec camera launcher auto-scans saved camera serial mappings on startup.
+If at least one configured camera is detected, it launches valid camera nodes
+immediately. Missing configured cameras are written to the launcher scan log and
+do not block startup behind a warning click.
+
+Offline/client PC deployment
+----------------------------
+
+Use INSTALL.md for the full client PC procedure. The short version is:
+
+1. On a staging machine, run:
+
+   tools/deps/fetch_offline_deps.sh
+
+2. Copy the whole workspace plus ignored payloads under third_party/.
+3. On the client PC, run:
+
+   tools/deps/install_offline_deps.sh
+   source /opt/ros/humble/setup.bash
+   colcon build --symlink-install
+   source install/setup.bash
+   tools/deps/verify_offline_env.sh
+
+The verify_offline_env.sh check is for the full AI/bridge bundle. Only source
+tools/deps/source_third_party_env.sh when YOLO/SAM2 or cell-external-bridge is
+needed.
+
+Important generated/local paths
+-------------------------------
+
+Keep source code in src/. Runtime output and teach/calibration data belong in:
+
+   calibration/
+   teach/
+   config/item_perception/
+   config/item_perception_yolo/
+   config/tray_perception/
+   config/camera_bringup/
+   config/robot_cell_orchestrator/
+   runtime/
+   debug files/
+   Log/
+
+Most of those paths are ignored by git because they are station/runtime data.
+
+Item detect and item pick behavior
+----------------------------------
+
+Classic item detect and YOLO item detect are expected to use the same handoff:
+
+1. Item pick is armed and waits for one pose.
+2. Item detect Seek ON publishes one detected pose.
+3. Item pick executes one pick sequence, performs final Z-up on success, and
+   returns to standby.
+4. If suction DI1 fails after retract and Auto Repick is enabled, item pick
+   releases, returns to the saved start joints, and asks item detect to repick.
+5. In TF-only mode, item pick publishes the goal TF for RViz and does not move
+   the robot.
+
+Repo cleanup policy
+-------------------
+
+Do not delete user calibration/teach/runtime files during cleanup unless the
+operator explicitly asks for a reset. Do not commit build/install/log outputs,
+third_party binary payloads, Python caches, ROS bags, model runs, or local
+station secrets. Keep package-specific operator details in the package README
+that owns the motion or perception behavior.

@@ -89,6 +89,13 @@ ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py \
 | `dobot_msgs_v4/msg/RobotStatus` | `dobot_msgs_v4/msg/RobotStatus` | Robot status and mode fields. |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | TCP pose feedback. |
 | `/dobot_bringup_ros2/msg/FeedInfo` | `std_msgs/msg/String` | JSON-like feedback payload. |
+| `/dobot_bringup_ros2/DIStatus_200mS` | `std_msgs/msg/String` | JSON DI status from the 30005 200 ms feedback stream. |
+
+Check the 200 ms DI status stream:
+
+```bash
+ros2 topic echo --field data /dobot_bringup_ros2/DIStatus_200mS
+```
 
 ## Services
 

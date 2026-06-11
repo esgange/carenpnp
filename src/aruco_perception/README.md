@@ -74,14 +74,17 @@ ros2 launch aruco_perception aruco_perception.launch.py \
 
 ## Calibration Behavior
 
-- With `use_calibration=true`, launch loads the newest non-empty YAML in
+- With `use_calibration=true`, launch loads the newest non-empty current-robot YAML in
   `WORKSPACE_ROOT/calibration` unless `calibration_file` is set.
+- For robot IP `192.168.200.1`, automatic selection is disabled and launch opens
+  a filtered chooser. Headless and direct node starts must provide
+  `calibration_file` explicitly.
 - If calibration is enabled and no usable file exists, launch fails early with a
   clear error.
 - The loaded YAML is expected to include `transform.rotation` and
   `transform.translation`.
 - When calibration is enabled, marker poses are published in
-  `calibrated_camera_link` by default.
+  `arm_calibrated_camera_link` by default.
 - When calibration is disabled, marker poses are published in `parent_frame`.
 
 ## Quick Checks
@@ -91,7 +94,7 @@ ros2 topic hz /robot_camera/color/image_raw
 ros2 topic hz /robot_camera/depth/image_raw
 ros2 topic echo /marker_pose --once
 ros2 topic hz /aruco_overlay
-ros2 run tf2_ros tf2_echo calibrated_camera_link aruco_marker_1
+ros2 run tf2_ros tf2_echo arm_calibrated_camera_link aruco_marker_1
 ```
 
 ## Notes

@@ -2,7 +2,7 @@ schema_version: 1
 
 mode: online
 runtime_dir: runtime
-offline_item_profiles_dir: teach/item_teach
+offline_item_profiles_dir: teach/item_teach_yolo
 offline_tray_profiles_dir: teach/tray_teach
 
 profiles:
@@ -25,6 +25,14 @@ camera:
   orbbec_launch_file: gemini_330_series.launch.py
   device_num: ""
   launch_args: {}
+  watchdog:
+    enabled: true
+    namespace: camera_watchdog
+    startup_timeout_sec: 20.0
+    health_timeout_sec: 5.0
+    check_period_sec: 1.0
+    restart_delay_sec: 3.0
+    restart_backoff_max_sec: 30.0
 
 common:
   color_topic: /robot_camera/color/image_raw
@@ -56,7 +64,7 @@ item_detect:
   calibration_parent_frame: base_link
   calibration_child_frame: bin_calibrated_camera_link
   camera_frame: ""
-  runtime_settings_file: config/item_perception/item_detect_runtime_settings.yaml
+  runtime_settings_file: config/item_perception_yolo/item_detect_yolo_runtime_settings.yaml
   selected_profile_export_file: config/item_perception/item_detect_selected_profile.txt
   pose_topic: bin_seek_pose
   pose_array_topic: bin_item_poses

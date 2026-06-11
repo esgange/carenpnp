@@ -16,7 +16,7 @@ source install/setup.bash
 If this robot setup does not already have a platform reference, create it once:
 
 ```bash
-ros2 launch camera_calibration platform_teach.launch.py
+ros2 launch platform_calibration platform_calibration.launch.py
 ```
 
 Then teach or update the bin:
@@ -64,6 +64,11 @@ best.onnx
 ros2 launch item_perception_yolo item_detect_yolo.launch.py
 ```
 
+YOLO detect defaults to the same `/bin_camera` topics used by YOLO teach. Use
+`Open Model` to select a YOLO ONNX/model bundle; when the bundle has its sibling
+YAML, detect also loads the saved ROI, camera topics, bin plane, and teach
+joints.
+
 Default outputs:
 
 - `/bin_overlay`
@@ -71,5 +76,5 @@ Default outputs:
 - `/bin_seek_pose`
 - `/bin_cube_marker`
 
-Use the top dropdown to select a YOLO profile. Use `Delete Item` to remove the
-selected YOLO profile and associated model bundle from disk.
+Use `Delete Item` to remove the selected YOLO profile and associated model
+bundle from disk.

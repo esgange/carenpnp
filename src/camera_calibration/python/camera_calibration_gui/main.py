@@ -1,9 +1,8 @@
 import subprocess
 import sys
 import os
-from dataclasses import dataclass
+import signal
 from datetime import datetime
-from functools import partial
 import math
 from pathlib import Path
 import re
@@ -16,31 +15,84 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_services_default
 from rclpy.time import Time
-from geometry_msgs.msg import TransformStamped
-from dobot_msgs_v4.msg import ToolVectorActual
-from dobot_msgs_v4.srv import InverseKin, MovJ, Stop
 from rcl_interfaces.srv import SetParameters
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
+from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformException, TransformListener
-from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 
-@dataclass(frozen=True)
-class GoalPose:
-  x: float
-  y: float
-  z: float
-  rx: float
-  ry: float
-  rz: float
-  distance_to_tag_mm: float = 0.0
-  tilt_from_seed_deg: float = 0.0
+class OverlayImageLabel(QtWidgets.QLabel):
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._status_overlay_text = ""
+    self._gate_overlay_text = ""
+
+  def set_status_overlay_text(self, text):
+    normalized = str(text or "").strip()
+    if normalized == self._status_overlay_text:
+      return
+    self._status_overlay_text = normalized
+    self.update()
+
+  def set_gate_overlay_text(self, text):
+    normalized = str(text or "").strip()
+    if normalized == self._gate_overlay_text:
+      return
+    self._gate_overlay_text = normalized
+    self.update()
+
+  def paintEvent(self, event):
+    super().paintEvent(event)
+    if not self._status_overlay_text and not self._gate_overlay_text:
+      return
+
+    painter = QtGui.QPainter(self)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+    font = QtGui.QFont("Monospace")
+    font.setStyleHint(QtGui.QFont.TypeWriter)
+    font.setPointSize(10)
+    painter.setFont(font)
+
+    if self._status_overlay_text:
+      self._draw_overlay_box(painter, self._status_overlay_text, align_right=False)
+    if self._gate_overlay_text:
+      self._draw_overlay_box(painter, self._gate_overlay_text, align_right=True)
+
+  def _draw_overlay_box(self, painter, text, align_right):
+    margin = 12
+    pad_x = 10
+    pad_y = 8
+    flags = QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap
+    available_width = max(120, self.width() - (margin * 2))
+    max_width = min(available_width, max(260, int(self.width() * 0.44)))
+    max_height = max(80, self.height() - (margin * 2))
+    measure_rect = QtCore.QRect(0, 0, max_width - (pad_x * 2), max_height - (pad_y * 2))
+    bounds = painter.boundingRect(measure_rect, flags, text)
+    box_width = min(max_width, bounds.width() + (pad_x * 2))
+    box_height = min(max_height, bounds.height() + (pad_y * 2))
+    x = self.width() - margin - box_width if align_right else margin
+    box = QtCore.QRect(x, margin, box_width, box_height)
+
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor(0, 0, 0, 180))
+    painter.drawRoundedRect(box, 6, 6)
+    painter.setPen(QtGui.QColor(245, 245, 245))
+    painter.drawText(box.adjusted(pad_x, pad_y, -pad_x, -pad_y), flags, text)
 
 
 CALIB_MODE_EYE_ON_HAND = "eye_on_hand"
 CALIB_MODE_EYE_TO_HAND = "eye_to_hand"
-TAG_FRAME_MAX_AGE_SEC = 1.5
+TAG_FRAME = "tag_frame"
+TAG_FRAME_MAX_AGE_SEC = 0.5
+TAG_STABILITY_WINDOW_SEC = 1.0
+TAG_STABILITY_TIME_EPS_SEC = 0.08
+TAG_STABILITY_TRANSLATION_TOL_MM = 1.0
+TAG_STABILITY_ROTATION_TOL_DEG = 1.0
+DEFAULT_ARUCO_IDS = [1, 2, 3, 4]
+ARUCO_ID_MIN = 0
+ARUCO_ID_MAX = 49  # DICT_5X5_50
 
 
 def workspace_root() -> Path:
@@ -86,6 +138,54 @@ def workspace_path(*parts: str) -> Path:
   return workspace_root().joinpath(*parts)
 
 
+def _unquote_config_value(value):
+  text = str(value or "").strip()
+  if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+    text = text[1:-1]
+  return text.strip()
+
+
+def read_station_config_value(*keys):
+  station_config = workspace_path("station_config")
+  try:
+    with station_config.open("r", encoding="utf-8") as stream:
+      values = {}
+      for raw_line in stream:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+          continue
+        if line.startswith("export "):
+          line = line[len("export "):].strip()
+        if "=" not in line:
+          continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = _unquote_config_value(value)
+  except OSError:
+    return ""
+
+  for key in keys:
+    value = values.get(key)
+    if value:
+      return value
+  return ""
+
+
+def resolve_robot_ip_address(value=None):
+  requested = str(value or "").strip()
+  if requested:
+    return requested
+  env_ip = os.environ.get("ROBOT_IP_ADDRESS", "").strip()
+  if env_ip:
+    return env_ip
+  return read_station_config_value("ROBOT_IP_ADDRESS", "ip_address")
+
+
+def sanitize_filename_token(value):
+  token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+  token = re.sub(r"_+", "_", token)
+  return token.strip("_")
+
+
 def normalize_calibration_mode(value):
   mode = str(value or "").strip().lower().replace("-", "_")
   if mode in (CALIB_MODE_EYE_TO_HAND, "eyetohand"):
@@ -98,19 +198,27 @@ def default_camera_prefix_for_mode(mode):
 
 
 def default_camera_frame_for_mode(mode, camera_prefix=None):
+  prefix = normalize_camera_prefix(camera_prefix, mode)
+  return f"{prefix}_color_optical_frame"
+
+
+def default_calibrated_camera_frame_for_mode(mode):
   if normalize_calibration_mode(mode) == CALIB_MODE_EYE_TO_HAND:
-    prefix = normalize_camera_prefix(camera_prefix, mode)
-    return f"{prefix}_color_optical_frame"
-  return "camera_link"
+    return "bin_calibrated_camera_link"
+  return "arm_calibrated_camera_link"
 
 
 def normalize_camera_prefix(value, mode=CALIB_MODE_EYE_ON_HAND):
   prefix = str(value or "").strip().strip("/")
+  if prefix.lower() == "auto":
+    prefix = ""
   return prefix or default_camera_prefix_for_mode(mode)
 
 
 def normalize_camera_frame(value, mode=CALIB_MODE_EYE_ON_HAND, camera_prefix=None):
   frame = str(value or "").strip().strip("/")
+  if frame.lower() == "auto":
+    frame = ""
   return frame or default_camera_frame_for_mode(mode, camera_prefix)
 
 
@@ -123,57 +231,65 @@ def camera_topics_for_prefix(prefix):
   )
 
 
+def format_aruco_ids(ids):
+  return ",".join(str(int(marker_id)) for marker_id in ids)
+
+
+def validate_aruco_ids(ids):
+  if len(ids) != 4:
+    return False, "ArUco IDs must contain exactly 4 IDs in TL,TR,BL,BR order."
+  for marker_id in ids:
+    if marker_id < ARUCO_ID_MIN or marker_id > ARUCO_ID_MAX:
+      return False, "ArUco IDs must be in range 0..49 for DICT_5X5_50."
+  if len(set(ids)) != len(ids):
+    return False, "ArUco IDs must be unique for depth board pose fitting."
+  return True, ""
+
+
+def parse_aruco_ids_text(text):
+  tokens = [token for token in re.split(r"[\s,;]+", str(text or "").strip()) if token]
+  try:
+    ids = [int(token) for token in tokens]
+  except ValueError:
+    return None, "ArUco IDs must be integers, for example 1,2,3,4."
+  valid, reason = validate_aruco_ids(ids)
+  if not valid:
+    return None, reason
+  return ids, ""
+
+
+def coerce_aruco_ids(value):
+  if isinstance(value, str):
+    return parse_aruco_ids_text(value)
+  try:
+    ids = [int(marker_id) for marker_id in value]
+  except (TypeError, ValueError):
+    return None, "ArUco IDs must be an integer array."
+  valid, reason = validate_aruco_ids(ids)
+  if not valid:
+    return None, reason
+  return ids, ""
+
+
 def calibration_mode_filename_token(mode):
   return "eyetohand" if normalize_calibration_mode(mode) == CALIB_MODE_EYE_TO_HAND else "eyeonhand"
 
 
-def calibration_filename_for_mode(mode):
-  return f"axab_calibration_{calibration_mode_filename_token(mode)}_{datetime.now().strftime('%d%m%Y')}.yaml"
+def calibration_filename_for_mode(mode, robot_ip_address=None):
+  filename = f"axab_calibration_{calibration_mode_filename_token(mode)}_{datetime.now().strftime('%d%m%Y')}"
+  ip_token = sanitize_filename_token(resolve_robot_ip_address(robot_ip_address))
+  if ip_token:
+    filename += f"_{ip_token}"
+  return f"{filename}.yaml"
 
 
-def parse_joint_values_from_robot_return(text):
-  raw = str(text or "")
-  if not raw:
-    return None
-
-  float_pattern = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
-  for content in re.findall(r"\{([^{}]+)\}", raw):
-    numbers = [float(token) for token in re.findall(float_pattern, content)]
-    if len(numbers) == 6:
-      return numbers
-
-  numbers = [float(token) for token in re.findall(float_pattern, raw)]
-  if len(numbers) == 6:
-    return numbers
-  return None
-
-
-def default_output_path(mode=CALIB_MODE_EYE_ON_HAND):
+def default_output_path(mode=CALIB_MODE_EYE_ON_HAND, robot_ip_address=None):
   calib_dir = workspace_path("calibration")
   try:
     calib_dir.mkdir(parents=True, exist_ok=True)
   except Exception:
     pass
-  return str(calib_dir / calibration_filename_for_mode(mode))
-
-
-def rpy_deg_to_quaternion(roll_deg, pitch_deg, yaw_deg):
-  roll = math.radians(float(roll_deg))
-  pitch = math.radians(float(pitch_deg))
-  yaw = math.radians(float(yaw_deg))
-
-  cy = math.cos(yaw * 0.5)
-  sy = math.sin(yaw * 0.5)
-  cp = math.cos(pitch * 0.5)
-  sp = math.sin(pitch * 0.5)
-  cr = math.cos(roll * 0.5)
-  sr = math.sin(roll * 0.5)
-
-  qw = cr * cp * cy + sr * sp * sy
-  qx = sr * cp * cy - cr * sp * sy
-  qy = cr * sp * cy + sr * cp * sy
-  qz = cr * cp * sy - sr * sp * cy
-  return qx, qy, qz, qw
+  return str(calib_dir / calibration_filename_for_mode(mode, robot_ip_address))
 
 
 def quaternion_normalize(quat):
@@ -185,551 +301,12 @@ def quaternion_normalize(quat):
   return qx * inv, qy * inv, qz * inv, qw * inv
 
 
-def quaternion_multiply(lhs, rhs):
-  lx, ly, lz, lw = lhs
-  rx, ry, rz, rw = rhs
-  return quaternion_normalize((
-    (lw * rx) + (lx * rw) + (ly * rz) - (lz * ry),
-    (lw * ry) - (lx * rz) + (ly * rw) + (lz * rx),
-    (lw * rz) + (lx * ry) - (ly * rx) + (lz * rw),
-    (lw * rw) - (lx * rx) - (ly * ry) - (lz * rz),
-  ))
-
-
-def quaternion_conjugate(quat):
-  x, y, z, w = quaternion_normalize(quat)
-  return -x, -y, -z, w
-
-
-def quaternion_rotate_vector(quat, vec):
-  q = quaternion_normalize(quat)
-  q_vec = (q[0], q[1], q[2])
-  vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
-  v = (vx, vy, vz)
-  t = vec_cross(q_vec, v)
-  t = (2.0 * t[0], 2.0 * t[1], 2.0 * t[2])
-  q_cross_t = vec_cross(q_vec, t)
-  return (
-    v[0] + (q[3] * t[0]) + q_cross_t[0],
-    v[1] + (q[3] * t[1]) + q_cross_t[1],
-    v[2] + (q[3] * t[2]) + q_cross_t[2],
-  )
-
-
-def quaternion_to_rpy_deg(quat):
-  x, y, z, w = quaternion_normalize(quat)
-
-  sinr_cosp = 2.0 * ((w * x) + (y * z))
-  cosr_cosp = 1.0 - (2.0 * ((x * x) + (y * y)))
-  roll = math.atan2(sinr_cosp, cosr_cosp)
-
-  sinp = 2.0 * ((w * y) - (z * x))
-  if abs(sinp) >= 1.0:
-    pitch = math.copysign(math.pi / 2.0, sinp)
-  else:
-    pitch = math.asin(sinp)
-
-  siny_cosp = 2.0 * ((w * z) + (x * y))
-  cosy_cosp = 1.0 - (2.0 * ((y * y) + (z * z)))
-  yaw = math.atan2(siny_cosp, cosy_cosp)
-  return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
-
-
-def vec_dot(lhs, rhs):
-  return (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2])
-
-
-def vec_cross(lhs, rhs):
-  return (
-    (lhs[1] * rhs[2]) - (lhs[2] * rhs[1]),
-    (lhs[2] * rhs[0]) - (lhs[0] * rhs[2]),
-    (lhs[0] * rhs[1]) - (lhs[1] * rhs[0]),
-  )
-
-
-def vec_norm(vec):
-  return math.sqrt((vec[0] * vec[0]) + (vec[1] * vec[1]) + (vec[2] * vec[2]))
-
-
-def vec_normalize(vec):
-  norm = vec_norm(vec)
-  if norm < 1e-9:
-    return None
-  inv = 1.0 / norm
-  return vec[0] * inv, vec[1] * inv, vec[2] * inv
-
-
-def angle_between_vectors_deg(lhs, rhs):
-  a = vec_normalize(lhs)
-  b = vec_normalize(rhs)
-  if a is None or b is None:
-    return 0.0
-  dot = max(-1.0, min(1.0, vec_dot(a, b)))
-  return math.degrees(math.acos(dot))
-
-
-def quaternion_from_two_vectors(start_vec, end_vec):
-  a = vec_normalize(start_vec)
-  b = vec_normalize(end_vec)
-  if a is None or b is None:
-    return 0.0, 0.0, 0.0, 1.0
-
-  dot = max(-1.0, min(1.0, vec_dot(a, b)))
-  if dot < -0.999999:
-    axis = vec_cross((1.0, 0.0, 0.0), a)
-    if vec_norm(axis) < 1e-6:
-      axis = vec_cross((0.0, 1.0, 0.0), a)
-    axis = vec_normalize(axis)
-    if axis is None:
-      return 0.0, 0.0, 0.0, 1.0
-    return axis[0], axis[1], axis[2], 0.0
-
-  cross = vec_cross(a, b)
-  quat = (cross[0], cross[1], cross[2], 1.0 + dot)
-  return quaternion_normalize(quat)
-
-
-def quaternion_from_axis_angle(axis, angle_deg):
-  axis_n = vec_normalize(axis)
-  if axis_n is None:
-    return 0.0, 0.0, 0.0, 1.0
-  half_angle = 0.5 * math.radians(float(angle_deg))
-  sin_half = math.sin(half_angle)
-  return quaternion_normalize((
-    axis_n[0] * sin_half,
-    axis_n[1] * sin_half,
-    axis_n[2] * sin_half,
-    math.cos(half_angle),
-  ))
-
-
-def rotate_vector_about_axis(vec, axis, angle_deg):
-  v = vec_normalize(vec)
-  k = vec_normalize(axis)
-  if v is None or k is None:
-    return v
-
-  angle_rad = math.radians(float(angle_deg))
-  c = math.cos(angle_rad)
-  s = math.sin(angle_rad)
-  kv = vec_dot(k, v)
-  k_cross_v = vec_cross(k, v)
-
-  rotated = (
-    (v[0] * c) + (k_cross_v[0] * s) + (k[0] * kv * (1.0 - c)),
-    (v[1] * c) + (k_cross_v[1] * s) + (k[1] * kv * (1.0 - c)),
-    (v[2] * c) + (k_cross_v[2] * s) + (k[2] * kv * (1.0 - c)),
-  )
-  return vec_normalize(rotated)
-
-
-def transform_pose_compose(parent_to_child, child_to_grandchild):
-  px, py, pz, pqx, pqy, pqz, pqw = parent_to_child
-  cx, cy, cz, cqx, cqy, cqz, cqw = child_to_grandchild
-  rotated_child = quaternion_rotate_vector((pqx, pqy, pqz, pqw), (cx, cy, cz))
-  return (
-    px + rotated_child[0],
-    py + rotated_child[1],
-    pz + rotated_child[2],
-    *quaternion_multiply((pqx, pqy, pqz, pqw), (cqx, cqy, cqz, cqw)),
-  )
-
-
-def transform_pose_inverse(parent_to_child):
-  tx, ty, tz, qx, qy, qz, qw = parent_to_child
-  inv_q = quaternion_conjugate((qx, qy, qz, qw))
-  inv_t = quaternion_rotate_vector(inv_q, (-tx, -ty, -tz))
-  return inv_t[0], inv_t[1], inv_t[2], inv_q[0], inv_q[1], inv_q[2], inv_q[3]
-
-
-def identity_transform_pose_mm():
-  return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
-
-
-def select_spread_subset(candidates, desired_count, seed_position=None):
-  n = max(1, int(desired_count))
-  if not candidates:
-    return []
-  if len(candidates) <= n:
-    return list(candidates)
-
-  if seed_position is None:
-    seed_position = (candidates[0].x, candidates[0].y, candidates[0].z)
-  sx, sy, sz = seed_position
-  start_idx = min(
-    range(len(candidates)),
-    key=lambda idx: (
-      (candidates[idx].x - sx) ** 2
-      + (candidates[idx].y - sy) ** 2
-      + (candidates[idx].z - sz) ** 2
-    ),
-  )
-
-  selected = [start_idx]
-  min_dist_sq = [float("inf")] * len(candidates)
-  for idx, pose in enumerate(candidates):
-    dx = pose.x - candidates[start_idx].x
-    dy = pose.y - candidates[start_idx].y
-    dz = pose.z - candidates[start_idx].z
-    min_dist_sq[idx] = (dx * dx) + (dy * dy) + (dz * dz)
-  min_dist_sq[start_idx] = -1.0
-
-  while len(selected) < n:
-    next_idx = max(range(len(candidates)), key=lambda idx: min_dist_sq[idx])
-    if min_dist_sq[next_idx] < 0.0:
-      break
-    selected.append(next_idx)
-    min_dist_sq[next_idx] = -1.0
-
-    next_pose = candidates[next_idx]
-    for idx, pose in enumerate(candidates):
-      if min_dist_sq[idx] < 0.0:
-        continue
-      dx = pose.x - next_pose.x
-      dy = pose.y - next_pose.y
-      dz = pose.z - next_pose.z
-      dist_sq = (dx * dx) + (dy * dy) + (dz * dz)
-      if dist_sq < min_dist_sq[idx]:
-        min_dist_sq[idx] = dist_sq
-
-  return [candidates[idx] for idx in selected]
-
-
-def build_camera_centered_gripper_goal(
-  seed_pose,
-  tag_pose,
-  gripper_to_camera_pose,
-  camera_to_tag_dir,
-  distance_mm,
-  min_base_z_mm,
-  wrist_spin_deg=0.0,
-  tilt_from_center_deg=0.0,
-):
-  base_x, base_y, base_z, base_rx, base_ry, base_rz = seed_pose
-  tag_x, tag_y, tag_z, _tag_qx, _tag_qy, _tag_qz, _tag_qw = tag_pose
-  if distance_mm <= 0.0:
-    return None
-
-  look_dir = vec_normalize(camera_to_tag_dir)
-  if look_dir is None:
-    return None
-
-  seed_gripper_quat = quaternion_normalize(rpy_deg_to_quaternion(base_rx, base_ry, base_rz))
-  seed_gripper_pose = (
-    float(base_x),
-    float(base_y),
-    float(base_z),
-    seed_gripper_quat[0],
-    seed_gripper_quat[1],
-    seed_gripper_quat[2],
-    seed_gripper_quat[3],
-  )
-  seed_camera_pose = transform_pose_compose(seed_gripper_pose, gripper_to_camera_pose)
-  seed_camera_quat = seed_camera_pose[3], seed_camera_pose[4], seed_camera_pose[5], seed_camera_pose[6]
-  seed_camera_z_axis = vec_normalize(quaternion_rotate_vector(seed_camera_quat, (0.0, 0.0, 1.0)))
-  if seed_camera_z_axis is None:
-    return None
-
-  desired_camera_x = tag_x - (look_dir[0] * distance_mm)
-  desired_camera_y = tag_y - (look_dir[1] * distance_mm)
-  desired_camera_z = tag_z - (look_dir[2] * distance_mm)
-
-  q_delta = quaternion_from_two_vectors(seed_camera_z_axis, look_dir)
-  desired_camera_quat = quaternion_multiply(q_delta, seed_camera_quat)
-  if abs(wrist_spin_deg) > 1e-6:
-    desired_camera_quat = quaternion_multiply(
-      desired_camera_quat,
-      quaternion_from_axis_angle((0.0, 0.0, 1.0), wrist_spin_deg),
-    )
-
-  desired_camera_pose = (
-    desired_camera_x,
-    desired_camera_y,
-    desired_camera_z,
-    desired_camera_quat[0],
-    desired_camera_quat[1],
-    desired_camera_quat[2],
-    desired_camera_quat[3],
-  )
-  desired_gripper_pose = transform_pose_compose(
-    desired_camera_pose,
-    transform_pose_inverse(gripper_to_camera_pose),
-  )
-  if desired_gripper_pose[2] < min_base_z_mm:
-    return None
-
-  rx, ry, rz = quaternion_to_rpy_deg(desired_gripper_pose[3:])
-  return GoalPose(
-    x=desired_gripper_pose[0],
-    y=desired_gripper_pose[1],
-    z=desired_gripper_pose[2],
-    rx=rx,
-    ry=ry,
-    rz=rz,
-    distance_to_tag_mm=distance_mm,
-    tilt_from_seed_deg=tilt_from_center_deg,
-  )
-
-
-def goal_pose_key(pose):
-  return (
-    int(round(float(pose.x))),
-    int(round(float(pose.y))),
-    int(round(float(pose.z))),
-    int(round(float(pose.rx) * 10.0)),
-    int(round(float(pose.ry) * 10.0)),
-    int(round(float(pose.rz) * 10.0)),
-  )
-
-
-def build_align_goal_pose(seed_pose, tag_pose, gripper_to_camera_pose, distance_mm, min_base_z_mm):
-  tag_x, tag_y, tag_z, tag_qx, tag_qy, tag_qz, tag_qw = tag_pose
-  if distance_mm <= 0.0:
-    return None
-
-  tag_z_axis = vec_normalize(quaternion_rotate_vector((tag_qx, tag_qy, tag_qz, tag_qw), (0.0, 0.0, 1.0)))
-  if tag_z_axis is None:
-    return None
-
-  # Put the camera on +tag_z side and point camera +Z directly at the target.
-  return build_camera_centered_gripper_goal(
-    seed_pose,
-    (tag_x, tag_y, tag_z, tag_qx, tag_qy, tag_qz, tag_qw),
-    gripper_to_camera_pose,
-    (-tag_z_axis[0], -tag_z_axis[1], -tag_z_axis[2]),
-    distance_mm,
-    min_base_z_mm,
-  )
-
-
-def build_goal_pose_sequence(
-  seed_pose,
-  tag_pose,
-  gripper_to_camera_pose,
-  sample_count,
-  min_distance_mm,
-  max_distance_mm,
-  max_tilt_deg,
-  look_up_bias_deg,
-  min_base_z_mm,
-  sequence_offset=0,
-):
-  tag_x, tag_y, tag_z, tag_qx, tag_qy, tag_qz, tag_qw = tag_pose
-  n = max(1, int(sample_count))
-  if max_distance_mm <= min_distance_mm:
-    return [], 0, 0, 0
-  if gripper_to_camera_pose is None:
-    gripper_to_camera_pose = identity_transform_pose_mm()
-
-  tag_z_axis = vec_normalize(quaternion_rotate_vector((tag_qx, tag_qy, tag_qz, tag_qw), (0.0, 0.0, 1.0)))
-  if tag_z_axis is None:
-    return [], 0, 0, 0
-
-  # Sample around tag Z-axis (front side): center line from goal->tag is -tag_z.
-  center_dir = vec_normalize((-tag_z_axis[0], -tag_z_axis[1], -tag_z_axis[2]))
-  if center_dir is None:
-    return [], 0, 0, 0
-
-  # Build basis around center direction for cone sampling.
-  helper_axis = (0.0, 0.0, 1.0)
-  if abs(vec_dot(center_dir, helper_axis)) > 0.95:
-    helper_axis = (0.0, 1.0, 0.0)
-  basis_x = vec_normalize(vec_cross(helper_axis, center_dir))
-  if basis_x is None:
-    return [], 0, 0, 0
-  basis_y = vec_normalize(vec_cross(center_dir, basis_x))
-  if basis_y is None:
-    return [], 0, 0, 0
-
-  # Stratified bins over distance + azimuth for more even spread.
-  distance_bins = max(1, int(math.ceil(math.sqrt(float(n)))))
-  azimuth_bins = max(1, int(math.ceil(float(n) / float(distance_bins))))
-  cell_count = max(1, distance_bins * azimuth_bins)
-  attempt_count = max(cell_count * 4, n * 8)
-
-  dist_span = max_distance_mm - min_distance_mm
-  cos_max_tilt = math.cos(math.radians(max_tilt_deg))
-  offset = max(0, int(sequence_offset))
-  wrist_spin_range_deg = 35.0
-
-  candidates = []
-  skipped_by_distance = 0
-  skipped_by_tilt = 0
-  skipped_by_height = 0
-
-  for attempt_idx in range(attempt_count):
-    if len(candidates) >= n:
-      break
-
-    # Cycle through all (distance, azimuth) bins in a permuted order.
-    if cell_count > 1:
-      cell_linear_idx = (offset + (attempt_idx * (cell_count - 1))) % cell_count
-    else:
-      cell_linear_idx = 0
-    cycle_idx = attempt_idx // cell_count
-    distance_bin = cell_linear_idx // azimuth_bins
-    azimuth_bin = cell_linear_idx % azimuth_bins
-
-    # Bin-local jitter (changes across refill rounds) keeps bins filled while avoiding duplicates.
-    dist_phase = (0.5 + ((offset + cycle_idx) * 0.6180339887498949)) % 1.0
-    az_phase = (0.5 + ((offset + cycle_idx) * 0.3819660112501051)) % 1.0
-
-    u_dist = (distance_bin + dist_phase) / float(distance_bins)
-    u_dist = max(0.0, min(0.999999, u_dist))
-    dist_to_tag = min_distance_mm + (dist_span * u_dist)
-    if dist_to_tag < min_distance_mm or dist_to_tag > max_distance_mm:
-      skipped_by_distance += 1
-      continue
-
-    u_az = (azimuth_bin + az_phase) / float(azimuth_bins)
-    u_az = max(0.0, min(0.999999, u_az))
-    phi = 2.0 * math.pi * u_az
-    cos_phi = math.cos(phi)
-    sin_phi = math.sin(phi)
-
-    # Equal-area cone sampling for tilt around center direction.
-    u_cap = (0.5 + ((attempt_idx + offset) * 0.7548776662466927)) % 1.0
-    cos_theta = 1.0 - (u_cap * (1.0 - cos_max_tilt))
-    cos_theta = max(-1.0, min(1.0, cos_theta))
-    sin_theta = math.sqrt(max(0.0, 1.0 - (cos_theta * cos_theta)))
-
-    goal_to_tag = vec_normalize((
-      (center_dir[0] * cos_theta) + (basis_x[0] * sin_theta * cos_phi) + (basis_y[0] * sin_theta * sin_phi),
-      (center_dir[1] * cos_theta) + (basis_x[1] * sin_theta * cos_phi) + (basis_y[1] * sin_theta * sin_phi),
-      (center_dir[2] * cos_theta) + (basis_x[2] * sin_theta * cos_phi) + (basis_y[2] * sin_theta * sin_phi),
-    ))
-    if goal_to_tag is None:
-      continue
-
-    # Apply a small upward camera bias so the tag sits closer to image center.
-    if abs(look_up_bias_deg) > 1e-6:
-      look_up_axis = vec_cross(goal_to_tag, (0.0, 0.0, 1.0))
-      if vec_norm(look_up_axis) > 1e-9:
-        biased = rotate_vector_about_axis(goal_to_tag, look_up_axis, look_up_bias_deg)
-        if biased is not None:
-          goal_to_tag = biased
-
-    tilt_from_center_deg = angle_between_vectors_deg(center_dir, goal_to_tag)
-    if tilt_from_center_deg > (max_tilt_deg + 1e-6):
-      skipped_by_tilt += 1
-      continue
-
-    # Add deterministic wrist (Link6 local Z) variation while preserving look-at direction.
-    spin_phase = (
-      0.5
-      + (azimuth_bin * 0.6180339887498949)
-      + ((distance_bin + cycle_idx + offset) * 0.4142135623730950)
-    ) % 1.0
-    spin_deg = (2.0 * spin_phase - 1.0) * wrist_spin_range_deg
-
-    goal = build_camera_centered_gripper_goal(
-      seed_pose,
-      (tag_x, tag_y, tag_z, tag_qx, tag_qy, tag_qz, tag_qw),
-      gripper_to_camera_pose,
-      goal_to_tag,
-      dist_to_tag,
-      min_base_z_mm,
-      wrist_spin_deg=spin_deg,
-      tilt_from_center_deg=tilt_from_center_deg,
-    )
-    if goal is None:
-      skipped_by_height += 1
-      continue
-    candidates.append(goal)
-
-  if not candidates:
-    return [], skipped_by_distance, skipped_by_tilt, skipped_by_height
-  return candidates[:n], skipped_by_distance, skipped_by_tilt, skipped_by_height
-
-
-def wrap_angle_deg(angle_deg):
-  wrapped = (float(angle_deg) + 180.0) % 360.0
-  return wrapped - 180.0
-
-
-def build_eye_to_hand_goal_pose_sequence(seed_pose, sample_count, min_base_z_mm, sequence_offset=0):
-  base_x, base_y, base_z, base_rx, base_ry, base_rz = seed_pose
-  n = max(1, int(sample_count))
-  offset = max(0, int(sequence_offset))
-
-  xy_span_mm = 90.0
-  z_span_mm = 70.0
-  rot_span_deg = 20.0
-  attempt_count = max(32, n * 14)
-
-  candidates = []
-  skipped_by_height = 0
-  seen = set()
-
-  # Include current pose first to guarantee one valid anchor sample.
-  seed_goal = GoalPose(
-    x=float(base_x),
-    y=float(base_y),
-    z=float(base_z),
-    rx=wrap_angle_deg(base_rx),
-    ry=wrap_angle_deg(base_ry),
-    rz=wrap_angle_deg(base_rz),
-    distance_to_tag_mm=0.0,
-    tilt_from_seed_deg=0.0,
-  )
-  if float(base_z) >= float(min_base_z_mm):
-    seed_key = goal_pose_key(seed_goal)
-    seen.add(seed_key)
-    candidates.append(seed_goal)
-  else:
-    skipped_by_height += 1
-
-  for attempt_idx in range(attempt_count):
-    if len(candidates) >= n:
-      break
-    phase = float(offset + attempt_idx + 1)
-    u1 = (0.5 + (phase * 0.6180339887498949)) % 1.0
-    u2 = (0.5 + (phase * 0.4142135623730950)) % 1.0
-    u3 = (0.5 + (phase * 0.7548776662466927)) % 1.0
-    u4 = (0.5 + (phase * 0.3819660112501051)) % 1.0
-    u5 = (0.5 + (phase * 0.5698402909980532)) % 1.0
-    u6 = (0.5 + (phase * 0.2775557561562891)) % 1.0
-
-    radius = xy_span_mm * math.sqrt(max(0.0, u1))
-    theta = 2.0 * math.pi * u2
-    dx = radius * math.cos(theta)
-    dy = radius * math.sin(theta)
-    dz = (2.0 * u3 - 1.0) * z_span_mm
-
-    px = float(base_x) + dx
-    py = float(base_y) + dy
-    pz = float(base_z) + dz
-    if pz < float(min_base_z_mm):
-      skipped_by_height += 1
-      continue
-
-    rx = wrap_angle_deg(float(base_rx) + ((2.0 * u4 - 1.0) * rot_span_deg))
-    ry = wrap_angle_deg(float(base_ry) + ((2.0 * u5 - 1.0) * rot_span_deg))
-    rz = wrap_angle_deg(float(base_rz) + ((2.0 * u6 - 1.0) * rot_span_deg))
-    rot_delta = math.sqrt(
-      (wrap_angle_deg(rx - float(base_rx)) ** 2)
-      + (wrap_angle_deg(ry - float(base_ry)) ** 2)
-      + (wrap_angle_deg(rz - float(base_rz)) ** 2)
-    )
-    dist_mm = math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
-
-    goal = GoalPose(
-      x=px,
-      y=py,
-      z=pz,
-      rx=rx,
-      ry=ry,
-      rz=rz,
-      distance_to_tag_mm=dist_mm,
-      tilt_from_seed_deg=rot_delta,
-    )
-    key = goal_pose_key(goal)
-    if key in seen:
-      continue
-    seen.add(key)
-    candidates.append(goal)
-
-  return candidates[:n], skipped_by_height
+def quaternion_angular_distance_deg(lhs, rhs):
+  a = quaternion_normalize(lhs)
+  b = quaternion_normalize(rhs)
+  dot = abs((a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]) + (a[3] * b[3]))
+  dot = max(-1.0, min(1.0, dot))
+  return math.degrees(2.0 * math.acos(dot))
 
 
 class CalibGui(QtWidgets.QWidget):
@@ -738,29 +315,43 @@ class CalibGui(QtWidgets.QWidget):
     self.ros_if = ros_if
     self._ui_settings = QtCore.QSettings("DOBOT", "camera_calibration_gui")
     self.calib_process = None
-    self.align_in_flight = False
-    self.generated_goals = []
-    self.auto_running = False
     self.manual_sample_count = 0
     self.manual_capture_in_flight = False
     self.manual_compute_in_flight = False
-    self.auto_state = "idle"
-    self.auto_goal_index = 0
-    self.auto_capture_retry = 0
-    self.auto_target_pose = None
-    self.auto_move_deadline = 0.0
-    self.auto_settle_deadline = 0.0
+    self.reset_samples_in_flight = False
+    self.preview_compute_in_flight = False
+    self._calibrator_ready = False
+    self._active_calibrator_config = None
+    self._calibrator_namespace_base = f"/camera_calibration_gui_{os.getpid()}"
+    self._calibrator_generation = 0
+    self._calibrator_namespace = self._calibrator_namespace_for_generation()
     self._save_yaml_ready = False
+    self._tag_stability_history = []
+    self._tag_stability_key = None
+    self._latest_tag_gate_ready = False
+    self._latest_tag_gate_detail = "Waiting for stable tag_frame."
     self.setWindowTitle("Camera Calibration")
     self._build_ui()
     self._restore_ui_settings()
     self.ros_if.apply_calibration_mode_tool(self._current_calibration_mode())
+    self._set_camera_prefix_for_mode(
+      self._current_calibration_mode(),
+      log_change=True,
+      force_apply=True,
+    )
+    self._set_camera_frame_for_mode(
+      self._current_calibration_mode(),
+      log_change=True,
+      force_apply=True,
+    )
     self._connect_ui_setting_signals()
     self._update_mode_dependent_ui()
     self._update_window_title()
     self._persist_all_ui_settings(log_changes=False)
+    self._apply_aruco_ids_to_perception(log_result=True)
     self._log_ui_settings_snapshot("UI settings active at startup")
     self._setup_monitors()
+    self.start_calibrator()
 
   def _build_ui(self):
     root_layout = QtWidgets.QHBoxLayout()
@@ -776,65 +367,30 @@ class CalibGui(QtWidgets.QWidget):
     self.gripper_frame = QtWidgets.QLineEdit("Link6")
     self.camera_prefix = QtWidgets.QLineEdit(default_camera_prefix_for_mode(CALIB_MODE_EYE_ON_HAND))
     self.camera_frame = QtWidgets.QLineEdit(default_camera_frame_for_mode(CALIB_MODE_EYE_ON_HAND))
-    self.target_frame = QtWidgets.QLineEdit("tag_frame")
+    self.aruco_ids = QtWidgets.QLineEdit(format_aruco_ids(DEFAULT_ARUCO_IDS))
     self.min_samples = QtWidgets.QSpinBox()
     self.min_samples.setMinimum(3)
     self.min_samples.setMaximum(1000)
     self.min_samples.setValue(21)
-    self.min_tag_distance_mm = QtWidgets.QDoubleSpinBox()
-    self.min_tag_distance_mm.setRange(50.0, 5000.0)
-    self.min_tag_distance_mm.setSingleStep(10.0)
-    self.min_tag_distance_mm.setValue(250.0)
-    self.min_tag_distance_mm.setSuffix(" mm")
-    self.max_tag_distance_mm = QtWidgets.QDoubleSpinBox()
-    self.max_tag_distance_mm.setRange(50.0, 5000.0)
-    self.max_tag_distance_mm.setSingleStep(10.0)
-    self.max_tag_distance_mm.setValue(800.0)
-    self.max_tag_distance_mm.setSuffix(" mm")
-    self.max_tilt_deg = QtWidgets.QDoubleSpinBox()
-    self.max_tilt_deg.setRange(1.0, 180.0)
-    self.max_tilt_deg.setSingleStep(1.0)
-    self.max_tilt_deg.setValue(30.0)
-    self.max_tilt_deg.setSuffix(" deg")
-    self.look_up_bias_deg = QtWidgets.QDoubleSpinBox()
-    self.look_up_bias_deg.setRange(-30.0, 30.0)
-    self.look_up_bias_deg.setSingleStep(0.5)
-    self.look_up_bias_deg.setValue(10.0)
-    self.look_up_bias_deg.setSuffix(" deg")
-    self.min_base_z_mm = QtWidgets.QDoubleSpinBox()
-    self.min_base_z_mm.setRange(-1000.0, 5000.0)
-    self.min_base_z_mm.setSingleStep(10.0)
-    self.min_base_z_mm.setValue(200.0)
-    self.min_base_z_mm.setSuffix(" mm")
     form.addRow("Calibration mode", self.calibration_mode)
     form.addRow("Base frame", self.base_frame)
     form.addRow("Gripper frame", self.gripper_frame)
     form.addRow("Camera topic prefix", self.camera_prefix)
     form.addRow("Camera frame", self.camera_frame)
-    form.addRow("Target frame", self.target_frame)
+    form.addRow("ArUco IDs", self.aruco_ids)
     form.addRow("Minimum samples", self.min_samples)
-    form.addRow("Min tag distance", self.min_tag_distance_mm)
-    form.addRow("Max tag distance", self.max_tag_distance_mm)
-    form.addRow("Max tilt from tag Z", self.max_tilt_deg)
-    form.addRow("Look up bias", self.look_up_bias_deg)
-    form.addRow("Min base Z height", self.min_base_z_mm)
     layout.addLayout(form)
 
-    button_layout = QtWidgets.QHBoxLayout()
-    self.start_btn = QtWidgets.QPushButton("Start")
-    self.stop_btn = QtWidgets.QPushButton("Stop")
-    self.align_btn = QtWidgets.QPushButton("Align")
-    self.start_btn.setEnabled(False)
-    self.stop_btn.setEnabled(False)
-    button_layout.addWidget(self.start_btn)
-    button_layout.addWidget(self.stop_btn)
-    button_layout.addWidget(self.align_btn)
-    layout.addLayout(button_layout)
-
     action_layout = QtWidgets.QHBoxLayout()
-    self.add_btn = QtWidgets.QPushButton("Generate Pose")
+    self.add_btn = QtWidgets.QPushButton("Get Sample")
+    self.undo_last_btn = QtWidgets.QPushButton("Undo Last")
+    self.reset_samples_btn = QtWidgets.QPushButton("Reset Samples")
     self.save_btn = QtWidgets.QPushButton("Save YAML")
+    self.undo_last_btn.setEnabled(False)
+    self.reset_samples_btn.setEnabled(False)
     action_layout.addWidget(self.add_btn)
+    action_layout.addWidget(self.undo_last_btn)
+    action_layout.addWidget(self.reset_samples_btn)
     action_layout.addWidget(self.save_btn)
     layout.addLayout(action_layout)
 
@@ -844,12 +400,18 @@ class CalibGui(QtWidgets.QWidget):
 
     overlay_group = QtWidgets.QGroupBox("ArUco Overlay (/aruco_overlay)")
     overlay_layout = QtWidgets.QVBoxLayout(overlay_group)
-    self.overlay_label = QtWidgets.QLabel("Waiting for /aruco_overlay ...")
+    self.overlay_label = OverlayImageLabel("Waiting for /aruco_overlay ...")
     self.overlay_label.setAlignment(QtCore.Qt.AlignCenter)
     self.overlay_label.setMinimumSize(640, 360)
     self.overlay_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
     self.overlay_label.setStyleSheet(
       "QLabel { background-color: #101010; color: #d0d0d0; border: 1px solid #444; }"
+    )
+    self.overlay_label.set_status_overlay_text(
+      "Live calibrated TF preview\nWaiting for 3 samples."
+    )
+    self.overlay_label.set_gate_overlay_text(
+      "Tag gate\nBLOCKED\nWaiting for tag_frame."
     )
     overlay_layout.addWidget(self.overlay_label)
 
@@ -858,14 +420,59 @@ class CalibGui(QtWidgets.QWidget):
 
     self.setLayout(root_layout)
 
-    self.start_btn.clicked.connect(self.start_automation)
-    self.stop_btn.clicked.connect(self.stop_calibrator)
-    self.align_btn.clicked.connect(self.align_to_tag)
     self.add_btn.clicked.connect(self.handle_add_button_clicked)
+    self.undo_last_btn.clicked.connect(self.undo_last_sample)
+    self.reset_samples_btn.clicked.connect(self.reset_samples)
     self.save_btn.clicked.connect(self.save_yaml)
 
   def log(self, text):
     self.status.appendPlainText(text)
+
+  @staticmethod
+  def _extract_transform_block(message):
+    text = str(message or "").strip()
+    index = text.find("transform:")
+    if index >= 0:
+      return text[index:].strip()
+    return text
+
+  def _set_live_transform_text(self, text):
+    self.overlay_label.set_status_overlay_text(str(text or "").strip())
+
+  def _set_tag_gate_overlay_text(self, ready, detail):
+    mode = self._current_calibration_mode()
+    camera_frame = self.camera_frame.text().strip() or default_camera_frame_for_mode(
+      mode, self.camera_prefix.text())
+    state = "READY" if ready else "BLOCKED"
+    self.overlay_label.set_gate_overlay_text(
+      f"Tag frame gate\n"
+      f"{state}\n"
+      f"{camera_frame} -> {TAG_FRAME}\n"
+      f"{detail}"
+    )
+
+  def _log_sample_count(self):
+    self.log(f"Samples: {self.manual_sample_count}/{int(self.min_samples.value())}")
+
+  def _set_sample_count(self, count):
+    try:
+      self.manual_sample_count = max(0, int(count))
+    except (TypeError, ValueError):
+      self.manual_sample_count = max(0, int(self.manual_sample_count))
+    self._update_undo_button_state()
+
+  def _update_undo_button_state(self):
+    if not hasattr(self, "undo_last_btn"):
+      return
+    can_undo = (
+      self.manual_sample_count > 0 and
+      not self.manual_capture_in_flight and
+      not self.manual_compute_in_flight and
+      not self.reset_samples_in_flight
+    )
+    self.undo_last_btn.setEnabled(can_undo)
+    if hasattr(self, "reset_samples_btn"):
+      self.reset_samples_btn.setEnabled(can_undo)
 
   def _set_save_yaml_ready(self, ready):
     ready = bool(ready)
@@ -876,7 +483,6 @@ class CalibGui(QtWidgets.QWidget):
       self.save_btn.setStyleSheet(
         "QPushButton { background-color: #2e7d32; color: #ffffff; font-weight: 600; }"
       )
-      self.log("[ui] Save YAML highlighted: calibration finished and calibrated TF is live.")
       return
 
     self.save_btn.setStyleSheet("")
@@ -897,51 +503,28 @@ class CalibGui(QtWidgets.QWidget):
     self.setWindowTitle(f"Camera Calibration ({suffix})")
 
   def _update_mode_dependent_ui(self):
-    mode = self._current_calibration_mode()
-    eye_to_hand = mode == CALIB_MODE_EYE_TO_HAND
-    self.align_btn.setEnabled((not self.auto_running) and (not self.align_in_flight) and (not eye_to_hand))
-    self.add_btn.setText("Get Sample" if eye_to_hand else "Generate Pose")
-    if not self.auto_running:
-      self.add_btn.setEnabled(not (self.manual_capture_in_flight or self.manual_compute_in_flight))
-    if eye_to_hand:
-      self.align_btn.setToolTip("Align is only used for eye-on-hand mode.")
-      self.add_btn.setToolTip("Capture the current hand-dragged pose as a calibration sample.")
-      self.start_btn.setEnabled(False)
-      self.start_btn.setToolTip("Eye-to-hand manual mode uses Get Sample instead of generated robot motion.")
-      for widget in (
-        self.min_tag_distance_mm,
-        self.max_tag_distance_mm,
-        self.max_tilt_deg,
-        self.look_up_bias_deg,
-        self.min_base_z_mm,
-      ):
-        widget.setEnabled(False)
-        widget.setToolTip("Used only for eye-on-hand pose generation; ignored for eye-to-hand samples.")
+    self.add_btn.setText("Get Sample")
+    add_enabled = (
+      self._latest_tag_gate_ready and
+      self._calibrator_ready and
+      not self.manual_capture_in_flight and
+      not self.manual_compute_in_flight and
+      not self.reset_samples_in_flight
+    )
+    self.add_btn.setEnabled(add_enabled)
+    if not self._calibrator_ready:
+      self.add_btn.setToolTip("Waiting for calibration services to start.")
+    elif self._latest_tag_gate_ready:
+      self.add_btn.setToolTip("Capture the current hand-guided robot pose as a calibration sample.")
     else:
-      self.align_btn.setToolTip("Move to the closest IK-valid camera-centered view of the target.")
-      self.add_btn.setToolTip("Generate robot goal poses for automatic capture.")
-      self.start_btn.setToolTip("")
-      for widget in (
-        self.min_tag_distance_mm,
-        self.max_tag_distance_mm,
-        self.max_tilt_deg,
-        self.look_up_bias_deg,
-        self.min_base_z_mm,
-      ):
-        widget.setEnabled(not self.auto_running)
-        widget.setToolTip("")
+      self.add_btn.setToolTip(f"Waiting for stable {TAG_FRAME}: {self._latest_tag_gate_detail}")
 
   def _on_calibration_mode_changed(self, *_):
     mode = self._current_calibration_mode()
+    self._reset_tag_stability()
     self.ros_if.apply_calibration_mode_tool(mode)
-    self._set_camera_prefix_for_mode(mode, log_change=True)
-    self._set_camera_frame_for_mode(mode, log_change=True)
-    if self.generated_goals and (not self.auto_running):
-      self.generated_goals = []
-      self.start_btn.setEnabled(False)
-      self.log("Calibration mode changed: cleared generated poses.")
-    if mode == CALIB_MODE_EYE_TO_HAND:
-      self.start_btn.setEnabled(False)
+    self._set_camera_prefix_for_mode(mode, log_change=True, force_apply=True)
+    self._set_camera_frame_for_mode(mode, log_change=True, force_apply=True)
     self._save_setting(
       "calibration_mode",
       "Calibration mode",
@@ -951,26 +534,33 @@ class CalibGui(QtWidgets.QWidget):
     )
     self._update_window_title()
     self._update_mode_dependent_ui()
+    self._restart_calibrator_for_current_settings("[ui] Calibration mode changed")
 
-  def _set_camera_prefix_for_mode(self, mode, log_change):
+  def _set_camera_prefix_for_mode(self, mode, log_change, force_apply=False):
     prefix = default_camera_prefix_for_mode(mode)
-    if self.camera_prefix.text().strip().strip("/") == prefix:
+    changed = self.camera_prefix.text().strip().strip("/") != prefix
+    if changed:
+      self.camera_prefix.setText(prefix)
+    if not changed and not force_apply:
       return
-    self.camera_prefix.setText(prefix)
     if log_change:
-      self.log(f"[ui] Camera topic prefix default for {mode}: {prefix}")
+      if changed:
+        self.log(f"[ui] Camera topic prefix default for {mode}: {prefix}")
       self._log_camera_prefix_launch_note(prefix)
       success, detail = self.ros_if.set_aruco_camera_prefix(prefix)
       prefix_text = "OK" if success else "ERROR"
       self.log(f"[camera_prefix] {prefix_text}: {detail}")
 
-  def _set_camera_frame_for_mode(self, mode, log_change):
+  def _set_camera_frame_for_mode(self, mode, log_change, force_apply=False):
     frame = default_camera_frame_for_mode(mode, self.camera_prefix.text())
-    if self.camera_frame.text().strip().strip("/") == frame:
+    changed = self.camera_frame.text().strip().strip("/") != frame
+    if changed:
+      self.camera_frame.setText(frame)
+    if not changed and not force_apply:
       return
-    self.camera_frame.setText(frame)
     if log_change:
-      self.log(f"[ui] Raw camera frame default for {mode}: {frame}")
+      if changed:
+        self.log(f"[ui] Raw camera frame default for {mode}: {frame}")
       success, detail = self.ros_if.set_calibration_camera_frame(frame)
       prefix_text = "OK" if success else "ERROR"
       self.log(f"[camera_frame] {prefix_text}: {detail}")
@@ -986,17 +576,26 @@ class CalibGui(QtWidgets.QWidget):
       self.log("[ui] Prefix matches the active ArUco stream.")
 
   def _on_camera_prefix_changed(self):
+    self._reset_tag_stability()
     prefix = normalize_camera_prefix(self.camera_prefix.text(), self._current_calibration_mode())
     if prefix != self.camera_prefix.text().strip():
       self.camera_prefix.setText(prefix)
+    self._save_setting(
+      "camera_prefix",
+      "Camera topic prefix",
+      prefix,
+      display_value=prefix,
+      emit_log=True,
+    )
     self._log_camera_prefix_launch_note(prefix)
     success, detail = self.ros_if.set_aruco_camera_prefix(prefix)
     prefix_text = "OK" if success else "ERROR"
     self.log(f"[camera_prefix] {prefix_text}: {detail}")
-    if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
-      self._set_camera_frame_for_mode(CALIB_MODE_EYE_TO_HAND, log_change=True)
+    self._set_camera_frame_for_mode(self._current_calibration_mode(), log_change=True)
+    self._restart_calibrator_for_current_settings("[ui] Camera topic prefix changed")
 
   def _on_camera_frame_changed(self):
+    self._reset_tag_stability()
     frame = normalize_camera_frame(
       self.camera_frame.text(),
       self._current_calibration_mode(),
@@ -1008,6 +607,7 @@ class CalibGui(QtWidgets.QWidget):
     success, detail = self.ros_if.set_calibration_camera_frame(frame)
     prefix_text = "OK" if success else "ERROR"
     self.log(f"[camera_frame] {prefix_text}: {detail}")
+    self._restart_calibrator_for_current_settings("[ui] Camera frame changed")
 
 
   def _settings_key(self, name):
@@ -1065,27 +665,19 @@ class CalibGui(QtWidgets.QWidget):
         value = int(fallback)
     return int(self._clamp(value, int(minimum), int(maximum)))
 
-  def _read_float_setting(self, name, fallback, minimum, maximum):
-    key = self._settings_key(name)
-    if not self._ui_settings.contains(key):
-      return float(fallback)
-
-    raw = self._ui_settings.value(key, fallback)
-    try:
-      value = float(raw)
-    except (TypeError, ValueError):
-      value = float(fallback)
-    return float(self._clamp(value, float(minimum), float(maximum)))
-
   def _restore_ui_settings(self):
-    self._set_calibration_mode(
-      self._read_text_setting("calibration_mode", self.ros_if.get_default_calibration_mode())
-    )
+    self._set_calibration_mode(self.ros_if.get_default_calibration_mode())
+    mode = self._current_calibration_mode()
     self.base_frame.setText(self._read_text_setting("base_frame", self.base_frame.text()))
     self.gripper_frame.setText(self._read_text_setting("gripper_frame", self.gripper_frame.text()))
-    self.camera_prefix.setText(self.ros_if.get_default_camera_prefix())
-    self.camera_frame.setText(self.ros_if.get_default_camera_frame())
-    self.target_frame.setText(self._read_text_setting("target_frame", self.target_frame.text()))
+    self.camera_prefix.setText(default_camera_prefix_for_mode(mode))
+    self.camera_frame.setText(default_camera_frame_for_mode(mode, self.camera_prefix.text()))
+    self.aruco_ids.setText(
+      self._read_text_setting(
+        "aruco_ids",
+        format_aruco_ids(self.ros_if.get_default_aruco_ids()),
+      )
+    )
 
     self.min_samples.setValue(
       self._read_int_setting(
@@ -1095,79 +687,28 @@ class CalibGui(QtWidgets.QWidget):
         self.min_samples.maximum(),
       )
     )
-    self.min_tag_distance_mm.setValue(
-      self._read_float_setting(
-        "min_tag_distance_mm",
-        self.min_tag_distance_mm.value(),
-        self.min_tag_distance_mm.minimum(),
-        self.min_tag_distance_mm.maximum(),
-      )
-    )
-    self.max_tag_distance_mm.setValue(
-      self._read_float_setting(
-        "max_tag_distance_mm",
-        self.max_tag_distance_mm.value(),
-        self.max_tag_distance_mm.minimum(),
-        self.max_tag_distance_mm.maximum(),
-      )
-    )
-    self.max_tilt_deg.setValue(
-      self._read_float_setting(
-        "max_tilt_deg",
-        self.max_tilt_deg.value(),
-        self.max_tilt_deg.minimum(),
-        self.max_tilt_deg.maximum(),
-      )
-    )
-    self.look_up_bias_deg.setValue(
-      self._read_float_setting(
-        "look_up_bias_deg",
-        self.look_up_bias_deg.value(),
-        self.look_up_bias_deg.minimum(),
-        self.look_up_bias_deg.maximum(),
-      )
-    )
-    self.min_base_z_mm.setValue(
-      self._read_float_setting(
-        "min_base_z_mm",
-        self.min_base_z_mm.value(),
-        self.min_base_z_mm.minimum(),
-        self.min_base_z_mm.maximum(),
-      )
-    )
 
   def _connect_ui_setting_signals(self):
     self.calibration_mode.currentIndexChanged.connect(self._on_calibration_mode_changed)
-    self.base_frame.editingFinished.connect(
-      partial(self._save_line_edit_setting, "base_frame", "Base frame", self.base_frame)
-    )
-    self.gripper_frame.editingFinished.connect(
-      partial(self._save_line_edit_setting, "gripper_frame", "Gripper frame", self.gripper_frame)
-    )
+    self.base_frame.editingFinished.connect(self._on_base_frame_changed)
+    self.gripper_frame.editingFinished.connect(self._on_gripper_frame_changed)
     self.camera_frame.editingFinished.connect(self._on_camera_frame_changed)
     self.camera_prefix.editingFinished.connect(self._on_camera_prefix_changed)
-    self.target_frame.editingFinished.connect(
-      partial(self._save_line_edit_setting, "target_frame", "Target frame", self.target_frame)
-    )
+    self.aruco_ids.editingFinished.connect(self._on_aruco_ids_changed)
 
-    self.min_samples.valueChanged.connect(
-      partial(self._save_spin_setting, "min_samples", "Minimum samples", self.min_samples)
-    )
-    self.min_tag_distance_mm.valueChanged.connect(
-      partial(self._save_spin_setting, "min_tag_distance_mm", "Min tag distance", self.min_tag_distance_mm)
-    )
-    self.max_tag_distance_mm.valueChanged.connect(
-      partial(self._save_spin_setting, "max_tag_distance_mm", "Max tag distance", self.max_tag_distance_mm)
-    )
-    self.max_tilt_deg.valueChanged.connect(
-      partial(self._save_spin_setting, "max_tilt_deg", "Max tilt from tag Z", self.max_tilt_deg)
-    )
-    self.look_up_bias_deg.valueChanged.connect(
-      partial(self._save_spin_setting, "look_up_bias_deg", "Look up bias", self.look_up_bias_deg)
-    )
-    self.min_base_z_mm.valueChanged.connect(
-      partial(self._save_spin_setting, "min_base_z_mm", "Min base Z height", self.min_base_z_mm)
-    )
+    self.min_samples.valueChanged.connect(self._on_min_samples_changed)
+
+  def _on_base_frame_changed(self):
+    self._save_line_edit_setting("base_frame", "Base frame", self.base_frame)
+    self._restart_calibrator_for_current_settings("[ui] Base frame changed")
+
+  def _on_gripper_frame_changed(self):
+    self._save_line_edit_setting("gripper_frame", "Gripper frame", self.gripper_frame)
+    self._restart_calibrator_for_current_settings("[ui] Gripper frame changed")
+
+  def _on_min_samples_changed(self, *_):
+    self._save_spin_setting("min_samples", "Minimum samples", self.min_samples)
+    self._restart_calibrator_for_current_settings("[ui] Minimum samples changed")
 
   def _save_line_edit_setting(self, name, label, widget):
     value = str(widget.text() or "").strip()
@@ -1179,6 +720,46 @@ class CalibGui(QtWidgets.QWidget):
     numeric_value, display_value = self._format_numeric_widget_value(widget)
     self._save_setting(name, label, numeric_value, display_value=display_value, emit_log=True)
 
+  def _normalize_aruco_ids_field(self, log_errors=True):
+    ids, reason = parse_aruco_ids_text(self.aruco_ids.text())
+    if ids is None:
+      if log_errors:
+        self.log(f"[aruco_ids] ERROR: {reason}")
+      return None
+    normalized = format_aruco_ids(ids)
+    if normalized != self.aruco_ids.text().strip():
+      self.aruco_ids.setText(normalized)
+    return ids
+
+  def _save_aruco_ids_setting(self, log_changes):
+    ids = self._normalize_aruco_ids_field(log_errors=log_changes)
+    if ids is None:
+      return None
+    normalized = format_aruco_ids(ids)
+    self._save_setting(
+      "aruco_ids",
+      "ArUco IDs",
+      normalized,
+      display_value=normalized,
+      emit_log=log_changes,
+    )
+    return ids
+
+  def _apply_aruco_ids_to_perception(self, log_result=True):
+    ids = self._save_aruco_ids_setting(log_changes=False)
+    if ids is None:
+      self.log("[aruco_ids] ERROR: tag_frame will not update until the ID list is valid.")
+      return False
+    success, detail = self.ros_if.set_calibration_aruco_ids(ids)
+    if log_result or not success:
+      prefix = "OK" if success else "ERROR"
+      self.log(f"[aruco_ids] {prefix}: {detail}")
+    return success
+
+  def _on_aruco_ids_changed(self):
+    self._reset_tag_stability()
+    self._apply_aruco_ids_to_perception(log_result=True)
+
   def _persist_all_ui_settings(self, log_changes=False):
     self._save_setting(
       "calibration_mode",
@@ -1189,8 +770,9 @@ class CalibGui(QtWidgets.QWidget):
     )
     self._save_setting("base_frame", "Base frame", self.base_frame.text().strip(), emit_log=log_changes)
     self._save_setting("gripper_frame", "Gripper frame", self.gripper_frame.text().strip(), emit_log=log_changes)
+    self._save_setting("camera_prefix", "Camera topic prefix", self.camera_prefix.text().strip(), emit_log=log_changes)
     self._save_setting("camera_frame", "Camera frame", self.camera_frame.text().strip(), emit_log=log_changes)
-    self._save_setting("target_frame", "Target frame", self.target_frame.text().strip(), emit_log=log_changes)
+    self._save_aruco_ids_setting(log_changes)
 
     min_samples_value, min_samples_display = self._format_numeric_widget_value(self.min_samples)
     self._save_setting(
@@ -1198,46 +780,6 @@ class CalibGui(QtWidgets.QWidget):
       "Minimum samples",
       min_samples_value,
       display_value=min_samples_display,
-      emit_log=log_changes,
-    )
-    min_tag_distance_value, min_tag_distance_display = self._format_numeric_widget_value(self.min_tag_distance_mm)
-    self._save_setting(
-      "min_tag_distance_mm",
-      "Min tag distance",
-      min_tag_distance_value,
-      display_value=min_tag_distance_display,
-      emit_log=log_changes,
-    )
-    max_tag_distance_value, max_tag_distance_display = self._format_numeric_widget_value(self.max_tag_distance_mm)
-    self._save_setting(
-      "max_tag_distance_mm",
-      "Max tag distance",
-      max_tag_distance_value,
-      display_value=max_tag_distance_display,
-      emit_log=log_changes,
-    )
-    max_tilt_value, max_tilt_display = self._format_numeric_widget_value(self.max_tilt_deg)
-    self._save_setting(
-      "max_tilt_deg",
-      "Max tilt from tag Z",
-      max_tilt_value,
-      display_value=max_tilt_display,
-      emit_log=log_changes,
-    )
-    look_up_bias_value, look_up_bias_display = self._format_numeric_widget_value(self.look_up_bias_deg)
-    self._save_setting(
-      "look_up_bias_deg",
-      "Look up bias",
-      look_up_bias_value,
-      display_value=look_up_bias_display,
-      emit_log=log_changes,
-    )
-    min_base_z_value, min_base_z_display = self._format_numeric_widget_value(self.min_base_z_mm)
-    self._save_setting(
-      "min_base_z_mm",
-      "Min base Z height",
-      min_base_z_value,
-      display_value=min_base_z_display,
       emit_log=log_changes,
     )
 
@@ -1248,18 +790,17 @@ class CalibGui(QtWidgets.QWidget):
     self.log(f"[ui] Gripper frame = {self.gripper_frame.text().strip()}")
     self.log(f"[ui] Camera topic prefix = {self.camera_prefix.text().strip()}")
     self.log(f"[ui] Camera frame = {self.camera_frame.text().strip()}")
-    self.log(f"[ui] Target frame = {self.target_frame.text().strip()}")
+    self.log(f"[ui] ArUco IDs = {self.aruco_ids.text().strip()} -> {TAG_FRAME}")
     color_topic, depth_topic, camera_info_topic = self.ros_if.get_camera_topics()
     self.log(f"[ui] Active color topic = {color_topic}")
     self.log(f"[ui] Active depth topic = {depth_topic}")
     self.log(f"[ui] Active camera info topic = {camera_info_topic}")
-    self.log(f"[ui] Output YAML path = {default_output_path(self._current_calibration_mode())} (auto)")
+    self.log(f"[ui] Private calibrator namespace base = {self._calibrator_namespace_base}")
+    self.log(
+      "[ui] Output YAML path = "
+      f"{default_output_path(self._current_calibration_mode(), self.ros_if.get_robot_ip_address())} (auto)"
+    )
     self.log(f"[ui] Minimum samples = {int(self.min_samples.value())}")
-    self.log(f"[ui] Min tag distance = {float(self.min_tag_distance_mm.value()):.2f} mm")
-    self.log(f"[ui] Max tag distance = {float(self.max_tag_distance_mm.value()):.2f} mm")
-    self.log(f"[ui] Max tilt from tag Z = {float(self.max_tilt_deg.value()):.2f} deg")
-    self.log(f"[ui] Look up bias = {float(self.look_up_bias_deg.value()):.2f} deg")
-    self.log(f"[ui] Min base Z height = {float(self.min_base_z_mm.value()):.2f} mm")
 
   def _setup_monitors(self):
     # Poll calibrator subprocess; if it exits (e.g., user stops it externally), close the GUI.
@@ -1273,40 +814,189 @@ class CalibGui(QtWidgets.QWidget):
     self.overlay_watch.timeout.connect(self._refresh_overlay)
     self.overlay_watch.start()
 
-    self.auto_watch = QtCore.QTimer(self)
-    self.auto_watch.setInterval(100)
-    self.auto_watch.timeout.connect(self._run_auto_step)
-    self.auto_watch.start()
+    self.tag_gate_watch = QtCore.QTimer(self)
+    self.tag_gate_watch.setInterval(250)
+    self.tag_gate_watch.timeout.connect(self._refresh_tag_gate_controls)
+    self.tag_gate_watch.start()
 
-  def _set_controls_during_auto(self, running):
-    for widget in [
-      self.calibration_mode,
-      self.base_frame,
-      self.gripper_frame,
-      self.camera_prefix,
-      self.camera_frame,
-      self.target_frame,
-      self.min_samples,
-      self.min_tag_distance_mm,
-      self.max_tag_distance_mm,
-      self.max_tilt_deg,
-      self.look_up_bias_deg,
-      self.min_base_z_mm,
-      self.add_btn,
-      self.save_btn,
-    ]:
-      widget.setEnabled(not running)
+    self.calibrator_ready_watch = QtCore.QTimer(self)
+    self.calibrator_ready_watch.setInterval(250)
+    self.calibrator_ready_watch.timeout.connect(self._refresh_calibrator_ready_controls)
+    self.calibrator_ready_watch.start()
 
-    self.start_btn.setEnabled((not running) and bool(self.generated_goals))
-    self.stop_btn.setEnabled(running or (self.calib_process is not None))
+  def _reset_tag_stability(self):
+    self._tag_stability_history = []
+    self._tag_stability_key = None
+    self._latest_tag_gate_ready = False
+    self._latest_tag_gate_detail = "Waiting for stable tag_frame."
+    self._set_tag_gate_overlay_text(False, self._latest_tag_gate_detail)
+
+  def _refresh_tag_gate_controls(self):
+    ready, detail = self._check_tag_visibility_gate(log_rejections=False)
+    self._latest_tag_gate_ready = ready
+    self._latest_tag_gate_detail = detail
+    self._set_tag_gate_overlay_text(ready, detail)
     self._update_mode_dependent_ui()
+
+  def _refresh_calibrator_ready_controls(self):
+    ready = (
+      self.calib_process is not None and
+      self.ros_if.is_trigger_service_ready(
+        self._calibrator_service_name("add_sample"),
+        timeout_sec=0.0,
+      )
+    )
+    if ready == self._calibrator_ready:
+      return
+    self._calibrator_ready = ready
+    if ready:
+      self.log("Calibrator services ready.")
+    self._update_mode_dependent_ui()
+
+  def _update_tag_stability(self, key, pose):
+    if key != self._tag_stability_key:
+      self._tag_stability_key = key
+      self._tag_stability_history = []
+
+    now = time.monotonic()
+    current = tuple(float(value) for value in pose[:7])
+    self._tag_stability_history.append((now, current))
+
+    retention_sec = max(TAG_STABILITY_WINDOW_SEC * 2.0, TAG_STABILITY_WINDOW_SEC + 0.5)
+    self._tag_stability_history = [
+      sample for sample in self._tag_stability_history
+      if now - sample[0] <= retention_sec
+    ]
+
+    if not self._tag_stability_history:
+      return False, "Tag stability: waiting for marker samples."
+
+    newest_time, newest_pose = self._tag_stability_history[-1]
+    window_start = newest_time - TAG_STABILITY_WINDOW_SEC - TAG_STABILITY_TIME_EPS_SEC
+    window_samples = [
+      sample for sample in self._tag_stability_history
+      if sample[0] >= window_start
+    ]
+    span_sec = newest_time - window_samples[0][0]
+    if span_sec + TAG_STABILITY_TIME_EPS_SEC < TAG_STABILITY_WINDOW_SEC:
+      return (
+        False,
+        f"Tag stability: collecting {min(span_sec, TAG_STABILITY_WINDOW_SEC):.2f}/{TAG_STABILITY_WINDOW_SEC:.2f}s.",
+      )
+
+    nx, ny, nz = newest_pose[:3]
+    newest_quat = newest_pose[3:7]
+    max_translation_mm = 0.0
+    max_rotation_deg = 0.0
+    for _sample_time, sample_pose in window_samples:
+      sx, sy, sz = sample_pose[:3]
+      axis_delta_mm = max(abs(sx - nx), abs(sy - ny), abs(sz - nz))
+      max_translation_mm = max(max_translation_mm, axis_delta_mm)
+      max_rotation_deg = max(
+        max_rotation_deg,
+        quaternion_angular_distance_deg(sample_pose[3:7], newest_quat),
+      )
+
+    stable = (
+      max_translation_mm <= TAG_STABILITY_TRANSLATION_TOL_MM and
+      max_rotation_deg <= TAG_STABILITY_ROTATION_TOL_DEG
+    )
+    message = (
+      f"Tag stability: {max_translation_mm:.2f}mm / {max_rotation_deg:.2f}deg "
+      f"over {span_sec:.2f}s "
+      f"(limits {TAG_STABILITY_TRANSLATION_TOL_MM:.1f}mm / "
+      f"{TAG_STABILITY_ROTATION_TOL_DEG:.1f}deg)."
+    )
+    return stable, message
+
+  def _current_calibrator_config(self):
+    mode = self._current_calibration_mode()
+    return (
+      mode,
+      self.base_frame.text().strip(),
+      self.gripper_frame.text().strip(),
+      self.camera_frame.text().strip(),
+      default_calibrated_camera_frame_for_mode(mode),
+      int(self.min_samples.value()),
+      self.ros_if.get_robot_ip_address(),
+    )
+
+  def _calibrator_namespace_for_generation(self):
+    return f"{self._calibrator_namespace_base}_{self._calibrator_generation}"
+
+  @staticmethod
+  def _format_calibrator_config(config):
+    if config is None:
+      return "none"
+    mode, base_frame, gripper_frame, camera_frame, calibrated_frame, min_samples, robot_ip = config
+    robot_ip_text = robot_ip or "auto"
+    return (
+      f"mode={mode}, base={base_frame}, gripper={gripper_frame}, "
+      f"camera={camera_frame}, calibrated={calibrated_frame}, "
+      f"min_samples={min_samples}, robot_ip={robot_ip_text}"
+    )
+
+  def _ensure_active_calibrator_matches_ui(self):
+    expected_config = self._current_calibrator_config()
+    if self.calib_process is not None and self._active_calibrator_config == expected_config:
+      return True
+    self.log(
+      "[sample] Active solver config mismatch; restarting. "
+      f"active=({self._format_calibrator_config(self._active_calibrator_config)}) "
+      f"expected=({self._format_calibrator_config(expected_config)})"
+    )
+    self._restart_calibrator_for_current_settings("[sample] Solver config mismatch")
+    self.log("Wait for calibrator services to become ready, then click Get Sample again.")
+    return False
+
+  def _restart_calibrator_for_current_settings(self, reason):
+    if self.manual_capture_in_flight or self.manual_compute_in_flight or self.reset_samples_in_flight:
+      self.log(f"{reason}: wait for the current calibration request to finish before restarting.")
+      return
+
+    next_config = self._current_calibrator_config()
+    if self.calib_process is not None and self._active_calibrator_config == next_config:
+      self._update_mode_dependent_ui()
+      return
+
+    self._calibrator_ready = False
+    self.preview_compute_in_flight = False
+    self._set_sample_count(0)
+    self._set_save_yaml_ready(False)
+    self._update_mode_dependent_ui()
+
+    if self.calib_process is not None:
+      self.log(f"{reason}: restarting calibrator.")
+      self._stop_calibrator(log_not_running=False)
+    else:
+      self.log(f"{reason}: starting calibrator.")
+    self.start_calibrator()
 
   def start_calibrator(self):
     if self.calib_process is not None:
       return True
 
-    output_path = default_output_path(self._current_calibration_mode())
-    self.log(f"Auto output YAML path: {output_path}")
+    self._calibrator_generation += 1
+    self._calibrator_namespace = self._calibrator_namespace_for_generation()
+    self._calibrator_ready = False
+    self._active_calibrator_config = None
+    self._update_mode_dependent_ui()
+    mode = self._current_calibration_mode()
+    calibrated_camera_frame = default_calibrated_camera_frame_for_mode(mode)
+    camera_frame = self.camera_frame.text().strip()
+    robot_ip_address = self.ros_if.get_robot_ip_address()
+    output_path = default_output_path(mode, robot_ip_address)
+    self.log(f"Output YAML path: {output_path}")
+    self.log(
+      "Active solver target: "
+      f"mode={mode}, camera_frame={camera_frame}, "
+      f"calibrated_frame={calibrated_camera_frame}, "
+      f"service={self._calibrator_service_name('add_sample')}"
+    )
+    parent_frame = self.base_frame.text().strip() if mode == CALIB_MODE_EYE_TO_HAND else self.gripper_frame.text().strip()
+    self._set_live_transform_text(
+      f"Live calibrated TF preview\n{parent_frame} -> {calibrated_camera_frame}\nWaiting for 3 samples."
+    )
 
     cmd = [
       "ros2",
@@ -1314,279 +1004,84 @@ class CalibGui(QtWidgets.QWidget):
       "camera_calibration",
       "eye_on_hand_calibrator",
       "--ros-args",
+      "-r",
+      f"__ns:={self._calibrator_namespace}",
       "-p",
-      f"calibration_mode:={self._current_calibration_mode()}",
+      f"calibration_mode:={mode}",
       "-p",
       f"base_frame:={self.base_frame.text()}",
       "-p",
       f"gripper_frame:={self.gripper_frame.text()}",
       "-p",
-      f"camera_frame:={self.camera_frame.text()}",
+      f"camera_frame:={camera_frame}",
       "-p",
-      f"target_frame:={self.target_frame.text()}",
+      f"calibrated_camera_frame:={calibrated_camera_frame}",
+      "-p",
+      f"target_frame:={TAG_FRAME}",
+      "-p",
+      f"tracking_base_frame:={camera_frame}",
+      "-p",
+      f"tracking_marker_frame:={TAG_FRAME}",
       "-p",
       f"min_samples:={self.min_samples.value()}",
       "-p",
-      "max_target_age_sec:=1.5",
+      "max_target_age_sec:=0.5",
     ]
+    if robot_ip_address:
+      cmd.extend([
+        "-p",
+        f"robot_ip_address:={robot_ip_address}",
+      ])
     self.log("Starting calibrator...")
+    self.log(f"Calibrator services: {self._calibrator_namespace}/<service>")
     try:
-      self.calib_process = subprocess.Popen(cmd)
+      self.calib_process = subprocess.Popen(cmd, start_new_session=True)
+      self._active_calibrator_config = self._current_calibrator_config()
       self.log("Calibrator started.")
-      self.stop_btn.setEnabled(True)
+      self._update_mode_dependent_ui()
       return True
     except Exception as exc:
       self.log(f"Failed to start calibrator: {exc}")
       self.calib_process = None
-      self.stop_btn.setEnabled(False)
+      self._active_calibrator_config = None
+      self._update_mode_dependent_ui()
       return False
 
-  def start_automation(self):
-    self._persist_all_ui_settings(log_changes=False)
+  def _stop_calibrator(self, log_not_running=True):
+    self._calibrator_ready = False
+    self._active_calibrator_config = None
     self._set_save_yaml_ready(False)
-    mode = self._current_calibration_mode()
-    self.ros_if.apply_calibration_mode_tool(mode)
-    if mode == CALIB_MODE_EYE_TO_HAND:
-      self.log("Eye-to-hand is in manual mode. Drag the robot, then click Get Sample.")
-      self.start_btn.setEnabled(False)
-      return
-    if self.auto_running:
-      self.log("Auto calibration is already running.")
-      return
-    if not self.generated_goals:
-      self.log("No valid generated poses yet. Click 'Generate Pose' first.")
-      self.start_btn.setEnabled(False)
-      return
-
-    if self.calib_process is not None:
-      self.log("Restarting calibrator with current GUI settings...")
-      self._stop_calibrator(clear_generated_goals=False)
-
-    if not self.start_calibrator():
-      return
-
-    if not self.ros_if.ensure_motion_ready(timeout_sec=0.5):
-      self.log("Motion service is not ready: /dobot_bringup_ros2/srv/MovJ")
-      return
-
-    ordered_goals = self._order_goals_for_motion(self.generated_goals)
-    parent_frame = self.base_frame.text().strip() or "base_link"
-    if not self.ros_if.publish_goal_pose_transforms(parent_frame, ordered_goals):
-      self.log("Failed to republish ordered goal pose TFs.")
-      return
-
-    self.generated_goals = ordered_goals
-    self.auto_goal_index = 0
-    self.auto_capture_retry = 0
-    self.auto_target_pose = None
-    self.auto_state = "resetting"
-    self.auto_running = True
-    self._set_controls_during_auto(True)
-    self.log("Execution order: nearest distance first, then lowest Z first.")
-    self.log(
-      f"Auto run started with {len(ordered_goals)} pose(s): move -> capture -> compute."
-    )
-    dispatched = self._call_trigger_async("reset_samples", self._on_reset_samples_done)
-    if not dispatched:
-      self._finish_automation(
-        False,
-        "Failed to reset samples. Ensure calibrator services are available.",
-      )
-
-  def _clear_generated_goals(self):
-    had_goals = bool(self.generated_goals)
-    self.generated_goals = []
-    self.start_btn.setEnabled(False)
-    if had_goals:
-      self.log("Generated poses cleared. Click 'Generate Pose' to enable Start again.")
-
-  def _stop_calibrator(self, clear_generated_goals):
-    if clear_generated_goals:
-      self._set_save_yaml_ready(False)
-      self._clear_generated_goals()
-
-    if self.auto_running:
-      self.log("Stopping auto calibration sequence...")
-      self.ros_if.stop_motion()
-      self._finish_automation(False, "Auto run canceled by user.")
-
+    self.manual_capture_in_flight = False
+    self.manual_compute_in_flight = False
+    self.reset_samples_in_flight = False
+    self.preview_compute_in_flight = False
     if self.calib_process is None:
-      self.log("Calibrator is not running.")
-      self.stop_btn.setEnabled(False)
+      if log_not_running:
+        self.log("Calibrator is not running.")
+      self._update_mode_dependent_ui()
       return
     self.log("Stopping calibrator...")
     try:
-      self.calib_process.terminate()
+      try:
+        os.killpg(os.getpgid(self.calib_process.pid), signal.SIGTERM)
+      except ProcessLookupError:
+        pass
       try:
         self.calib_process.wait(timeout=3.0)
       except subprocess.TimeoutExpired:
-        self.calib_process.kill()
+        try:
+          os.killpg(os.getpgid(self.calib_process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+          pass
+        self.calib_process.wait(timeout=1.0)
     finally:
       self.calib_process = None
-      self.manual_capture_in_flight = False
-      self.manual_compute_in_flight = False
-      self.manual_sample_count = 0
-      self.stop_btn.setEnabled(self.auto_running)
+      self._set_sample_count(0)
       self.log("Calibrator stopped.")
       self._update_mode_dependent_ui()
 
   def stop_calibrator(self, *_):
-    self._stop_calibrator(clear_generated_goals=True)
-
-  @staticmethod
-  def _order_goals_for_motion(goals):
-    return sorted(
-      goals,
-      key=lambda pose: (
-        float(pose.distance_to_tag_mm),
-        float(pose.z),
-        float(pose.tilt_from_seed_deg),
-        float(pose.x),
-        float(pose.y),
-      ),
-    )
-
-  def _lookup_gripper_to_camera_pose(self):
-    gripper_frame = self.gripper_frame.text().strip() or "Link6"
-    camera_frame = self.camera_frame.text().strip() or "camera_link"
-    if gripper_frame == camera_frame:
-      return identity_transform_pose_mm()
-
-    pose = self.ros_if.lookup_pose_mm(gripper_frame, camera_frame)
-    if pose is None:
-      self.log(
-        f"Cannot resolve TF '{gripper_frame}' -> '{camera_frame}'. "
-        "Need a valid camera mount transform for camera-centered motion."
-      )
-      return None
-    return pose
-
-  def align_to_tag(self):
-    self._persist_all_ui_settings(log_changes=False)
-    self.ros_if.apply_calibration_mode_tool(self._current_calibration_mode())
-    if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
-      self.log("Align is disabled in eye-to-hand manual mode. Drag the robot, then click Get Sample.")
-      return
-    if self.auto_running:
-      self.log("Cannot align while auto calibration is running.")
-      return
-    if self.align_in_flight:
-      self.log("Align command is already in progress.")
-      return
-
-    seed_pose = self.ros_if.get_latest_tcp()
-    if seed_pose is None:
-      self.log("No live TCP pose yet on dobot_msgs_v4/msg/ToolVectorActual. Cannot align.")
-      return
-
-    min_distance_mm = float(self.min_tag_distance_mm.value())
-    max_distance_mm = float(self.max_tag_distance_mm.value())
-    min_base_z_mm = float(self.min_base_z_mm.value())
-    if min_distance_mm <= 0.0:
-      self.log("Min tag distance must be > 0 for align.")
-      return
-    if max_distance_mm < min_distance_mm:
-      max_distance_mm = min_distance_mm
-
-    parent_frame = self.base_frame.text().strip() or "base_link"
-    target_frame = self.target_frame.text().strip() or "tag_frame"
-    tag_pose = self.ros_if.lookup_pose_mm(parent_frame, target_frame)
-    if tag_pose is None:
-      self.log(
-        f"Cannot resolve TF '{parent_frame}' -> '{target_frame}'. "
-        "Need a valid tag transform before align."
-      )
-      return
-
-    gripper_to_camera_pose = self._lookup_gripper_to_camera_pose()
-    if gripper_to_camera_pose is None:
-      return
-
-    if not self.ros_if.ensure_motion_ready(timeout_sec=0.5):
-      self.log("Motion service is not ready: /dobot_bringup_ros2/srv/MovJ")
-      return
-
-    self.ros_if.clear_ik_joint_cache()
-    if not self.ros_if.ensure_ik_ready(timeout_sec=0.25):
-      self.log("[align] IK service is not ready. Joint-mode MovJ requires IK.")
-      return
-
-    distance_count = 1 if max_distance_mm <= min_distance_mm else 12
-    distance_candidates = []
-    for index in range(distance_count):
-      if distance_count == 1:
-        distance = min_distance_mm
-      else:
-        distance = min_distance_mm + ((max_distance_mm - min_distance_mm) * index / float(distance_count - 1))
-      distance_candidates.append(distance)
-
-    goal = None
-    rejected_details = []
-    for distance in distance_candidates:
-      candidate = build_align_goal_pose(
-        seed_pose,
-        tag_pose,
-        gripper_to_camera_pose,
-        distance,
-        min_base_z_mm,
-      )
-      if candidate is None:
-        rejected_details.append(f"{distance:.0f} mm: geometry/min-z")
-        continue
-
-      ok, detail = self.ros_if.check_pose_reachable_ik(candidate, timeout_sec=0.4)
-      if ok is True:
-        goal = candidate
-        break
-      rejected_details.append(f"{distance:.0f} mm: {detail}")
-
-    if goal is None:
-      self.log(
-        f"[align] No IK-valid camera-centered pose in distance range "
-        f"{min_distance_mm:.0f}-{max_distance_mm:.0f} mm."
-      )
-      for detail in rejected_details[:6]:
-        self.log(f"  [align] reject {detail}")
-      if len(rejected_details) > 6:
-        self.log(f"  [align] ... {len(rejected_details) - 6} more rejected distance(s).")
-      return
-
-    self.ros_if.publish_goal_pose_transforms(parent_frame, [goal])
-    self.align_in_flight = True
-    self.align_btn.setEnabled(False)
-    self.log(
-      f"[align] Camera-centered move ({goal.distance_to_tag_mm:.0f} mm) -> "
-      f"x={goal.x:.1f} y={goal.y:.1f} z={goal.z:.1f} "
-      f"rx={goal.rx:.1f} ry={goal.ry:.1f} rz={goal.rz:.1f}"
-    )
-    ik_joints = self.ros_if.get_cached_ik_joint_solution(goal)
-    if ik_joints is None:
-      self.align_in_flight = False
-      self.align_btn.setEnabled(True)
-      self.log("[align] IK joint solution missing; aborting move.")
-      return
-    self.log("[align] Dispatch mode: MovJ joint.")
-    future = self.ros_if.send_movj_goal(joint_values=ik_joints)
-    if future is None:
-      self.align_in_flight = False
-      self.align_btn.setEnabled(True)
-      self.log("[align] Failed to dispatch motion command.")
-      return
-    future.add_done_callback(self._on_align_move_done)
-
-  def _on_align_move_done(self, future):
-    self.align_in_flight = False
-    self._update_mode_dependent_ui()
-    try:
-      res = future.result()
-      if int(getattr(res, "res", 0)) != 0:
-        self.log(
-          f"[align] Move command rejected: res={res.res}, reply={res.robot_return}"
-        )
-        return
-      self.log("[align] Move command accepted.")
-    except Exception as exc:
-      self.log(f"[align] Move command failed: {exc}")
+    self._stop_calibrator()
 
   def _check_calibrator_process(self):
     if self.calib_process is None:
@@ -1595,11 +1090,13 @@ class CalibGui(QtWidgets.QWidget):
       return
     # Process exited on its own; mirror UI state and close GUI so launch shuts down cleanly.
     self.log("Calibrator process exited; closing GUI.")
-    self.auto_running = False
     self.manual_capture_in_flight = False
     self.manual_compute_in_flight = False
+    self.reset_samples_in_flight = False
+    self.preview_compute_in_flight = False
+    self._calibrator_ready = False
+    self._active_calibrator_config = None
     self.calib_process = None
-    self.stop_btn.setEnabled(False)
     QtWidgets.QApplication.instance().quit()
 
   def _refresh_overlay(self):
@@ -1623,226 +1120,50 @@ class CalibGui(QtWidgets.QWidget):
     self.overlay_label.setText("")
     self.overlay_label.setPixmap(pixmap)
 
-  @staticmethod
-  def _angle_error_deg(current_deg, target_deg):
-    wrapped = (float(current_deg) - float(target_deg) + 180.0) % 360.0
-    return abs(wrapped - 180.0)
-
-  def _goal_reached(self, current_tcp, target_pose):
-    pos_tol_mm = 5.0
-    rot_tol_deg = 2.0
-    if abs(current_tcp[0] - target_pose.x) > pos_tol_mm:
-      return False
-    if abs(current_tcp[1] - target_pose.y) > pos_tol_mm:
-      return False
-    if abs(current_tcp[2] - target_pose.z) > pos_tol_mm:
-      return False
-    if self._angle_error_deg(current_tcp[3], target_pose.rx) > rot_tol_deg:
-      return False
-    if self._angle_error_deg(current_tcp[4], target_pose.ry) > rot_tol_deg:
-      return False
-    if self._angle_error_deg(current_tcp[5], target_pose.rz) > rot_tol_deg:
-      return False
-    return True
-
   def _check_tag_visibility_gate(self, log_rejections):
     mode = self._current_calibration_mode()
-    camera_frame = self.camera_frame.text().strip() or "camera_link"
-    target_frame = self.target_frame.text().strip() or "tag_frame"
-    pose = self.ros_if.lookup_pose_mm_with_age(camera_frame, target_frame, timeout_sec=0.08)
+    camera_frame = self.camera_frame.text().strip() or default_camera_frame_for_mode(
+      mode, self.camera_prefix.text())
+    target_frame = TAG_FRAME
+    pose = self.ros_if.lookup_pose_mm_with_age(
+      camera_frame,
+      target_frame,
+      timeout_sec=0.08 if log_rejections else 0.01,
+      warn_on_failure=log_rejections,
+    )
     if pose is None:
-      message = f"Cannot resolve TF '{camera_frame}' -> '{target_frame}'."
+      message = f"No TF sample yet for {camera_frame} -> {target_frame}."
+      self._tag_stability_history = []
       if log_rejections:
         self.log(f"[visibility] {message}")
       return False, message
 
-    _tx, _ty, _tz, _qx, _qy, _qz, _qw, age_sec = pose
+    _tx, _ty, _tz, _qx, _qy, _qz, _qw, stamp_age_sec = pose
+    tf_age_sec = self.ros_if.latest_dynamic_tf_age(camera_frame, target_frame)
+    age_sec = tf_age_sec if tf_age_sec is not None else stamp_age_sec
     if not math.isfinite(age_sec) or age_sec > TAG_FRAME_MAX_AGE_SEC:
       age_text = "unknown" if not math.isfinite(age_sec) else f"{max(0.0, age_sec):.3f}s"
       message = (
         f"Tag TF is stale (age {age_text}, max {TAG_FRAME_MAX_AGE_SEC:.2f}s). "
         "All 4 calibration markers must be visible."
       )
+      self._tag_stability_history = []
       if log_rejections:
         self.log(f"[visibility] {message}")
       return False, message
 
-    detail = f"all 4 markers visible, tf_age={max(0.0, age_sec):.3f}s"
-    if mode == CALIB_MODE_EYE_TO_HAND:
-      detail += "; distance/tilt gates ignored in manual eye-to-hand"
+    stable, stability_detail = self._update_tag_stability((camera_frame, target_frame), pose)
+    if not stable:
+      message = (
+        f"tf_age={max(0.0, age_sec):.3f}s; {stability_detail} "
+        "All 4 calibration markers must stay visible before sampling."
+      )
+      if log_rejections:
+        self.log(f"[visibility] {message}")
+      return False, message
+
+    detail = f"all 4 markers visible, tf_age={max(0.0, age_sec):.3f}s; {stability_detail}"
     return True, detail
-
-  def _dispatch_next_auto_move(self):
-    if self.auto_goal_index >= len(self.generated_goals):
-      self.log("All goal poses captured. Computing calibration...")
-      self.auto_state = "waiting_compute"
-      dispatched = self._call_trigger_async("compute_calibration", self._on_compute_done)
-      if not dispatched:
-        self._finish_automation(False, "Failed to call compute_calibration.")
-      return
-
-    goal = self.generated_goals[self.auto_goal_index]
-    ik_joints = self.ros_if.get_cached_ik_joint_solution(goal)
-    if ik_joints is None:
-      self._finish_automation(
-        False,
-        f"Missing IK joint solution for goal {self.auto_goal_index + 1}; aborting.",
-      )
-      return
-    future = self.ros_if.send_movj_goal(joint_values=ik_joints)
-    if future is None:
-      self._finish_automation(False, "Failed to dispatch motion command (MovJ unavailable).")
-      return
-
-    goal_no = self.auto_goal_index + 1
-    self.log(
-      f"[auto] Move {goal_no}/{len(self.generated_goals)} -> "
-      f"x={goal.x:.1f} y={goal.y:.1f} z={goal.z:.1f} "
-      f"rx={goal.rx:.1f} ry={goal.ry:.1f} rz={goal.rz:.1f} mode=joint"
-    )
-    future.add_done_callback(lambda f, step=goal_no: self._on_move_command_done(f, step))
-    self.auto_target_pose = goal
-    self.auto_move_deadline = time.monotonic() + 40.0
-    self.auto_state = "waiting_motion"
-
-  def _run_auto_step(self):
-    if not self.auto_running:
-      return
-
-    if self.auto_state == "dispatch_move":
-      self._dispatch_next_auto_move()
-      return
-
-    if self.auto_state == "waiting_motion":
-      if time.monotonic() > self.auto_move_deadline:
-        self._finish_automation(
-          False,
-          f"Move timeout at goal {self.auto_goal_index + 1}.",
-        )
-        return
-
-      current_tcp = self.ros_if.get_latest_tcp()
-      if current_tcp is None or self.auto_target_pose is None:
-        return
-
-      if self._goal_reached(current_tcp, self.auto_target_pose):
-        self.auto_settle_deadline = time.monotonic() + 2.0
-        self.auto_state = "settling"
-      return
-
-    if self.auto_state == "settling":
-      if time.monotonic() < self.auto_settle_deadline:
-        return
-      mode = self._current_calibration_mode()
-      visible, visibility_detail = self._check_tag_visibility_gate(log_rejections=True)
-      if not visible:
-        goal_no = self.auto_goal_index + 1
-        if mode == CALIB_MODE_EYE_TO_HAND:
-          self.log(
-            f"[auto] Skip goal {goal_no}/{len(self.generated_goals)}: "
-            "tag visibility gate failed."
-          )
-          self.auto_goal_index += 1
-          self.auto_capture_retry = 0
-          self.auto_state = "dispatch_move"
-          return
-        if self.auto_capture_retry < 3:
-          self.auto_capture_retry += 1
-          self.log(
-            f"[auto] Waiting at goal {goal_no}/{len(self.generated_goals)}: "
-            f"{visibility_detail}"
-          )
-          self.auto_settle_deadline = time.monotonic() + 1.0
-          self.auto_state = "settling"
-          return
-        self._finish_automation(
-          False,
-          f"Sample capture blocked at goal {goal_no}: {visibility_detail}",
-        )
-        return
-      self.log(f"[visibility] OK: {visibility_detail}")
-      self.auto_capture_retry += 1
-      self.auto_state = "waiting_capture"
-      dispatched = self._call_trigger_async("add_sample", self._on_add_sample_done)
-      if not dispatched:
-        self._finish_automation(False, "Failed to call add_sample.")
-      return
-
-  def _on_reset_samples_done(self, success, message):
-    if not self.auto_running:
-      return
-    prefix = "OK" if success else "ERROR"
-    self.log(f"[reset_samples] {prefix}: {message}")
-    if not success:
-      self._finish_automation(False, "Cannot continue without resetting samples.")
-      return
-    self.auto_state = "dispatch_move"
-
-  def _on_move_command_done(self, future, step_index):
-    if not self.auto_running:
-      return
-    try:
-      res = future.result()
-      if int(getattr(res, "res", 0)) != 0:
-        self._finish_automation(
-          False,
-          f"Move command rejected at step {step_index}: res={res.res}, reply={res.robot_return}",
-        )
-    except Exception as exc:
-      self._finish_automation(False, f"Move command failed at step {step_index}: {exc}")
-
-  def _on_add_sample_done(self, success, message):
-    if not self.auto_running:
-      return
-    if success:
-      self.log(
-        f"[add_sample] OK ({self.auto_goal_index + 1}/{len(self.generated_goals)}): {message}"
-      )
-      self.auto_goal_index += 1
-      self.auto_capture_retry = 0
-      self.auto_state = "dispatch_move"
-      return
-
-    self.log(f"[add_sample] ERROR: {message}")
-    if self.auto_capture_retry < 3:
-      self.log(f"Retrying sample capture at goal {self.auto_goal_index + 1}...")
-      self.auto_settle_deadline = time.monotonic() + 2.0
-      self.auto_state = "settling"
-      return
-    self._finish_automation(
-      False,
-      f"Sample capture failed repeatedly at goal {self.auto_goal_index + 1}.",
-    )
-
-  def _on_compute_done(self, success, message):
-    if not self.auto_running:
-      return
-    prefix = "OK" if success else "ERROR"
-    self.log(f"[compute_calibration] {prefix}: {message}")
-    message_lc = str(message or "").lower()
-    tf_broadcasted = ("broadcasted static tf" in message_lc) and ("calibrated_camera_link" in message_lc)
-    if success:
-      if tf_broadcasted:
-        self._set_save_yaml_ready(True)
-      else:
-        self._set_save_yaml_ready(False)
-        self.log("[ui] Save YAML not highlighted: compute succeeded but TF broadcast was not confirmed.")
-      self._finish_automation(True, "Auto calibration run completed.")
-    else:
-      self._set_save_yaml_ready(False)
-      self._finish_automation(False, "Auto run ended with compute failure.")
-
-  def _finish_automation(self, success, final_message):
-    if final_message:
-      self.log(final_message)
-    self.auto_running = False
-    self.auto_state = "idle"
-    self.auto_target_pose = None
-    self.auto_move_deadline = 0.0
-    self.auto_settle_deadline = 0.0
-    self.auto_capture_retry = 0
-    self._set_controls_during_auto(False)
-    self.stop_btn.setEnabled(self.calib_process is not None)
 
   @staticmethod
   def _parse_sample_total(message):
@@ -1854,73 +1175,107 @@ class CalibGui(QtWidgets.QWidget):
     except ValueError:
       return None
 
-  def handle_add_button_clicked(self):
-    if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND:
-      self.get_manual_eye_to_hand_sample()
+  def _request_preview_calibration(self, sample_count):
+    if sample_count < 3:
       return
-    self.generate_goal_poses()
+    if self.preview_compute_in_flight:
+      return
 
-  def get_manual_eye_to_hand_sample(self):
+    self.preview_compute_in_flight = True
+    dispatched = self._call_trigger_async(
+      "preview_calibration",
+      self._on_preview_calibration_done,
+    )
+    if not dispatched:
+      self.preview_compute_in_flight = False
+      self.log("Failed to call preview_calibration.")
+
+  def _on_preview_calibration_done(self, success, message):
+    self.preview_compute_in_flight = False
+    if success:
+      self._set_live_transform_text(self._extract_transform_block(message))
+    else:
+      self.log(f"[preview_calibration] ERROR: {message}")
+      self._set_live_transform_text(f"Live calibrated TF preview\n{message}")
+    self._update_mode_dependent_ui()
+    self._update_undo_button_state()
+
+  def handle_add_button_clicked(self):
+    self.get_manual_sample()
+
+  def get_manual_sample(self):
     self._persist_all_ui_settings(log_changes=False)
-    self.ros_if.apply_calibration_mode_tool(CALIB_MODE_EYE_TO_HAND)
-    if self.auto_running:
-      self.log("Cannot manually capture while auto calibration is running.")
+    self.ros_if.apply_calibration_mode_tool(self._current_calibration_mode())
+    if not self._apply_aruco_ids_to_perception(log_result=False):
       return
     if self.manual_capture_in_flight or self.manual_compute_in_flight:
-      self.log("Manual capture/compute is already in progress.")
+      self.log("Sample capture/compute is already in progress.")
+      return
+    if self.reset_samples_in_flight:
+      self.log("Reset samples is already in progress.")
       return
 
-    visible, visibility_detail = self._check_tag_visibility_gate(log_rejections=True)
+    if self.calib_process is None:
+      if self.start_calibrator():
+        self.log("Calibrator was not running; wait for services to become ready, then click Get Sample.")
+      return
+    if not self._ensure_active_calibrator_matches_ui():
+      return
+    if not self._calibrator_ready:
+      self.log("Calibration services are still starting; wait for Get Sample to enable.")
+      self._update_mode_dependent_ui()
+      return
+
+    visible, _detail = self._check_tag_visibility_gate(log_rejections=True)
     if not visible:
       self.log("Sample not added: visibility gate failed.")
       return
 
-    if self.calib_process is None:
-      self.manual_sample_count = 0
-      self._set_save_yaml_ready(False)
-      if not self.start_calibrator():
-        return
-
     self._set_save_yaml_ready(False)
     self.manual_capture_in_flight = True
     self.add_btn.setEnabled(False)
-    self.log(f"[manual] Capturing sample {self.manual_sample_count + 1}: {visibility_detail}")
+    self.reset_samples_btn.setEnabled(False)
     dispatched = self._call_trigger_async("add_sample", self._on_manual_add_sample_done)
     if not dispatched:
       self.manual_capture_in_flight = False
-      self.add_btn.setEnabled(True)
       self.log("Failed to call add_sample for manual capture.")
+      self._update_mode_dependent_ui()
+      self._update_undo_button_state()
 
   def _on_manual_add_sample_done(self, success, message):
     self.manual_capture_in_flight = False
-    prefix = "OK" if success else "ERROR"
-    self.log(f"[add_sample] {prefix}: {message}")
     if not success:
+      self.log(f"[add_sample] ERROR: {message}")
       self._update_mode_dependent_ui()
+      self._update_undo_button_state()
       return
 
     parsed_total = self._parse_sample_total(message)
-    if parsed_total is not None:
-      self.manual_sample_count = parsed_total
-    else:
-      self.manual_sample_count += 1
-
-    required = int(self.min_samples.value())
-    if self.manual_sample_count < required:
-      remaining = required - self.manual_sample_count
-      self.log(
-        f"[manual] {self.manual_sample_count}/{required} samples collected. "
-        f"Need {remaining} more before computing."
-      )
+    if parsed_total is None:
+      self.log(f"[add_sample] ERROR: response did not include solver sample count: {message}")
       self._update_mode_dependent_ui()
+      self._update_undo_button_state()
       return
 
-    self.log(
-      f"[manual] {self.manual_sample_count}/{required} samples collected. "
-      "Computing updated calibration TF..."
-    )
+    self._set_sample_count(parsed_total)
+
+    required = int(self.min_samples.value())
+    self._log_sample_count()
+    preview_from_add_sample = "transform:" in str(message or "")
+    if preview_from_add_sample:
+      self._set_live_transform_text(self._extract_transform_block(message))
+
+    if self.manual_sample_count < required:
+      if not preview_from_add_sample:
+        self._request_preview_calibration(self.manual_sample_count)
+      self._update_mode_dependent_ui()
+      self._update_undo_button_state()
+      return
+
     self.manual_compute_in_flight = True
     self.add_btn.setEnabled(False)
+    self.undo_last_btn.setEnabled(False)
+    self.reset_samples_btn.setEnabled(False)
     dispatched = self._call_trigger_async("compute_calibration", self._on_manual_compute_done)
     if not dispatched:
       self.manual_compute_in_flight = False
@@ -1929,209 +1284,153 @@ class CalibGui(QtWidgets.QWidget):
 
   def _on_manual_compute_done(self, success, message):
     self.manual_compute_in_flight = False
-    prefix = "OK" if success else "ERROR"
-    self.log(f"[compute_calibration] {prefix}: {message}")
     message_lc = str(message or "").lower()
-    tf_broadcasted = ("broadcasted static tf" in message_lc) and ("calibrated_camera_link" in message_lc)
+    expected_frame = default_calibrated_camera_frame_for_mode(self._current_calibration_mode())
+    tf_broadcasted = ("broadcasted static tf" in message_lc) and (expected_frame in message_lc)
     if success and tf_broadcasted:
+      self._set_live_transform_text(self._extract_transform_block(message))
       self._set_save_yaml_ready(True)
-      self.log("[manual] Updated calibration TF is live. Add more samples to refine, or Save YAML if satisfied.")
     elif success:
+      self._set_live_transform_text(self._extract_transform_block(message))
       self._set_save_yaml_ready(False)
-      self.log("[ui] Save YAML not highlighted: compute succeeded but TF broadcast was not confirmed.")
     else:
       self._set_save_yaml_ready(False)
-      self.log("[manual] Calibration compute failed. Add another sample or inspect TF visibility.")
+      self.log(f"[compute_calibration] ERROR: {message}")
     self._update_mode_dependent_ui()
+    self._update_undo_button_state()
 
-  def generate_goal_poses(self):
-    self._persist_all_ui_settings(log_changes=False)
+  def undo_last_sample(self):
+    if self.manual_capture_in_flight or self.manual_compute_in_flight or self.reset_samples_in_flight:
+      self.log("Cannot undo while sample capture/compute/reset is in progress.")
+      return
+    if self.calib_process is None:
+      self.log("Calibrator is not running. No active samples to undo.")
+      self._set_sample_count(0)
+      return
+    if self.manual_sample_count <= 0:
+      self.log("No samples to undo.")
+      return
+
     self._set_save_yaml_ready(False)
-    self.generated_goals = []
-    self.start_btn.setEnabled(False)
-    goals = self._build_and_publish_goal_poses(log_preview=True)
-    if goals:
-      self.generated_goals = goals
-      self.start_btn.setEnabled(not self.auto_running)
+    self.undo_last_btn.setEnabled(False)
+    self.reset_samples_btn.setEnabled(False)
+    dispatched = self._call_trigger_async("remove_last_sample", self._on_undo_last_sample_done)
+    if not dispatched:
+      self._update_undo_button_state()
+      self.log("Failed to call remove_last_sample.")
 
-  def _build_and_publish_goal_poses(self, log_preview):
-    seed_pose = self.ros_if.get_latest_tcp()
-    if seed_pose is None:
-      self.log("No live TCP pose yet on dobot_msgs_v4/msg/ToolVectorActual. Cannot generate goals.")
-      return None
-    self.ros_if.apply_calibration_mode_tool(self._current_calibration_mode())
-    self.ros_if.clear_ik_joint_cache()
+  def _on_undo_last_sample_done(self, success, message):
+    prefix = "OK" if success else "ERROR"
+    self.log(f"[remove_last_sample] {prefix}: {message}")
+    if not success:
+      self._update_undo_button_state()
+      return
 
-    sample_count = int(self.min_samples.value())
-    if sample_count <= 0:
-      self.log("Minimum samples must be > 0.")
-      return None
+    parsed_total = self._parse_sample_total(message)
+    if parsed_total is not None:
+      self._set_sample_count(parsed_total)
+    else:
+      self._set_sample_count(self.manual_sample_count - 1)
 
-    mode = self._current_calibration_mode()
-    eye_to_hand = mode == CALIB_MODE_EYE_TO_HAND
-    if eye_to_hand:
-      self.log("Eye-to-hand is manual. Drag the robot, then click Get Sample.")
-      return None
-
-    min_distance_mm = float(self.min_tag_distance_mm.value())
-    max_distance_mm = float(self.max_tag_distance_mm.value())
-    max_tilt_deg = float(self.max_tilt_deg.value())
-    look_up_bias_deg = float(self.look_up_bias_deg.value())
-    min_base_z_mm = float(self.min_base_z_mm.value())
-    if min_distance_mm >= max_distance_mm:
-      self.log("Invalid distance limits: min distance must be smaller than max distance.")
-      return None
-
-    parent_frame = self.base_frame.text().strip() or "base_link"
-    if parent_frame != "base_link":
-      self.log(
-        f"Note: Min base Z height is checked in '{parent_frame}'. "
-        "Set Base frame to 'base_link' for strict base_link constraint."
-      )
-    target_frame = self.target_frame.text().strip() or "tag_frame"
-    tag_pose = None
-    gripper_to_camera_pose = identity_transform_pose_mm()
-    visible, visibility_message = self._check_tag_visibility_gate(log_rejections=False)
-    if not visible:
-      self.log(
-        "Eye-on-hand needs all 4 markers visible before pose generation. "
-        f"Current visibility check failed: {visibility_message}"
-      )
-      return None
-    tag_pose = self.ros_if.lookup_pose_mm(parent_frame, target_frame)
-    if tag_pose is None:
-      self.log(
-        f"Cannot resolve TF '{parent_frame}' -> '{target_frame}'. "
-        "Need a valid tag transform before generating look-at poses."
-      )
-      return None
-    gripper_to_camera_pose = self._lookup_gripper_to_camera_pose()
-    if gripper_to_camera_pose is None:
-      return None
-
-    ik_ready = self.ros_if.ensure_ik_ready(timeout_sec=0.25)
-    if not ik_ready:
-      self.log("IK service is not ready. Joint-mode MovJ requires IK for every goal.")
-      return None
-    ik_rejected = 0
-    ik_checked = 0
-    ik_rounds_used = 0
-    skipped_by_distance = 0
-    skipped_by_tilt = 0
-    skipped_by_height = 0
-
-    goals = []
-    self.log(
-      f"IK pre-check enabled: generating {sample_count} poses first, "
-      "then refilling only failed/missing poses."
+    self._set_save_yaml_ready(False)
+    self._log_sample_count()
+    parent_frame = (
+      self.base_frame.text().strip()
+      if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND
+      else self.gripper_frame.text().strip()
     )
-    seen_goal_keys = set()
-    max_refill_rounds = 8
-
-    for round_idx in range(max_refill_rounds):
-      missing = sample_count - len(goals)
-      if missing <= 0:
-        break
-
-      ik_rounds_used = round_idx + 1
-      batch, skip_d, skip_t, skip_h = build_goal_pose_sequence(
-        seed_pose,
-        tag_pose,
-        gripper_to_camera_pose,
-        missing,
-        min_distance_mm,
-        max_distance_mm,
-        max_tilt_deg,
-        look_up_bias_deg,
-        min_base_z_mm,
-        sequence_offset=round_idx * 409,
+    calibrated_frame = default_calibrated_camera_frame_for_mode(self._current_calibration_mode())
+    if self.manual_sample_count < 3:
+      self._set_live_transform_text(
+        f"Live calibrated TF preview\n{parent_frame} -> {calibrated_frame}\nWaiting for 3 samples."
       )
-      skipped_by_distance += skip_d
-      skipped_by_tilt += skip_t
-      skipped_by_height += skip_h
+      self._update_mode_dependent_ui()
+      self._update_undo_button_state()
+      return
 
-      if not batch:
-        if round_idx == 0:
-          self.log("Failed to generate poses: invalid seed/tag geometry.")
-          return None
-        self.log(f"No additional candidates available in refill round {ik_rounds_used}.")
-        break
+    if self.manual_sample_count >= int(self.min_samples.value()):
+      self.manual_compute_in_flight = True
+      self.add_btn.setEnabled(False)
+      self.undo_last_btn.setEnabled(False)
+      self.reset_samples_btn.setEnabled(False)
+      dispatched = self._call_trigger_async("compute_calibration", self._on_manual_compute_done)
+      if not dispatched:
+        self.manual_compute_in_flight = False
+        self.log("Failed to recompute calibration after undo.")
+        self._update_mode_dependent_ui()
+        self._update_undo_button_state()
+      return
 
-      self.log(
-        f"IK batch {ik_rounds_used}: generated {len(batch)} candidate pose(s) "
-        f"for {missing} missing pose(s)."
+    self._request_preview_calibration(self.manual_sample_count)
+    self._update_mode_dependent_ui()
+    self._update_undo_button_state()
+
+  def _confirm_reset_samples(self):
+    dialog = QtWidgets.QMessageBox(self)
+    dialog.setIcon(QtWidgets.QMessageBox.Warning)
+    dialog.setWindowTitle("Reset Samples?")
+    dialog.setText("Delete all calibration samples?")
+    dialog.setInformativeText(
+      "This cannot be undone. The current calibration sample set will be cleared."
+    )
+    reset_button = dialog.addButton("Reset Samples", QtWidgets.QMessageBox.DestructiveRole)
+    cancel_button = dialog.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+    dialog.setDefaultButton(cancel_button)
+    dialog.exec_()
+    return dialog.clickedButton() == reset_button
+
+  def reset_samples(self):
+    if self.manual_capture_in_flight or self.manual_compute_in_flight or self.reset_samples_in_flight:
+      self.log("Cannot reset while sample capture/compute/reset is in progress.")
+      return
+    if self.calib_process is None:
+      self.log("Calibrator is not running. No active samples to reset.")
+      self._set_sample_count(0)
+      self._set_save_yaml_ready(False)
+      return
+    if self.manual_sample_count <= 0:
+      self.log("No samples to reset.")
+      return
+    if not self._confirm_reset_samples():
+      self.log("Reset samples canceled.")
+      return
+
+    self._set_save_yaml_ready(False)
+    self.reset_samples_in_flight = True
+    self.add_btn.setEnabled(False)
+    self.undo_last_btn.setEnabled(False)
+    self.reset_samples_btn.setEnabled(False)
+    dispatched = self._call_trigger_async("reset_samples", self._on_reset_samples_done)
+    if not dispatched:
+      self.reset_samples_in_flight = False
+      self.log("Failed to call reset_samples.")
+      self._update_mode_dependent_ui()
+      self._update_undo_button_state()
+
+  def _on_reset_samples_done(self, success, message):
+    self.reset_samples_in_flight = False
+    prefix = "OK" if success else "ERROR"
+    self.log(f"[reset_samples] {prefix}: {message}")
+    if success:
+      self._set_sample_count(0)
+      parent_frame = (
+        self.base_frame.text().strip()
+        if self._current_calibration_mode() == CALIB_MODE_EYE_TO_HAND
+        else self.gripper_frame.text().strip()
       )
-      accepted_this_round = 0
-      for index, pose in enumerate(batch, start=1):
-        key = goal_pose_key(pose)
-        if key in seen_goal_keys:
-          continue
-        seen_goal_keys.add(key)
-
-        ik_checked += 1
-        ok, detail = self.ros_if.check_pose_reachable_ik(pose, timeout_sec=0.4)
-        if ok is True:
-          goals.append(pose)
-          accepted_this_round += 1
-          if len(goals) >= sample_count:
-            break
-          continue
-
-        ik_rejected += 1
-        self.log(f"  [ik] reject r{ik_rounds_used} pose {index}: {detail}")
-
-      if len(goals) >= sample_count:
-        break
-      if accepted_this_round == 0:
-        self.log(f"Round {ik_rounds_used} added no IK-valid new poses.")
-
-    if not goals:
-      self.log("All generated goals were rejected by IK pre-check.")
-      return None
-
-    published = self.ros_if.publish_goal_pose_transforms(parent_frame, goals)
-    if not published:
-      self.log("Failed to publish goal pose TFs.")
-      return None
-
-    if log_preview:
-      self.log(
-        f"Generated {len(goals)} camera-centered goal pose frame(s) under parent '{parent_frame}'. "
-        f"The camera frame is aimed at '{target_frame}' for each pose."
+      calibrated_frame = default_calibrated_camera_frame_for_mode(self._current_calibration_mode())
+      self._set_live_transform_text(
+        f"Live calibrated TF preview\n{parent_frame} -> {calibrated_frame}\nWaiting for 3 samples."
       )
-      if len(goals) < sample_count:
-        self.log(
-          f"Requested {sample_count}, but only {len(goals)} satisfied safety limits "
-          f"(min/max distance {min_distance_mm:.0f}/{max_distance_mm:.0f} mm, "
-          f"max tilt {max_tilt_deg:.1f} deg, look up {look_up_bias_deg:.1f} deg, "
-          f"min z {min_base_z_mm:.0f} mm)."
-        )
-      if ik_rejected:
-        self.log(f"IK pre-check rejected {ik_rejected} pose(s) out of {ik_checked}.")
-      if ik_rounds_used:
-        self.log(f"IK refill rounds used: {ik_rounds_used}.")
-      if skipped_by_distance or skipped_by_tilt or skipped_by_height:
-        self.log(
-          f"Filtered out candidates: distance={skipped_by_distance}, "
-          f"tilt={skipped_by_tilt}, low_z={skipped_by_height}."
-        )
-      preview_count = min(5, len(goals))
-      for index in range(preview_count):
-        p = goals[index]
-        self.log(
-          f"  goal {index + 1}: "
-          f"x={p.x:.1f} y={p.y:.1f} z={p.z:.1f} "
-          f"rx={p.rx:.1f} ry={p.ry:.1f} rz={p.rz:.1f} "
-          f"dist={p.distance_to_tag_mm:.1f} tilt={p.tilt_from_seed_deg:.1f}"
-        )
-      if len(goals) > preview_count:
-        self.log(f"  ... {len(goals) - preview_count} more goal poses.")
-    return goals
+      self._log_sample_count()
+    self._update_mode_dependent_ui()
+    self._update_undo_button_state()
 
   def _call_trigger_async(self, service_name, done_callback):
-    client = self.ros_if.get_client(service_name)
+    service_path = self._calibrator_service_name(service_name)
+    client = self.ros_if.get_client(service_path)
     if client is None:
-      self.log(f"Service /{service_name} unavailable.")
+      self.log(f"Service {service_path} unavailable.")
       return False
 
     future = client.call_async(Trigger.Request())
@@ -2160,13 +1459,18 @@ class CalibGui(QtWidgets.QWidget):
       except Exception as exc:
         self.log(f"[{service_name}] call failed: {exc}")
 
-    client = self.ros_if.get_client(service_name)
+    service_path = self._calibrator_service_name(service_name)
+    client = self.ros_if.get_client(service_path)
     if client is None:
-      self.log(f"Service /{service_name} unavailable. Ensure calibrator is running.")
+      self.log(f"Service {service_path} unavailable. Ensure calibrator is running.")
       return
 
     future = client.call_async(Trigger.Request())
     future.add_done_callback(done_callback)
+
+  def _calibrator_service_name(self, service_name):
+    name = str(service_name or "").strip().strip("/")
+    return f"{self._calibrator_namespace}/{name}"
 
   def save_yaml(self):
     self._persist_all_ui_settings(log_changes=False)
@@ -2181,18 +1485,17 @@ class RosInterface(Node):
   def __init__(self):
     super().__init__("camera_calibration_gui")
     self._client_map = {}
-    self._latest_tcp = None
     self._latest_overlay_qimage = None
     self._latest_overlay_received_monotonic = None
+    self._latest_dynamic_tf_received_monotonic = {}
     self._unsupported_overlay_encodings = set()
     self._tf_buffer = Buffer()
     self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
-    self._goal_tf_broadcaster = StaticTransformBroadcaster(self)
-    self._motion_service_root = str(
-      self.declare_parameter("motion_service_root", "/dobot_bringup_ros2/srv").value
-    ).rstrip("/")
     self._default_calibration_mode = normalize_calibration_mode(
       self.declare_parameter("calibration_mode", CALIB_MODE_EYE_ON_HAND).value
+    )
+    self._robot_ip_address = resolve_robot_ip_address(
+      self.declare_parameter("robot_ip_address", "").value
     )
     self._default_camera_prefix = normalize_camera_prefix(
       self.declare_parameter(
@@ -2209,6 +1512,15 @@ class RosInterface(Node):
       self._default_calibration_mode,
       self._default_camera_prefix,
     )
+    self._default_aruco_ids = DEFAULT_ARUCO_IDS.copy()
+    aruco_ids_value = self.declare_parameter("aruco_ids", DEFAULT_ARUCO_IDS).value
+    aruco_ids, aruco_ids_reason = coerce_aruco_ids(aruco_ids_value)
+    if aruco_ids is None:
+      self.get_logger().warn(
+        f"Invalid aruco_ids parameter: {aruco_ids_reason} Using {format_aruco_ids(DEFAULT_ARUCO_IDS)}."
+      )
+    else:
+      self._default_aruco_ids = aruco_ids
     self._color_topic = str(
       self.declare_parameter(
         "color_topic",
@@ -2227,19 +1539,6 @@ class RosInterface(Node):
         f"/{self._default_camera_prefix}/color/camera_info",
       ).value
     )
-    self._auto_move_speed_l = int(self.declare_parameter("auto_move_speed_l", 35).value)
-    self._auto_move_acc_l = int(self.declare_parameter("auto_move_acc_l", 35).value)
-    self._ik_user = str(self.declare_parameter("ik_user", "0").value)
-    self._ik_tool = str(self.declare_parameter("ik_tool", "0").value)
-    self._active_ik_tool = str(self._ik_tool)
-    self._ik_use_joint_near = str(self.declare_parameter("ik_use_joint_near", "0").value)
-    self._ik_joint_near = str(
-      self.declare_parameter("ik_joint_near", "{0,0,0,0,0,0}").value
-    )
-    self._ik_joint_solution_cache = {}
-    self._movj_client = self.create_client(MovJ, f"{self._motion_service_root}/MovJ")
-    self._stop_motion_client = self.create_client(Stop, f"{self._motion_service_root}/Stop")
-    self._ik_client = self.create_client(InverseKin, f"{self._motion_service_root}/InverseKin")
     self._aruco_set_parameters_client = self.create_client(
       SetParameters,
       "/aruco_perception/set_parameters",
@@ -2251,27 +1550,37 @@ class RosInterface(Node):
     self.apply_calibration_mode_tool(self._default_calibration_mode)
 
     self.create_subscription(
-      ToolVectorActual,
-      "dobot_msgs_v4/msg/ToolVectorActual",
-      self._tcp_callback,
-      10,
-    )
-    self.create_subscription(
       Image,
       "/aruco_overlay",
       self._overlay_callback,
       5,
     )
+    self.create_subscription(
+      TFMessage,
+      "/tf",
+      self._tf_callback,
+      50,
+    )
 
   def get_client(self, service_name):
     if service_name in self._client_map:
-      return self._client_map[service_name]
-    client = self.create_client(Trigger, service_name, qos_profile=qos_profile_services_default)
+      client = self._client_map[service_name]
+    else:
+      client = self.create_client(Trigger, service_name, qos_profile=qos_profile_services_default)
+      self._client_map[service_name] = client
+
     if not client.wait_for_service(timeout_sec=1.5):
       self.get_logger().warn(f"Service {service_name} not available")
       return None
-    self._client_map[service_name] = client
     return client
+
+  def is_trigger_service_ready(self, service_name, timeout_sec=0.0):
+    if service_name in self._client_map:
+      client = self._client_map[service_name]
+    else:
+      client = self.create_client(Trigger, service_name, qos_profile=qos_profile_services_default)
+      self._client_map[service_name] = client
+    return bool(client.wait_for_service(timeout_sec=max(0.0, float(timeout_sec))))
 
   def get_default_calibration_mode(self):
     return self._default_calibration_mode
@@ -2282,18 +1591,53 @@ class RosInterface(Node):
   def get_default_camera_frame(self):
     return self._default_camera_frame
 
+  def get_default_aruco_ids(self):
+    return list(self._default_aruco_ids)
+
+  def get_robot_ip_address(self):
+    return self._robot_ip_address
+
   def get_camera_topics(self):
     return self._color_topic, self._depth_topic, self._camera_info_topic
+
+  @staticmethod
+  def _tf_key(parent_frame, child_frame):
+    return (
+      str(parent_frame or "").strip().strip("/"),
+      str(child_frame or "").strip().strip("/"),
+    )
+
+  def _tf_callback(self, msg):
+    received = time.monotonic()
+    for transform in msg.transforms:
+      key = self._tf_key(transform.header.frame_id, transform.child_frame_id)
+      self._latest_dynamic_tf_received_monotonic[key] = received
+
+  def latest_dynamic_tf_age(self, parent_frame, child_frame):
+    received = self._latest_dynamic_tf_received_monotonic.get(
+      self._tf_key(parent_frame, child_frame)
+    )
+    if received is None:
+      return None
+    return time.monotonic() - received
+
+  @staticmethod
+  def _to_parameter_msg(parameter_spec):
+    if isinstance(parameter_spec, Parameter):
+      return parameter_spec.to_parameter_msg()
+    if len(parameter_spec) == 2:
+      name, value = parameter_spec
+      parameter_type = Parameter.Type.STRING
+    else:
+      name, parameter_type, value = parameter_spec
+    return Parameter(name, parameter_type, value).to_parameter_msg()
 
   def _call_set_parameters(self, client, parameters, unavailable_message, timeout_sec=1.5):
     if not client.wait_for_service(timeout_sec=timeout_sec):
       return False, unavailable_message
 
     req = SetParameters.Request()
-    req.parameters = [
-      Parameter(name, Parameter.Type.STRING, value).to_parameter_msg()
-      for name, value in parameters
-    ]
+    req.parameters = [self._to_parameter_msg(parameter_spec) for parameter_spec in parameters]
     future = client.call_async(req)
     deadline = time.monotonic() + max(0.1, float(timeout_sec))
     while rclpy.ok() and (not future.done()) and time.monotonic() < deadline:
@@ -2360,102 +1704,21 @@ class RosInterface(Node):
       f"ArUco: {aruco_detail}; calibration_perception: {perception_detail}",
     )
 
-  def ensure_motion_ready(self, timeout_sec=0.5):
-    return self._movj_client.wait_for_service(timeout_sec=timeout_sec)
+  def set_calibration_aruco_ids(self, ids, timeout_sec=1.5):
+    normalized = [int(marker_id) for marker_id in ids]
+    success, detail = self._call_set_parameters(
+      self._calibration_perception_set_parameters_client,
+      [("marker_ids", Parameter.Type.INTEGER_ARRAY, normalized)],
+      "Service unavailable: /calibration_perception/set_parameters.",
+      timeout_sec=timeout_sec,
+    )
+    if success:
+      self._default_aruco_ids = normalized
+      return True, f"{TAG_FRAME} now fits depth board pose from ArUco IDs {format_aruco_ids(normalized)}."
+    return False, detail
 
-  def ensure_ik_ready(self, timeout_sec=0.5):
-    return self._ik_client.wait_for_service(timeout_sec=timeout_sec)
-
-  def clear_ik_joint_cache(self):
-    self._ik_joint_solution_cache.clear()
-
-  def apply_calibration_mode_tool(self, _calibration_mode):
-    self._active_ik_tool = str(self._ik_tool)
-
-  @staticmethod
-  def _is_nonzero_tool_value(tool_value):
-    text = str(tool_value or "").strip().lower()
-    return text not in ("", "0", "false", "off", "no")
-
-  def get_cached_ik_joint_solution(self, goal_pose):
-    return self._ik_joint_solution_cache.get(goal_pose_key(goal_pose))
-
-  def check_pose_reachable_ik(self, goal_pose, timeout_sec=0.5):
-    if not self.ensure_ik_ready(timeout_sec=0.2):
-      return None, "IK service unavailable"
-
-    req = InverseKin.Request()
-    req.x = float(goal_pose.x)
-    req.y = float(goal_pose.y)
-    req.z = float(goal_pose.z)
-    req.rx = float(goal_pose.rx)
-    req.ry = float(goal_pose.ry)
-    req.rz = float(goal_pose.rz)
-    req.user = self._ik_user
-    req.tool = self._active_ik_tool
-    req.use_joint_near = self._ik_use_joint_near
-    req.joint_near = self._ik_joint_near
-
-    future = self._ik_client.call_async(req)
-    deadline = time.monotonic() + max(0.05, float(timeout_sec))
-    while rclpy.ok() and (not future.done()) and time.monotonic() < deadline:
-      rclpy.spin_once(self, timeout_sec=0.01)
-
-    if not future.done():
-      return False, "IK timeout"
-
-    try:
-      response = future.result()
-    except Exception as exc:
-      return False, f"IK call failed: {exc}"
-
-    if int(getattr(response, "res", -1)) == 0:
-      joint_values = parse_joint_values_from_robot_return(getattr(response, "robot_return", ""))
-      if joint_values is None:
-        return False, "IK returned no parseable joint solution"
-      self._ik_joint_solution_cache[goal_pose_key(goal_pose)] = joint_values
-      return True, "IK OK"
-    return False, f"res={response.res}, reply={response.robot_return}"
-
-  def send_movj_goal(self, joint_values):
-    if not self.ensure_motion_ready(timeout_sec=0.5):
-      self.get_logger().warn(
-        f"Motion service not available: {self._motion_service_root}/MovJ"
-      )
-      return None
-    if joint_values is None or len(joint_values) < 6:
-      self.get_logger().warn("Joint-mode MovJ requires 6 joint values.")
-      return None
-
-    speed_l = max(1, min(100, int(self._auto_move_speed_l)))
-    acc_l = max(1, min(100, int(self._auto_move_acc_l)))
-    req = MovJ.Request()
-    req.mode = True
-    req.a = float(joint_values[0])
-    req.b = float(joint_values[1])
-    req.c = float(joint_values[2])
-    req.d = float(joint_values[3])
-    req.e = float(joint_values[4])
-    req.f = float(joint_values[5])
-    motion_args = [f"v={speed_l},a={acc_l}"]
-    if self._is_nonzero_tool_value(self._active_ik_tool):
-      motion_args.append("tool=1")
-    req.param_value = motion_args
-    return self._movj_client.call_async(req)
-
-  def stop_motion(self):
-    if not self._stop_motion_client.wait_for_service(timeout_sec=0.2):
-      return False
-    self._stop_motion_client.call_async(Stop.Request())
-    return True
-
-  def _tcp_callback(self, msg):
-    self._latest_tcp = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
-
-  def get_latest_tcp(self):
-    if self._latest_tcp is None:
-      return None
-    return list(self._latest_tcp)
+  def apply_calibration_mode_tool(self, calibration_mode):
+    self._default_calibration_mode = normalize_calibration_mode(calibration_mode)
 
   def _overlay_callback(self, msg):
     image = self._image_msg_to_qimage(msg)
@@ -2499,33 +1762,24 @@ class RosInterface(Node):
       )
     return None
 
-  def lookup_translation_mm(self, parent_frame, child_frame, timeout_sec=0.15):
-    timeout_ns = int(max(0.01, float(timeout_sec)) * 1e9)
-    try:
-      tf_msg = self._tf_buffer.lookup_transform(
-        parent_frame,
-        child_frame,
-        Time(),
-        timeout=Duration(nanoseconds=timeout_ns),
-      )
-      return (
-        float(tf_msg.transform.translation.x) * 1000.0,
-        float(tf_msg.transform.translation.y) * 1000.0,
-        float(tf_msg.transform.translation.z) * 1000.0,
-      )
-    except TransformException as exc:
-      self.get_logger().warn(
-        f"TF lookup failed ({parent_frame} -> {child_frame}): {exc}"
-      )
-      return None
-
-  def lookup_pose_mm(self, parent_frame, child_frame, timeout_sec=0.15):
-    pose = self.lookup_pose_mm_with_age(parent_frame, child_frame, timeout_sec)
+  def lookup_pose_mm(self, parent_frame, child_frame, timeout_sec=0.15, warn_on_failure=True):
+    pose = self.lookup_pose_mm_with_age(
+      parent_frame,
+      child_frame,
+      timeout_sec,
+      warn_on_failure=warn_on_failure,
+    )
     if pose is None:
       return None
     return pose[:7]
 
-  def lookup_pose_mm_with_age(self, parent_frame, child_frame, timeout_sec=0.15):
+  def lookup_pose_mm_with_age(
+    self,
+    parent_frame,
+    child_frame,
+    timeout_sec=0.15,
+    warn_on_failure=True,
+  ):
     timeout_ns = int(max(0.01, float(timeout_sec)) * 1e9)
     try:
       tf_msg = self._tf_buffer.lookup_transform(
@@ -2549,39 +1803,11 @@ class RosInterface(Node):
         float(age_sec),
       )
     except TransformException as exc:
-      self.get_logger().warn(
-        f"TF lookup failed ({parent_frame} -> {child_frame}): {exc}"
-      )
+      if warn_on_failure:
+        self.get_logger().warn(
+          f"TF lookup failed ({parent_frame} -> {child_frame}): {exc}"
+        )
       return None
-
-  def publish_goal_pose_transforms(self, parent_frame, goals):
-    if not parent_frame:
-      self.get_logger().warn("Empty parent_frame for goal poses.")
-      return False
-    if not goals:
-      self.get_logger().warn("No goal poses to publish.")
-      return False
-
-    now_msg = self.get_clock().now().to_msg()
-    transforms = []
-    for index, pose in enumerate(goals, start=1):
-      tf_msg = TransformStamped()
-      tf_msg.header.stamp = now_msg
-      tf_msg.header.frame_id = parent_frame
-      tf_msg.child_frame_id = f"calib_goal_{index:02d}"
-      tf_msg.transform.translation.x = float(pose.x) / 1000.0
-      tf_msg.transform.translation.y = float(pose.y) / 1000.0
-      tf_msg.transform.translation.z = float(pose.z) / 1000.0
-      qx, qy, qz, qw = rpy_deg_to_quaternion(pose.rx, pose.ry, pose.rz)
-      tf_msg.transform.rotation.x = qx
-      tf_msg.transform.rotation.y = qy
-      tf_msg.transform.rotation.z = qz
-      tf_msg.transform.rotation.w = qw
-      transforms.append(tf_msg)
-
-    self._goal_tf_broadcaster.sendTransform(transforms)
-    return True
-
 
 def main(args=None):
   rclpy.init(args=args)

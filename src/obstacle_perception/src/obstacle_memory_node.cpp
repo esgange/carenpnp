@@ -21,7 +21,7 @@ ObstacleMemoryNode::ObstacleMemoryNode(const rclcpp::NodeOptions & options)
   skip_if_live_ = declare_parameter<bool>("skip_if_live", true);
   blue_tint_ = declare_parameter<double>("blue_tint", 0.02);
   frustum_enable_ = declare_parameter<bool>("frustum_enable", true);
-  frustum_frame_ = declare_parameter<std::string>("frustum_frame", "calibrated_camera_link");
+  frustum_frame_ = declare_parameter<std::string>("frustum_frame", "arm_calibrated_camera_link");
   frustum_near_ = declare_parameter<double>("frustum_near", 0.1);
   frustum_far_ = declare_parameter<double>("frustum_far", 3.0);
   frustum_hfov_deg_ = declare_parameter<double>("frustum_hfov_deg", 65.0);
@@ -212,7 +212,7 @@ void ObstacleMemoryNode::publishMemory()
 
   sensor_msgs::msg::PointCloud2 cloud;
   cloud.header.stamp = this->now();
-  cloud.header.frame_id = last_frame_id_.empty() ? "calibrated_camera_link" : last_frame_id_;
+  cloud.header.frame_id = last_frame_id_.empty() ? "arm_calibrated_camera_link" : last_frame_id_;
   cloud.height = 1;
   cloud.is_dense = false;
 

@@ -31,6 +31,16 @@ CAMERA_FORWARD_ARGS = (
     'enable_point_cloud',
 )
 
+CAMERA_WATCHDOG_FORWARD_ARGS = (
+    'watchdog_enabled',
+    'watchdog_namespace',
+    'watchdog_startup_timeout_sec',
+    'watchdog_health_timeout_sec',
+    'watchdog_check_period_sec',
+    'watchdog_restart_delay_sec',
+    'watchdog_restart_backoff_max_sec',
+)
+
 
 OPTIONAL_NODE_PARAMETER_OVERRIDES = {
     'item_pick': {
@@ -510,12 +520,24 @@ def _launch_setup(context, *args, **kwargs):
                     value = _stringify(configured).strip()
             if value:
                 camera_args[key] = value
+        for key in CAMERA_WATCHDOG_FORWARD_ARGS:
+            value = _launch_value(context, f'camera_{key}')
+            if not value:
+                settings_key = key.removeprefix('watchdog_')
+                configured = _nested(settings, f'camera.watchdog.{settings_key}')
+                if configured is not None and _stringify(configured).strip() != '':
+                    value = _stringify(configured).strip()
+            if value:
+                camera_args[key] = value
         actions.append(_include('orbbec_camera_launcher', 'camera_headless.launch.py', camera_args))
 
     if _flag(context, settings, workspace_root, 'launch_item_detect', 'launch.item_detect'):
-        actions.append(_include('item_perception', 'item_detect.launch.py', {
+        item_detect_camera_args = dict(item_camera_args)
+        item_detect_camera_args.pop('camera_control_service_root', None)
+        actions.append(_include('item_perception_yolo', 'item_detect_yolo.launch.py', {
             'params_file': _optional_setting(context, settings, workspace_root, 'item_detect_params_file', 'item_detect.params_file', path=True),
             'profiles_dir': item_profiles_dir,
+            'model_root': item_profiles_dir,
             'selected_profile_path': _selected_profile_path(
                 context,
                 settings,
@@ -584,7 +606,7 @@ def _launch_setup(context, *args, **kwargs):
             ),
             'start_visualization': start_visualization,
             'headless': 'true',
-            **item_camera_args,
+            **item_detect_camera_args,
             **item_calibration_args,
         }))
 
@@ -862,6 +884,8 @@ def generate_launch_description():
         ],
     ]
     for key in CAMERA_FORWARD_ARGS:
+        args.append(_override_arg(f'camera_{key}'))
+    for key in CAMERA_WATCHDOG_FORWARD_ARGS:
         args.append(_override_arg(f'camera_{key}'))
 
     return LaunchDescription([

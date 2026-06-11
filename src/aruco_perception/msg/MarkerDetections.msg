@@ -6,3 +6,6 @@ int32[] ids
 geometry_msgs/Pose[] poses
 geometry_msgs/Point[] pixel_centers
 geometry_msgs/Polygon[] pixel_corners
+# Depth-derived 3D points in header.frame_id, one entry per marker.
+geometry_msgs/Point[] camera_centers
+geometry_msgs/Polygon[] camera_corners

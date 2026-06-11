@@ -2188,7 +2188,7 @@ workspace:
     - ament_index_python
     - launch
     - launch_ros
-    src/camera_calibration/launch/platform_teach.launch.py:
+    src/platform_calibration/launch/platform_calibration.launch.py:
     - ament_index_python
     - launch
     - launch_ros

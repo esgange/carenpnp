@@ -1,9 +1,9 @@
 cameras:
 - slot: 1
-  serial_number: CP1Z842000YW
+  serial_number: CP9JA53000CS
   camera_name: bin_camera
 - slot: 2
-  serial_number: CP9JA530001W
+  serial_number: CP9JA5300025
   camera_name: robot_camera
 orbbec_launch_args:
   device_preset: High Accuracy

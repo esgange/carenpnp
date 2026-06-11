@@ -73,6 +73,7 @@ def generate_launch_description():
     item_name = LaunchConfiguration("item_name")
     bin_teach_dir = LaunchConfiguration("bin_teach_dir")
     runtime_root = LaunchConfiguration("runtime_root")
+    saved_sessions_root = LaunchConfiguration("saved_sessions_root")
     runtime_settings_path = LaunchConfiguration("runtime_settings_path")
     profile_dir = LaunchConfiguration("profile_dir")
     model_root = LaunchConfiguration("model_root")
@@ -90,6 +91,8 @@ def generate_launch_description():
     train_epochs = LaunchConfiguration("train_epochs")
     train_imgsz = LaunchConfiguration("train_imgsz")
     train_device = LaunchConfiguration("train_device")
+    train_use_gpu_if_available = LaunchConfiguration("train_use_gpu_if_available")
+    record_fps = LaunchConfiguration("record_fps")
     display_scale = LaunchConfiguration("display_scale")
     live_view_enabled = LaunchConfiguration("live_view_enabled")
     overlay_enabled = LaunchConfiguration("overlay_enabled")
@@ -109,6 +112,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "runtime_root",
             default_value=_repo_path("config", "item_perception_yolo", "item_teach_yolo_runtime"),
+        ),
+        DeclareLaunchArgument(
+            "saved_sessions_root",
+            default_value=_repo_path("config", "item_perception_yolo", "item_teach_yolo_saved_sessions"),
         ),
         DeclareLaunchArgument(
             "runtime_settings_path",
@@ -135,11 +142,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("train_epochs", default_value="80"),
         DeclareLaunchArgument("train_imgsz", default_value="640"),
-        DeclareLaunchArgument("train_device", default_value="cpu"),
+        DeclareLaunchArgument("train_device", default_value="0"),
+        DeclareLaunchArgument("train_use_gpu_if_available", default_value="true"),
+        DeclareLaunchArgument("record_fps", default_value="5.0"),
         DeclareLaunchArgument("display_scale", default_value="1.0"),
         DeclareLaunchArgument("live_view_enabled", default_value="true"),
         DeclareLaunchArgument("overlay_enabled", default_value="true"),
-        DeclareLaunchArgument("clear_runtime_on_start", default_value="true"),
+        DeclareLaunchArgument("clear_runtime_on_start", default_value="false"),
         DeclareLaunchArgument(
             "python_executable",
             default_value=_repo_path(".venv", "bin", "python"),
@@ -158,6 +167,7 @@ def generate_launch_description():
                     "item_name": item_name,
                     "bin_teach_dir": bin_teach_dir,
                     "runtime_root": runtime_root,
+                    "saved_sessions_root": saved_sessions_root,
                     "runtime_settings_path": runtime_settings_path,
                     "profile_dir": profile_dir,
                     "model_root": model_root,
@@ -174,7 +184,10 @@ def generate_launch_description():
                     "yolo_base_model": yolo_base_model,
                     "train_epochs": ParameterValue(train_epochs, value_type=int),
                     "train_imgsz": ParameterValue(train_imgsz, value_type=int),
-                    "train_device": train_device,
+                    "train_device": ParameterValue(train_device, value_type=str),
+                    "train_use_gpu_if_available": ParameterValue(
+                        train_use_gpu_if_available, value_type=bool),
+                    "record_fps": ParameterValue(record_fps, value_type=float),
                     "display_scale": ParameterValue(display_scale, value_type=float),
                     "live_view_enabled": ParameterValue(live_view_enabled, value_type=bool),
                     "overlay_enabled": ParameterValue(overlay_enabled, value_type=bool),

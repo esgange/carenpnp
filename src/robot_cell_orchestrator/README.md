@@ -75,7 +75,10 @@ ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py
 
 This starts the configured Orbbec cameras, `item_detect`, `item_pick` in
 headless service mode, `tray_detect`, and `tray_intercept` in headless service
-mode. RViz is available as a launch argument and is off by default:
+mode. The camera watchdog publishes `/camera_watchdog/status` and
+`/camera_watchdog/healthy`, and automatically relaunches camera drivers whose
+color/depth streams stop. RViz is available as a launch argument and is off by
+default:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py launch_rviz:=true
@@ -96,7 +99,8 @@ WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_runtime_headless_settings.ya
 
 That file owns camera launch selection, RViz on/off, online/offline profile
 dirs, topics, service names, calibration paths, and child runtime settings file
-paths. Launch arguments are overrides only, for example:
+paths. Its `camera.watchdog` section controls startup/health timeouts and
+restart backoff. Launch arguments are overrides only, for example:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py launch_rviz:=true mode:=offline
@@ -167,14 +171,15 @@ nodes are launched manually.
 
 ```text
 WORKSPACE_ROOT/teach/bin_teach
-WORKSPACE_ROOT/teach/item_teach
+WORKSPACE_ROOT/teach/item_teach_yolo
 WORKSPACE_ROOT/teach/tray_teach
 ```
 
-The offline dropdowns choose the bin, item, and tray teach files used for the
-manual cycle gate. When Robot Cell Orchestrator launches offline item/tray detect nodes, it
-passes the selected item/tray teach file as `selected_profile_path:=...`. It does
-not copy teach files or remember the selected teach in detect runtime settings.
+The offline dropdowns choose the bin, YOLO item, and tray teach files used for
+the manual cycle gate. When Robot Cell Orchestrator launches offline item/tray
+detect nodes, it passes the selected item/tray teach file as
+`selected_profile_path:=...`. It does not copy teach files or remember the
+selected teach in detect runtime settings.
 
 The right panel also has an **External Bridge** control above **Node Launcher**.
 When Robot Cell Orchestrator is in Offline mode, that button starts `cell_external_bridge` in

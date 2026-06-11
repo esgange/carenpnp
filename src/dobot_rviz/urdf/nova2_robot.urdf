@@ -401,12 +401,4 @@
       effort="0"
       velocity="0" />
   </joint>
-
-  <link name="camera_link" />
-
-  <joint name="camera_mount" type="fixed">
-    <origin xyz="0 -0.074 -0.03" rpy="-0.174533 0 0" />
-    <parent link="Link6" />
-    <child link="camera_link" />
-  </joint>
 </robot>

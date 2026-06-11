@@ -226,6 +226,7 @@ protected:
 private:
     rclcpp::TimerBase::SharedPtr kTimer;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr kPublisherInfo;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr kPublisher200mSDIStatus;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::EnableRobot>> kServiceEnableRobot;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::DisableRobot>> kServiceDisableRobot;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::ClearError>> kServiceClearError;
@@ -320,11 +321,13 @@ private:
 private:
     void getErrorID(std::vector<int> &Vec);
     void pubFeedBackInfo();
+    void pub200mSDIStatus(const std::string robotIp);
 
 private:
     std::string kRobotName;
     std::shared_ptr<CRCommanderRos2> commander_;
     std::thread threadPubFeedBackInfo;
+    std::thread threadPub200mSDIStatus;
 };
 
 #endif // CRROBOTROS2_H

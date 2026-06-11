@@ -1,22 +1,22 @@
 item_teach_runtime:
   ros__parameters:
-    red_threshold: 182
-    green_threshold: 183
-    blue_threshold: 159
-    color_exposure_us: 0
+    red_threshold: 139
+    green_threshold: 141
+    blue_threshold: 146
+    color_exposure_us: 8
     depth_exposure_us: 0
-    color_exposure_percent: 0
+    color_exposure_percent: 7
     depth_exposure_percent: 0
     color_exposure_min_us: 1
     color_exposure_max_us: 100
     depth_exposure_min_us: 1
     depth_exposure_max_us: 32000
-    rgb_hole_fill_sensitivity: 17
+    rgb_hole_fill_sensitivity: 0
     rgb_mask_dilate_px: 1
-    depth_null_fill_sensitivity: 44
-    depth_window_mm: 22
-    depth_hole_fill_sensitivity: 0
+    depth_null_fill_sensitivity: 6
+    depth_window_mm: 70
+    depth_hole_fill_sensitivity: 3
     depth_trim_px: 1
-    adaptive_depth_trim_max_add_px: 4
-    adaptive_depth_trim_max_height_mm: 138
-    blob_tolerance_percent: 16
+    adaptive_depth_trim_max_add_px: 2
+    adaptive_depth_trim_max_height_mm: 112
+    blob_tolerance_percent: 10

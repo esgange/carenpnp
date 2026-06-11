@@ -88,7 +88,7 @@ private:
 
   image_geometry::PinholeCameraModel cam_model_;
 
-  const std::string output_frame_{"calibrated_camera_link"};
+  const std::string output_frame_{"arm_calibrated_camera_link"};
   std::string color_topic_;
   std::string depth_topic_;
   std::string camera_info_topic_;

@@ -114,6 +114,10 @@ Defaults:
 If calibration is enabled and no usable YAML is available, launch shows an error
 dialog and exits.
 
+For robot IP `192.168.200.1`, `tray_detect.launch.py` does not auto-select an
+eye-on-hand file. It opens a filtered chooser, or requires
+`calibration_file:=<path>` when running headless.
+
 ## Inputs
 
 | Topic | Type |

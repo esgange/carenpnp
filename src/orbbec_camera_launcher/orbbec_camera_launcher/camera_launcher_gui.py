@@ -771,7 +771,8 @@ class CameraLauncherApp:
         errors = self._mapping_errors()
         if errors:
             title = 'Auto launch skipped' if auto else 'Camera mapping incomplete'
-            messagebox.showwarning(title, '\n'.join(errors))
+            if not auto:
+                messagebox.showwarning(title, '\n'.join(errors))
             self._append_scan_text('\nCamera launch skipped:\n' + '\n'.join(errors) + '\n')
             self._update_ui_state()
             return
@@ -780,10 +781,10 @@ class CameraLauncherApp:
         if not pairs:
             message = 'No configured camera slots have both serial number and camera name.'
             if auto:
-                messagebox.showwarning('Auto launch skipped', message)
+                self._append_scan_text(f'\nAuto launch skipped: {message}\n')
             else:
                 messagebox.showerror('No cameras configured', message)
-            self._append_scan_text(f'\n{message}\n')
+                self._append_scan_text(f'\n{message}\n')
             self._update_ui_state()
             return
 
@@ -856,7 +857,8 @@ class CameraLauncherApp:
                 message = 'No camera connected. No camera nodes were launched.'
             if warnings:
                 message = message + '\n\n' + '\n'.join(warnings)
-            messagebox.showwarning('No camera connected', message)
+            if not auto:
+                messagebox.showwarning('No camera connected', message)
             self._append_scan_text('\n' + message + '\n')
             self._update_ui_state()
             self.status_var.set('No camera connected')
@@ -873,13 +875,18 @@ class CameraLauncherApp:
             )
             if unconfigured:
                 message += '\n\n' + '\n'.join(warnings[: 1 + len(unconfigured)])
-            messagebox.showwarning('Partial camera startup', message)
+            if not auto:
+                messagebox.showwarning('Partial camera startup', message)
+            else:
+                self.status_var.set('Auto launching connected configured camera(s)')
             self._append_scan_text('\n' + message + '\n')
         elif warnings:
-            messagebox.showwarning(
-                'Partial camera startup',
-                '\n'.join(warnings) + '\n\nLaunching detected configured camera(s).',
-            )
+            message = '\n'.join(warnings) + '\n\nLaunching detected configured camera(s).'
+            if not auto:
+                messagebox.showwarning('Partial camera startup', message)
+            else:
+                self.status_var.set('Auto launching connected configured camera(s)')
+            self._append_scan_text('\n' + message + '\n')
 
         self._launch_camera_pairs(launch_pairs)
 
@@ -1009,11 +1016,12 @@ class CameraLauncherApp:
         command = [
             'ros2',
             'launch',
-            'orbbec_camera',
-            'gemini_330_series.launch.py',
-            f'camera_name:={pair["camera_name"]}',
-            f'serial_number:={pair["serial_number"]}',
+            'orbbec_camera_launcher',
+            'camera_headless.launch.py',
+            f'config_file:={self.config_path}',
+            f'enabled_cameras:={pair["camera_name"]}',
             f'device_num:={getattr(self, "sequential_device_num", max(1, len(pending) + 1))}',
+            f'watchdog_namespace:=camera_watchdog/{pair["camera_name"]}',
             *orbbec_launch_args,
         ]
         display_command = shell_join(command)

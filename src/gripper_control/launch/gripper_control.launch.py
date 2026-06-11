@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from pathlib import Path
 
 def _ros_domain_action():
@@ -30,6 +31,7 @@ def _ros_domain_action():
 
 def generate_launch_description():
     do_service = LaunchConfiguration('do_service')
+    di_status_topic = LaunchConfiguration('di_status_topic')
     auto_off_on_exit = LaunchConfiguration('auto_off_on_exit')
 
     return LaunchDescription([
@@ -38,6 +40,11 @@ def generate_launch_description():
             'do_service',
             default_value='/dobot_bringup_ros2/srv/DO',
             description='Dobot DO service name',
+        ),
+        DeclareLaunchArgument(
+            'di_status_topic',
+            default_value='/dobot_bringup_ros2/DIStatus_200mS',
+            description='Dobot 30005 DI status topic containing digital_input_bits',
         ),
         DeclareLaunchArgument(
             'auto_off_on_exit',
@@ -52,7 +59,8 @@ def generate_launch_description():
             parameters=[
                 {
                     'do_service': do_service,
-                    'auto_off_on_exit': auto_off_on_exit,
+                    'di_status_topic': di_status_topic,
+                    'auto_off_on_exit': ParameterValue(auto_off_on_exit, value_type=bool),
                 }
             ],
         ),

@@ -2,6 +2,7 @@
 #include <string>
 #include <iostream>
 #include <cstdlib>
+#include <stdexcept>
 
 #include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
@@ -9,6 +10,7 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/robot_identity.hpp>
 #include <dobot_common/workspace_paths.hpp>
 
 namespace aruco_perception
@@ -20,10 +22,12 @@ public:
   : Node("perception_calibration"), static_broadcaster_(std::make_shared<tf2_ros::StaticTransformBroadcaster>(this))
   {
     parent_frame_ = this->declare_parameter<std::string>("parent_frame", "Link6");
-    child_frame_ = this->declare_parameter<std::string>("child_frame", "calibrated_camera_link");
+    child_frame_ = this->declare_parameter<std::string>("child_frame", "arm_calibrated_camera_link");
     calibration_dir_ = this->declare_parameter<std::string>(
       "calibration_dir", defaultCalibrationDir());
     calibration_file_ = this->declare_parameter<std::string>("calibration_file", "");
+    robot_ip_address_ = dobot_common::robot_identity::resolveRobotIpAddress(
+      this->declare_parameter<std::string>("robot_ip_address", ""), __FILE__);
     auto_discover_ = this->declare_parameter<bool>("auto_discover", true);
     // Only broadcast when a calibration file is found; otherwise prompt and skip publishing.
 
@@ -32,6 +36,15 @@ public:
     Eigen::Vector3d t = Eigen::Vector3d::Zero();
     bool loaded = false;
     std::string reason;
+
+    if (
+      calibration_file_.empty() &&
+      auto_discover_ &&
+      dobot_common::robot_identity::requiresManualCalibrationSelection(robot_ip_address_))
+    {
+      throw std::runtime_error(
+        "Robot IP 192.168.200.1 requires explicit calibration_file selection.");
+    }
 
     if (calibration_file_.empty() && auto_discover_)
     {
@@ -84,6 +97,7 @@ private:
   std::string child_frame_;
   std::string calibration_dir_;
   std::string calibration_file_;
+  std::string robot_ip_address_;
   bool auto_discover_{true};
 
   void publishTransform(const Eigen::Quaterniond &q_in, const Eigen::Vector3d &t_in)
@@ -123,8 +137,7 @@ private:
         return {};
       }
 
-      std::filesystem::path preferred_path;
-      std::filesystem::file_time_type preferred_time;
+      dobot_common::robot_identity::LatestRobotFileSelection selection;
       for (const auto &entry : std::filesystem::directory_iterator(calib_dir))
       {
         if (!entry.is_regular_file())
@@ -145,13 +158,9 @@ private:
         {
           continue;
         }
-        if (preferred_path.empty() || entry.last_write_time() > preferred_time)
-        {
-          preferred_path = p;
-          preferred_time = entry.last_write_time();
-        }
+        selection.consider(p, entry.last_write_time(), robot_ip_address_);
       }
-      return preferred_path.string();
+      return selection.selected().string();
     }
     catch (const std::exception &ex)
     {

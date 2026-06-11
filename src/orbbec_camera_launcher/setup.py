@@ -32,4 +32,9 @@ setup(
     description='Operator GUI for launching two Orbbec cameras by serial number.',
     license='BSD-3-Clause',
     tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'camera_watchdog = orbbec_camera_launcher.camera_watchdog:main',
+        ],
+    },
 )

@@ -2,6 +2,7 @@
 import math
 import os
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,19 +17,29 @@ from cv_bridge import CvBridge
 from dobot_msgs_v4.srv import MovJ
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped, TransformStamped
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import StaticTransformBroadcaster
 from visualization_msgs.msg import Marker
 
 
 WINDOW_NAME = "item_detect_view"
+BIN_CAMERA_COLOR_TOPIC = "/bin_camera/color/image_raw"
+BIN_CAMERA_DEPTH_TOPIC = "/bin_camera/depth/image_raw"
+BIN_CAMERA_INFO_TOPIC = "/bin_camera/color/camera_info"
 TOP_BAR_HEIGHT = 206
 PREVIEW_CANVAS_WIDTH = 1080
 PREVIEW_CANVAS_HEIGHT = 680
-BUTTON_HEIGHT = 34
+BUTTON_HEIGHT = 38
 DROPDOWN_ROW_HEIGHT = 34
 MAX_DROPDOWN_ROWS = 7
+SLIDER_HIT_PADDING = 14
+SEEK_WINDOW_MIN_SEC = 1.0
+SEEK_WINDOW_MAX_SEC = 60.0
+SEEK_DECAY_MIN_SEC = 0.1
+SEEK_DECAY_MAX_SEC = 1.0
 METERS_TO_MM = 1000.0
 
 
@@ -77,6 +88,16 @@ def workspace_path(*parts: str) -> Path:
     return workspace_root().joinpath(*parts)
 
 
+def normalize_calibration_type(value: object) -> str:
+    normalized = []
+    for ch in str(value or ""):
+        if ch.isalnum():
+            normalized.append(ch.lower())
+        elif ch in ("_", "-"):
+            normalized.append("_")
+    return "".join(normalized)
+
+
 @dataclass
 class Button:
     name: str
@@ -105,9 +126,9 @@ class ItemProfile:
     model_path: str = ""
     model_pt_path: str = ""
     model_dir: str = ""
-    color_topic: str = "/robot_camera/color/image_raw"
-    depth_topic: str = "/robot_camera/depth/image_raw"
-    camera_info_topic: str = "/robot_camera/color/camera_info"
+    color_topic: str = BIN_CAMERA_COLOR_TOPIC
+    depth_topic: str = BIN_CAMERA_DEPTH_TOPIC
+    camera_info_topic: str = BIN_CAMERA_INFO_TOPIC
     overlay_topic: str = "bin_overlay"
     roi_points: List[Tuple[float, float]] = field(default_factory=list)
     depth_plane: DepthPlane = field(default_factory=DepthPlane)
@@ -244,14 +265,47 @@ class ItemDetectYoloNode(Node):
             self.declare_parameter(
                 "model_root", str(workspace_path("teach", "item_teach_yolo"))
             ).value)
-        self.color_topic = self.declare_parameter("color_topic", "/robot_camera/color/image_raw").value
-        self.depth_topic = self.declare_parameter("depth_topic", "/robot_camera/depth/image_raw").value
-        self.camera_info_topic = self.declare_parameter("camera_info_topic", "/robot_camera/color/camera_info").value
+        selected_model_path_text = str(self.declare_parameter("selected_model_path", "").value).strip()
+        self.selected_model_path: Optional[Path] = (
+            resolve_path(selected_model_path_text) if selected_model_path_text else None)
+        selected_profile_path_text = str(self.declare_parameter("selected_profile_path", "").value).strip()
+        self.selected_profile_path: Optional[Path] = (
+            resolve_path(selected_profile_path_text) if selected_profile_path_text else None)
+        self.runtime_settings_path = resolve_path(
+            str(self.declare_parameter(
+                "runtime_settings_file",
+                str(workspace_path("config", "item_perception_yolo", "item_detect_yolo_runtime_settings.yaml")),
+            ).value))
+        self.selected_model_export_path = resolve_path(
+            str(self.declare_parameter(
+                "selected_model_export_file",
+                str(workspace_path("config", "item_perception_yolo", "item_detect_yolo_selected_model.txt")),
+            ).value))
+        self.selected_profile_export_path = resolve_path(
+            str(self.declare_parameter(
+                "selected_profile_export_file",
+                str(workspace_path("config", "item_perception", "item_detect_selected_profile.txt")),
+            ).value))
+        self.selected_profile_topic = str(
+            self.declare_parameter("selected_profile_topic", "item_detect/selected_profile").value
+        ).strip() or "item_detect/selected_profile"
+        self.color_topic = self.normalize_topic(
+            self.declare_parameter("color_topic", BIN_CAMERA_COLOR_TOPIC).value,
+            BIN_CAMERA_COLOR_TOPIC)
+        self.depth_topic = self.normalize_topic(
+            self.declare_parameter("depth_topic", BIN_CAMERA_DEPTH_TOPIC).value,
+            BIN_CAMERA_DEPTH_TOPIC)
+        self.camera_info_topic = self.normalize_topic(
+            self.declare_parameter("camera_info_topic", BIN_CAMERA_INFO_TOPIC).value,
+            BIN_CAMERA_INFO_TOPIC)
         self.overlay_topic = self.declare_parameter("overlay_topic", "bin_overlay").value
+        self.use_profile_camera_topics = as_bool(
+            self.declare_parameter("use_profile_camera_topics", True).value)
         self.seek_pose_topic = self.declare_parameter("bin_pose_topic", "bin_seek_pose").value
         self.item_pose_array_topic = self.declare_parameter("bin_item_pose_array_topic", "bin_item_poses").value
         self.item_cube_marker_topic = self.declare_parameter("bin_cube_marker_topic", "bin_cube_marker").value
         self.seek_service_name = self.declare_parameter("seek_service", "item_detect/seek").value
+        self.repick_service_name = self.declare_parameter("repick_service", "item_detect/repick").value
         self.seek_complete_service_name = self.declare_parameter(
             "seek_complete_service", "item_detect/seek_complete").value
         self.seek_status_service_name = self.declare_parameter(
@@ -259,15 +313,20 @@ class ItemDetectYoloNode(Node):
         self.go_to_teach_service_name = self.declare_parameter(
             "go_to_teach_service", "item_detect/go_to_teach").value
         self.movj_service_name = self.declare_parameter("movj_service", "/dobot_bringup_ros2/srv/MovJ").value
-        self.camera_frame = self.declare_parameter("camera_frame", "camera_color_optical_frame").value
+        self.camera_frame = str(self.declare_parameter("camera_frame", "").value).strip()
         self.use_calibration = as_bool(self.declare_parameter("use_calibration", True).value)
         self.publish_static_calibration_tf = as_bool(
             self.declare_parameter("publish_static_calibration_tf", True).value)
-        self.calibration_parent_frame = self.declare_parameter("calibration_parent_frame", "Link6").value
+        self.calibration_parent_frame = str(
+            self.declare_parameter("calibration_parent_frame", "base_link").value).strip() or "base_link"
         self.calibration_child_frame = self.declare_parameter(
-            "calibration_child_frame", "calibrated_camera_link").value
+            "calibration_child_frame", "bin_calibrated_camera_link").value
         self.calibration_file = self.declare_parameter("calibration_file", "").value
-        self.start_visualization = as_bool(self.declare_parameter("start_visualization", True).value)
+        self.robot_ip_address = self.declare_parameter("robot_ip_address", "").value
+        self.headless = as_bool(self.declare_parameter("headless", False).value)
+        self.start_visualization = (
+            as_bool(self.declare_parameter("start_visualization", True).value) and
+            not self.headless)
         self.publish_overlay = as_bool(self.declare_parameter("publish_overlay", True).value)
         self.align_item_z_axis_to_depth_plane = as_bool(
             self.declare_parameter("align_item_z_axis_to_depth_plane", True).value)
@@ -288,23 +347,29 @@ class ItemDetectYoloNode(Node):
         self.selected_pose: Optional[Pose3D] = None
         self.peak_pixel: Optional[Tuple[int, int]] = None
         self.last_inference_time = 0.0
+        self.last_camera_render_time = 0.0
         self.status = "Loading YOLO profiles"
         self.seek_mode_active = False
+        self.seek_result_latched = False
         self.seek_started_time = 0.0
         self.last_seek_pose: Optional[Pose3D] = None
         self.last_seek_pose_time = 0.0
         self.go_to_teach_in_progress = False
         self.pending_delete_profile: Optional[Path] = None
         self.pending_delete_deadline = 0.0
+        self.delete_confirm_active = False
+        self.delete_confirm_dialog_rect = (0, 0, 0, 0)
+        self.delete_confirm_cancel_rect = (0, 0, 0, 0)
+        self.delete_confirm_accept_rect = (0, 0, 0, 0)
+        self.debug_images_enabled = False
         self.view_mode = "RGB"
         self.active_slider: Optional[str] = None
 
         self.buttons: Dict[str, Button] = {}
         self.slider_rects: Dict[str, Tuple[int, int, int, int]] = {}
-        self.profile_dropdown_open = False
-        self.profile_option_rects: List[Tuple[int, int, int, int]] = []
         self.preview_scale = 1.0
         self.preview_rect = (0, TOP_BAR_HEIGHT, PREVIEW_CANVAS_WIDTH, PREVIEW_CANVAS_HEIGHT)
+        self.rendered_window_size = (0, 0)
 
         self.profiles: List[ItemProfile] = []
         self.selected_profile_index = -1
@@ -312,16 +377,64 @@ class ItemDetectYoloNode(Node):
         self.ort_session: Optional[ort.InferenceSession] = None
         self.ort_input_name = ""
         self.ort_output_names: List[str] = []
+        self.calibration_translation = (0.0, 0.0, 0.0)
+        self.calibration_rotation = (0.0, 0.0, 0.0, 1.0)
+
+        if self.use_calibration:
+            if self.calibration_file:
+                reason = self.load_calibration_from_file(resolve_path(str(self.calibration_file)))
+                if reason:
+                    raise RuntimeError(
+                        f"Failed to load calibration file '{self.calibration_file}': {reason}"
+                    )
+            elif not self.camera_frame:
+                self.get_logger().warn(
+                    "use_calibration=true but no calibration_file was supplied; "
+                    "YOLO item outputs will use incoming camera frame IDs."
+                )
+            if self.calibration_file:
+                if self.camera_frame and self.camera_frame != self.calibration_child_frame:
+                    self.get_logger().warn(
+                        "camera_frame (%s) differs from calibration_child_frame (%s). "
+                        "Using calibration_child_frame for YOLO item outputs.",
+                        self.camera_frame,
+                        self.calibration_child_frame,
+                    )
+                self.camera_frame = self.calibration_child_frame
+
+        self.load_runtime_ui_settings()
 
         self.overlay_pub = self.create_publisher(Image, self.overlay_topic, 5)
         self.seek_pose_pub = self.create_publisher(PoseStamped, self.seek_pose_topic, 10)
         self.item_pose_array_pub = self.create_publisher(PoseArray, self.item_pose_array_topic, 10)
-        self.item_marker_pub = self.create_publisher(Marker, self.item_cube_marker_topic, 1)
-        self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
-        self.depth_sub = self.create_subscription(Image, self.depth_topic, self.depth_callback, 10)
-        self.info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self.info_callback, 10)
+        marker_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.item_marker_pub = self.create_publisher(Marker, self.item_cube_marker_topic, marker_qos)
+        selected_profile_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.selected_profile_pub = self.create_publisher(
+            String,
+            self.selected_profile_topic,
+            selected_profile_qos,
+        )
+        self.color_sub = None
+        self.depth_sub = None
+        self.info_sub = None
+        self.configure_camera_subscriptions(
+            self.color_topic,
+            self.depth_topic,
+            self.camera_info_topic,
+            force=True)
+        self.camera_status_timer = self.create_timer(0.5, self.render_no_camera_topics_overlay)
         self.movj_client = self.create_client(MovJ, self.movj_service_name)
         self.create_service(Trigger, self.seek_service_name, self.handle_seek)
+        self.create_service(Trigger, self.repick_service_name, self.handle_repick)
         self.create_service(Trigger, self.seek_complete_service_name, self.handle_seek_complete)
         self.create_service(Trigger, self.seek_status_service_name, self.handle_seek_status)
         self.create_service(Trigger, self.go_to_teach_service_name, self.handle_go_to_teach)
@@ -329,14 +442,67 @@ class ItemDetectYoloNode(Node):
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
         self.publish_calibration_tf()
         self.refresh_profiles()
+        if self.selected_profile_path is not None and self.selected_profile_path.exists():
+            self.select_model_path(self.selected_profile_path)
+        if self.selected_model_path is not None and self.selected_model_path.exists():
+            self.select_model_path(self.selected_model_path)
 
         if self.start_visualization:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | getattr(cv2, "WINDOW_GUI_NORMAL", 0))
+            self.resize_window_if_needed(
+                PREVIEW_CANVAS_WIDTH,
+                TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT)
             cv2.setMouseCallback(WINDOW_NAME, self.mouse_callback)
 
         self.get_logger().info(
             f"item_detect YOLO ready. profiles_dir={self.profiles_dir} "
-            f"pose_topic={self.seek_pose_topic} array_topic={self.item_pose_array_topic}")
+            f"pose_topic={self.seek_pose_topic} array_topic={self.item_pose_array_topic} "
+            f"seek_service={self.seek_service_name} repick_service={self.repick_service_name} "
+            f"selected_profile_topic={self.selected_profile_topic} "
+            f"output_frame={self.camera_frame or 'incoming camera frame'} "
+            f"calibration_tf={self.calibration_parent_frame}->{self.calibration_child_frame}")
+
+    def normalize_topic(self, value, fallback: str) -> str:
+        topic = str(value or "").strip()
+        return topic or fallback
+
+    def configure_camera_subscriptions(
+        self,
+        color_topic,
+        depth_topic,
+        camera_info_topic,
+        force: bool = False,
+    ) -> bool:
+        next_color_topic = self.normalize_topic(color_topic, self.color_topic)
+        next_depth_topic = self.normalize_topic(depth_topic, self.depth_topic)
+        next_camera_info_topic = self.normalize_topic(camera_info_topic, self.camera_info_topic)
+        topics_changed = (
+            next_color_topic != self.color_topic or
+            next_depth_topic != self.depth_topic or
+            next_camera_info_topic != self.camera_info_topic)
+        if not force and not topics_changed:
+            return False
+
+        for attr in ("color_sub", "depth_sub", "info_sub"):
+            sub = getattr(self, attr, None)
+            if sub is not None:
+                self.destroy_subscription(sub)
+                setattr(self, attr, None)
+
+        self.color_topic = next_color_topic
+        self.depth_topic = next_depth_topic
+        self.camera_info_topic = next_camera_info_topic
+        self.latest_depth_m = None
+        self.latest_info = None
+        self.last_camera_render_time = 0.0
+
+        self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
+        self.depth_sub = self.create_subscription(Image, self.depth_topic, self.depth_callback, 10)
+        self.info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self.info_callback, 10)
+        self.get_logger().info(
+            "YOLO detect camera topics: "
+            f"color={self.color_topic} depth={self.depth_topic} info={self.camera_info_topic}")
+        return True
 
     def refresh_profiles(self) -> None:
         self.profiles = []
@@ -354,7 +520,14 @@ class ItemDetectYoloNode(Node):
             self.active_profile = None
             self.selected_profile_index = -1
             self.ort_session = None
+            self.ort_input_name = ""
+            self.ort_output_names = []
+            self.selected_model_path = None
+            self.selected_profile_path = None
             self.status = f"No YOLO profiles in {self.profiles_dir}"
+            self.save_selected_model_export_file()
+            self.save_selected_profile_export_file()
+            self.publish_selected_profile()
             return
         self.select_profile(0)
 
@@ -393,8 +566,6 @@ class ItemDetectYoloNode(Node):
             if not model_path:
                 return None
             roi_points = self.parse_points(params.get("roi_points", []))
-            if len(roi_points) < 4:
-                return None
             depth_plane_node = params.get("depth_plane", {})
             if not isinstance(depth_plane_node, dict):
                 depth_plane_node = {}
@@ -448,6 +619,140 @@ class ItemDetectYoloNode(Node):
             self.get_logger().warn(f"Skipping YOLO profile {path}: {exc}")
             return None
 
+    def model_path_for_runtime(self, path: Path) -> Optional[Path]:
+        candidate = path.resolve()
+        if candidate.is_dir():
+            for name in ("best.onnx", "model.onnx"):
+                model_path = candidate / name
+                if model_path.exists():
+                    return model_path.resolve()
+            onnx_files = sorted(candidate.glob("*.onnx"), key=lambda p: p.stat().st_mtime, reverse=True)
+            return onnx_files[0].resolve() if onnx_files else None
+        if candidate.suffix.lower() == ".onnx":
+            return candidate
+        if candidate.suffix.lower() == ".pt":
+            same_stem = candidate.with_suffix(".onnx")
+            if same_stem.exists():
+                return same_stem.resolve()
+            best_onnx = candidate.parent / "best.onnx"
+            if best_onnx.exists():
+                return best_onnx.resolve()
+        return None
+
+    def metadata_yaml_for_model(self, model_path: Path) -> Optional[Path]:
+        search_dir = model_path if model_path.is_dir() else model_path.parent
+        candidates = [
+            search_dir / f"{search_dir.name}.yaml",
+            search_dir / "profile.yaml",
+            search_dir / "item.yaml",
+        ]
+        candidates.extend(sorted(search_dir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True))
+        seen = set()
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved in seen or not candidate.exists() or not candidate.is_file():
+                continue
+            seen.add(resolved)
+            if self.load_profile(candidate) is not None:
+                return candidate
+        return None
+
+    def profile_from_model_path(self, path: Path) -> Optional[ItemProfile]:
+        if path.suffix.lower() in (".yaml", ".yml"):
+            profile = self.load_profile(path)
+            if profile is None:
+                self.status = f"Open Model: selected YAML has no YOLO model path"
+            return profile
+        model_path = self.model_path_for_runtime(path)
+        if model_path is None or not model_path.exists():
+            self.status = f"Open Model: no ONNX model found for {path}"
+            return None
+        metadata_path = self.metadata_yaml_for_model(model_path)
+        if metadata_path is not None:
+            profile = self.load_profile(metadata_path)
+            if profile is not None:
+                profile.model_path = str(model_path)
+                if not profile.model_dir:
+                    profile.model_dir = str(model_path.parent)
+                profile.label = profile.label or model_path.parent.name
+                return profile
+
+        item_name = model_path.parent.name if model_path.parent.name else model_path.stem
+        return ItemProfile(
+            path=model_path,
+            label=f"{item_name} | model only",
+            item_name=item_name,
+            class_name=item_name,
+            model_path=str(model_path),
+            model_dir=str(model_path.parent),
+            color_topic=self.color_topic,
+            depth_topic=self.depth_topic,
+            camera_info_topic=self.camera_info_topic,
+            overlay_topic=self.overlay_topic,
+        )
+
+    def select_model_path(self, path: Path) -> bool:
+        profile = self.profile_from_model_path(path)
+        if profile is None:
+            return False
+        for index, existing in enumerate(self.profiles):
+            try:
+                if Path(existing.model_path).resolve() == Path(profile.model_path).resolve():
+                    self.profiles[index] = profile
+                    return self.select_profile(index)
+            except Exception:
+                pass
+        self.profiles.insert(0, profile)
+        return self.select_profile(0)
+
+    def open_model_dialog(self) -> Optional[Path]:
+        start_dir = self.model_root if self.model_root.exists() else self.profiles_dir
+        filename_arg = str(start_dir)
+        if filename_arg and not filename_arg.endswith("/"):
+            filename_arg += "/"
+        command = (
+            "if command -v zenity >/dev/null 2>&1; then "
+            "zenity --file-selection --title='Open YOLO Model' "
+            f"--filename={self.shell_quote(filename_arg)} "
+            "--file-filter='YOLO models | *.onnx *.pt' --file-filter='Metadata | *.yaml *.yml' --file-filter='All files | *'; "
+            "elif command -v kdialog >/dev/null 2>&1; then "
+            "kdialog --title 'Open YOLO Model' --getopenfilename "
+            f"{self.shell_quote(str(start_dir))} 'YOLO models (*.onnx *.pt)'; "
+            "fi 2>/dev/null"
+        )
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=300,
+            )
+        except Exception as exc:
+            self.status = f"Open Model failed: {exc}"
+            return None
+        selected = result.stdout.strip()
+        if not selected:
+            return None
+        return resolve_path(selected)
+
+    def request_open_model(self) -> None:
+        self.status = "Open Model: select YOLO ONNX model"
+        selected_path = self.open_model_dialog()
+        if selected_path is None:
+            self.status = "Open Model cancelled"
+            return
+        if self.select_model_path(selected_path):
+            self.save_runtime_ui_settings()
+            self.save_selected_model_export_file()
+            self.status = f"Loaded {self.profile_label()}"
+
+    @staticmethod
+    def shell_quote(text: str) -> str:
+        return "'" + text.replace("'", "'\"'\"'") + "'"
+
     def parse_points(self, value) -> List[Tuple[float, float]]:
         if not isinstance(value, list):
             return []
@@ -479,11 +784,20 @@ class ItemDetectYoloNode(Node):
             return False
         self.selected_profile_index = index
         self.active_profile = profile
+        if self.use_profile_camera_topics:
+            self.configure_camera_subscriptions(
+                profile.color_topic,
+                profile.depth_topic,
+                profile.camera_info_topic)
         self.load_onnx_model(model_path)
+        self.selected_model_path = model_path
         self.status = f"Loaded {profile.label}"
-        self.profile_dropdown_open = False
         self.pending_delete_profile = None
         self.pending_delete_deadline = 0.0
+        self.delete_confirm_active = False
+        self.save_selected_model_export_file()
+        self.save_selected_profile_export_file()
+        self.publish_selected_profile()
         return True
 
     def load_onnx_model(self, model_path: Path) -> None:
@@ -499,28 +813,109 @@ class ItemDetectYoloNode(Node):
         self.ort_input_name = self.ort_session.get_inputs()[0].name
         self.ort_output_names = [output.name for output in self.ort_session.get_outputs()]
 
+    def load_calibration_from_file(self, path: Path) -> str:
+        try:
+            if not path.exists():
+                return "File does not exist"
+            if path.stat().st_size <= 0:
+                return "Calibration file is empty"
+            root = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            return f"Could not read YAML: {exc}"
+        if not isinstance(root, dict):
+            return "Calibration YAML is not a map"
+
+        transform = root.get("transform", {})
+        if not isinstance(transform, dict):
+            return "Missing 'transform' key"
+        translation = transform.get("translation", {})
+        rotation = transform.get("rotation", {})
+        if not isinstance(translation, dict) or not isinstance(rotation, dict):
+            return "Missing rotation/translation keys"
+
+        params = root.get("parameters", {})
+        if not isinstance(params, dict):
+            params = {}
+        calibration_type = str(params.get("calibration_type", "")).strip()
+        if normalize_calibration_type(calibration_type) != "eye_on_base":
+            return (
+                "Expected eye-to-hand calibration YAML with "
+                "parameters.calibration_type=eye_on_base, got "
+                f"'{calibration_type or '<missing>'}'"
+            )
+
+        parent_frame = str(
+            params.get("robot_base_frame") or
+            params.get("transform_parent_frame") or
+            ""
+        ).strip()
+        if parent_frame and parent_frame != self.calibration_parent_frame:
+            self.get_logger().warn(
+                "Calibration YAML parent frame is %s but YOLO detect was configured with %s. "
+                "Using YAML parent frame so eye-to-hand TF matches camera_calibration.",
+                parent_frame,
+                self.calibration_parent_frame,
+            )
+            self.calibration_parent_frame = parent_frame
+
+        child_frame = str(params.get("transform_child_frame") or "").strip()
+        if child_frame and child_frame != self.calibration_child_frame:
+            self.get_logger().warn(
+                "Calibration YAML child frame is %s but YOLO detect was configured with %s. "
+                "Using YAML child frame so eye-to-hand TF matches camera_calibration.",
+                child_frame,
+                self.calibration_child_frame,
+            )
+            self.calibration_child_frame = child_frame
+
+        try:
+            qx = float(rotation.get("x", 0.0))
+            qy = float(rotation.get("y", 0.0))
+            qz = float(rotation.get("z", 0.0))
+            qw = float(rotation.get("w", 1.0))
+            tx = float(translation.get("x", 0.0))
+            ty = float(translation.get("y", 0.0))
+            tz = float(translation.get("z", 0.0))
+        except Exception as exc:
+            return f"Failed to parse rotation/translation: {exc}"
+
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if norm < 1e-9 or not math.isfinite(norm):
+            return "Invalid quaternion (zero norm)"
+        inv_norm = 1.0 / norm
+        self.calibration_translation = (tx, ty, tz)
+        self.calibration_rotation = (qx * inv_norm, qy * inv_norm, qz * inv_norm, qw * inv_norm)
+        return ""
+
     def publish_calibration_tf(self) -> None:
         if not self.use_calibration or not self.publish_static_calibration_tf or not self.calibration_file:
             return
         try:
-            root = yaml.safe_load(resolve_path(self.calibration_file).read_text(encoding="utf-8")) or {}
-            transform = root.get("transform", {})
-            translation = transform.get("translation", {})
-            rotation = transform.get("rotation", {})
+            tx, ty, tz = self.calibration_translation
+            qx, qy, qz, qw = self.calibration_rotation
             msg = TransformStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = self.calibration_parent_frame
             msg.child_frame_id = self.calibration_child_frame
-            msg.transform.translation.x = float(translation.get("x", 0.0))
-            msg.transform.translation.y = float(translation.get("y", 0.0))
-            msg.transform.translation.z = float(translation.get("z", 0.0))
-            msg.transform.rotation.x = float(rotation.get("x", 0.0))
-            msg.transform.rotation.y = float(rotation.get("y", 0.0))
-            msg.transform.rotation.z = float(rotation.get("z", 0.0))
-            msg.transform.rotation.w = float(rotation.get("w", 1.0))
+            msg.transform.translation.x = tx
+            msg.transform.translation.y = ty
+            msg.transform.translation.z = tz
+            msg.transform.rotation.x = qx
+            msg.transform.rotation.y = qy
+            msg.transform.rotation.z = qz
+            msg.transform.rotation.w = qw
             self.static_tf_broadcaster.sendTransform(msg)
         except Exception as exc:
             self.get_logger().warn(f"Calibration TF publish failed: {exc}")
+
+    def resolved_camera_frame_id(self, header, info: Optional[CameraInfo]) -> str:
+        if self.camera_frame:
+            return self.camera_frame
+        if getattr(header, "frame_id", ""):
+            return str(header.frame_id)
+        if info is not None and info.header.frame_id:
+            return str(info.header.frame_id)
+        return "camera_color_optical_frame"
 
     def depth_callback(self, msg: Image) -> None:
         try:
@@ -550,7 +945,7 @@ class ItemDetectYoloNode(Node):
         if depth_m is not None and depth_m.shape[:2] != frame.shape[:2]:
             depth_m = cv2.resize(depth_m, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
         stamp = msg.header.stamp
-        frame_id = msg.header.frame_id or self.camera_frame or "camera_color_optical_frame"
+        frame_id = self.resolved_camera_frame_id(msg.header, info)
 
         now = time.monotonic()
         min_period = 1.0 / max(0.1, self.max_inference_hz)
@@ -561,12 +956,16 @@ class ItemDetectYoloNode(Node):
         base_view = self.display_frame(frame, depth_m)
         output = self.render_overlay(base_view, depth_m) if self.publish_overlay else base_view.copy()
         if self.publish_overlay:
-            self.overlay_pub.publish(self.bridge.cv2_to_imgmsg(output, encoding="bgr8"))
+            overlay_msg = self.bridge.cv2_to_imgmsg(output, encoding="bgr8")
+            overlay_msg.header.stamp = stamp
+            overlay_msg.header.frame_id = frame_id
+            self.overlay_pub.publish(overlay_msg)
         self.publish_pose_outputs(stamp, frame_id)
         if self.start_visualization:
             view = self.build_ui(output)
             cv2.imshow(WINDOW_NAME, view)
             cv2.waitKey(1)
+        self.last_camera_render_time = time.monotonic()
 
     def process_frame(self, frame: np.ndarray, depth_m: Optional[np.ndarray], info: Optional[CameraInfo]) -> None:
         profile = self.active_profile
@@ -622,9 +1021,10 @@ class ItemDetectYoloNode(Node):
         frame: np.ndarray,
         points: List[Tuple[float, float]],
     ) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], np.ndarray]]:
-        if len(points) < 3:
-            return None
         h, w = frame.shape[:2]
+        if len(points) < 3:
+            mask = np.full((h, w), 255, dtype=np.uint8)
+            return frame.copy(), (0, 0, w, h), mask
         pts = np.asarray(points, dtype=np.float32)
         pts[:, 0] = np.clip(pts[:, 0], 0, max(0, w - 1))
         pts[:, 1] = np.clip(pts[:, 1], 0, max(0, h - 1))
@@ -1087,7 +1487,10 @@ class ItemDetectYoloNode(Node):
             self.seek_started_time > 0.0 and
             now - self.seek_started_time > max(0.1, self.seek_window_sec)
         ):
-            self.set_seek_mode(False, "Seek window expired")
+            self.seek_started_time = now
+            self.last_seek_pose = None
+            self.last_seek_pose_time = 0.0
+            self.status = f"Seek still ON: no valid YOLO pose in {self.seek_window_sec:.1f}s window; reacquiring"
 
         pose_array = PoseArray()
         pose_array.header.stamp = stamp
@@ -1114,6 +1517,12 @@ class ItemDetectYoloNode(Node):
             msg.pose = pose_to_msg(seek_pose)
             self.seek_pose_pub.publish(msg)
             self.publish_marker(stamp, frame_id, seek_pose)
+            self.seek_mode_active = False
+            self.seek_result_latched = True
+            self.seek_started_time = 0.0
+            self.last_seek_pose = seek_pose
+            self.last_seek_pose_time = now
+            self.status = "Seek done, handed off YOLO item target | waiting for item pick release"
 
     def publish_marker(self, stamp, frame_id: str, pose: Pose3D) -> None:
         marker = Marker()
@@ -1136,7 +1545,17 @@ class ItemDetectYoloNode(Node):
     def display_frame(self, frame: np.ndarray, depth_m: Optional[np.ndarray]) -> np.ndarray:
         if self.view_mode == "Depth":
             return self.depth_visualization(depth_m, frame.shape)
+        if self.view_mode == "Binarized":
+            return self.binarized_visualization(frame.shape)
         return frame.copy()
+
+    def binarized_visualization(self, frame_shape: Tuple[int, int, int]) -> np.ndarray:
+        output = np.zeros(frame_shape, dtype=np.uint8)
+        for index, detection in enumerate(self.latest_detections):
+            mask = self.mask_for_frame(detection.mask, frame_shape[:2])
+            color = (230, 230, 230) if index != 0 else (255, 255, 255)
+            output[mask > 0] = color
+        return output
 
     def depth_visualization(self, depth_m: Optional[np.ndarray], frame_shape: Tuple[int, int, int]) -> np.ndarray:
         output = np.zeros(frame_shape, dtype=np.uint8)
@@ -1236,6 +1655,69 @@ class ItemDetectYoloNode(Node):
             cv2.putText(image, str(index + 1), (center_pt[0] + 8, center_pt[1] - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.56, (40, 255, 255), 2, cv2.LINE_AA)
 
+    def build_no_camera_topics_placeholder(self) -> np.ndarray:
+        placeholder = np.zeros((PREVIEW_CANVAS_HEIGHT, PREVIEW_CANVAS_WIDTH, 3), dtype=np.uint8)
+        placeholder[:] = (18, 18, 18)
+        cv2.rectangle(
+            placeholder,
+            (0, 0),
+            (placeholder.shape[1] - 1, placeholder.shape[0] - 1),
+            (34, 34, 34),
+            2,
+        )
+
+        lines = [
+            "no camera topics...",
+            f"color: {self.color_topic}  publishers={self.count_publishers(self.color_topic)}",
+            f"depth: {self.depth_topic}  publishers={self.count_publishers(self.depth_topic)}",
+            f"info:  {self.camera_info_topic}  publishers={self.count_publishers(self.camera_info_topic)}",
+        ]
+        scales = [1.35, 0.68, 0.68, 0.68]
+        thicknesses = [3, 1, 1, 1]
+        colors = [
+            (80, 220, 255),
+            (220, 220, 220),
+            (220, 220, 220),
+            (220, 220, 220),
+        ]
+        y = (placeholder.shape[0] // 2) - 55
+        for index, line in enumerate(lines):
+            text_size, _ = cv2.getTextSize(
+                line,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scales[index],
+                thicknesses[index],
+            )
+            x = max(20, (placeholder.shape[1] - text_size[0]) // 2)
+            cv2.putText(
+                placeholder,
+                line,
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scales[index],
+                colors[index],
+                thicknesses[index],
+                cv2.LINE_AA,
+            )
+            y += 52 if index == 0 else 32
+        return placeholder
+
+    def render_no_camera_topics_overlay(self) -> None:
+        now = time.monotonic()
+        if self.last_camera_render_time > 0.0 and now - self.last_camera_render_time < 1.0:
+            return
+
+        output = self.build_ui(self.build_no_camera_topics_placeholder())
+        if self.publish_overlay:
+            msg = self.bridge.cv2_to_imgmsg(output, encoding="bgr8")
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self.camera_frame or "camera_color_optical_frame"
+            self.overlay_pub.publish(msg)
+        if self.start_visualization:
+            cv2.imshow(WINDOW_NAME, output)
+            cv2.waitKey(1)
+        self.last_camera_render_time = now
+
     def render_overlay(self, frame: np.ndarray, depth_m: Optional[np.ndarray]) -> np.ndarray:
         output = frame.copy()
         profile = self.active_profile
@@ -1261,7 +1743,7 @@ class ItemDetectYoloNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(output, label, (int(round(detection.center[0])) + 8, int(round(detection.center[1])) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 1, cv2.LINE_AA)
-        if self.seek_mode_active and self.selected_detection is not None:
+        if self.seek_is_on() and self.selected_detection is not None:
             mask = self.mask_for_frame(self.selected_detection.mask, output.shape[:2])
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(output, contours, -1, (0, 255, 0), 3)
@@ -1276,48 +1758,56 @@ class ItemDetectYoloNode(Node):
         return output
 
     def build_ui(self, preview_image: np.ndarray) -> np.ndarray:
-        canvas = np.zeros((TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT, PREVIEW_CANVAS_WIDTH, 3), dtype=np.uint8)
+        canvas_w = PREVIEW_CANVAS_WIDTH
+        canvas_h = TOP_BAR_HEIGHT + PREVIEW_CANVAS_HEIGHT
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         canvas[:] = (30, 32, 36)
         self.buttons.clear()
         self.slider_rects.clear()
-        self.profile_option_rects.clear()
 
-        bar = canvas[:TOP_BAR_HEIGHT, :]
-        bar[:] = (28, 30, 34)
         self.draw_top_controls(canvas)
-        self.draw_summary_panel(canvas)
-        self.draw_seek_controls_panel(canvas)
-        self.draw_detection_quality_panel(canvas)
-        self.draw_status_strip(canvas)
 
         preview, scale = self.fit_preview(preview_image)
         self.preview_scale = scale
         x = 0
         y = TOP_BAR_HEIGHT
+        canvas[y:y + PREVIEW_CANVAS_HEIGHT, x:x + PREVIEW_CANVAS_WIDTH] = (8, 10, 12)
         canvas[y:y + preview.shape[0], x:x + preview.shape[1]] = preview
         self.preview_rect = (x, y, preview.shape[1], preview.shape[0])
 
-        if self.profile_dropdown_open:
-            self.draw_profile_dropdown(canvas)
+        self.draw_delete_confirmation_overlay(canvas)
+        if self.start_visualization:
+            self.resize_window_if_needed(canvas_w, canvas_h)
         return canvas
 
     def draw_top_controls(self, canvas: np.ndarray) -> None:
-        y = 20
-        h = 40
+        width = canvas.shape[1]
+        bar = canvas[:TOP_BAR_HEIGHT, :]
+        bar[:] = (28, 30, 34)
+        cv2.line(canvas, (0, 58), (width, 58), (52, 56, 62), 1)
+
+        margin = 16
+        gap = 10
+        y = 14
+        h = 38
+        button_count = 7
+        button_w = max(112, min(132, (width - 2 * margin - (button_count - 1) * gap) // button_count))
+        x = margin
         self.draw_button(
             canvas,
             "view_mode",
-            (20, y, 150, h),
+            (x, y, button_w, h),
             f"View: {self.view_mode}",
             True,
             True,
             fill_color=(72, 128, 68),
             border_color=(132, 215, 150),
         )
+        x += button_w + gap
         self.draw_button(
             canvas,
             "overlay",
-            (182, y, 150, h),
+            (x, y, button_w, h),
             "Overlay: ON" if self.publish_overlay else "Overlay: OFF",
             True,
             self.publish_overlay,
@@ -1326,35 +1816,37 @@ class ItemDetectYoloNode(Node):
             border_color=(102, 106, 112),
             active_border_color=(132, 205, 236),
         )
+        x += button_w + gap
         self.draw_button(
             canvas,
             "seek",
-            (344, y, 120, h),
-            "Seek: ON" if self.seek_mode_active else "Seek: OFF",
+            (x, y, button_w, h),
+            "Seek: ON" if self.seek_is_on() else "Seek: OFF",
             True,
-            self.seek_mode_active,
+            self.seek_is_on(),
             fill_color=(48, 62, 72),
             active_fill_color=(70, 126, 186),
             border_color=(102, 106, 112),
             active_border_color=(126, 202, 255),
         )
+        x += button_w + gap
         self.draw_button(
             canvas,
-            "profile_dropdown",
-            (476, y, 274, h),
-            self.profile_label(),
-            bool(self.profiles),
-            self.profile_dropdown_open,
-            fill_color=(61, 78, 96),
-            active_fill_color=(61, 78, 96),
-            border_color=(130, 166, 198),
-            active_border_color=(130, 166, 198),
+            "debug_images",
+            (x, y, button_w, h),
+            "Debug Img",
+            True,
+            self.debug_images_enabled,
+            fill_color=(58, 64, 72),
+            active_fill_color=(70, 126, 186),
+            border_color=(112, 120, 130),
+            active_border_color=(126, 202, 255),
         )
-        self.draw_dropdown_arrow(canvas, (476, y, 274, h), bool(self.profiles))
+        x += button_w + gap
         self.draw_button(
             canvas,
             "go_to_teach",
-            (764, y, 148, h),
+            (x, y, button_w, h),
             "Go Teach..." if self.go_to_teach_in_progress else "Go To Teach",
             self.can_go_to_teach(),
             self.go_to_teach_in_progress,
@@ -1363,73 +1855,96 @@ class ItemDetectYoloNode(Node):
             border_color=(134, 232, 165),
             active_border_color=(126, 202, 255),
         )
+        x += button_w + gap
+        self.draw_button(
+            canvas,
+            "open_model",
+            (x, y, button_w, h),
+            "Open Model",
+            True,
+            False,
+            fill_color=(61, 78, 96),
+            border_color=(130, 166, 198),
+        )
+        x += button_w + gap
         self.draw_button(
             canvas,
             "delete_profile",
-            (922, y, 148, h),
-            self.delete_profile_label(),
+            (x, y, button_w, h),
+            "Delete Item",
             self.can_delete_profile(),
-            self.delete_pending(),
+            False,
             fill_color=(86, 76, 148),
-            active_fill_color=(90, 76, 152),
             border_color=(160, 146, 246),
-            active_border_color=(170, 156, 245),
         )
 
-    def draw_summary_panel(self, canvas: np.ndarray) -> None:
-        x, y, w, h = (20, 72, 344, 90)
-        self.draw_panel_box(canvas, (x, y, w, h), "Item Summary")
+        panel_y = y + h + 12
+        panel_gap = 10
+        panel_h = 92
+        panel_total_w = max(360, width - 2 * margin)
+        panel_w = max(120, (panel_total_w - 2 * panel_gap) // 3)
+        summary_rect = (margin, panel_y, panel_w, panel_h)
+        seek_rect = (margin + panel_w + panel_gap, panel_y, panel_w, panel_h)
+        quality_rect = (
+            seek_rect[0] + panel_w + panel_gap,
+            panel_y,
+            max(120, width - margin - (seek_rect[0] + panel_w + panel_gap)),
+            panel_h,
+        )
+        status_rect = (margin, panel_y + panel_h + 8, max(120, width - 2 * margin), 28)
+
+        self.draw_panel_box(canvas, summary_rect, "Item Summary")
+        self.draw_panel_box(canvas, seek_rect, "Seek Controls")
+        self.draw_panel_box(canvas, quality_rect, "Detection Quality")
+
+        x, y, w, h = summary_rect
         count = len(self.latest_detections)
         cv2.putText(canvas, f"Detected masks: {count}", (x + 12, y + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (164, 238, 144), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_DUPLEX, 0.45, (164, 238, 144), 1, cv2.LINE_AA)
         best_text = "Best: n/a"
         if self.selected_detection is not None:
             best_text = f"Best confidence: {self.selected_detection.score * 100.0:.0f}%"
         cv2.putText(canvas, best_text, (x + 12, y + 64),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (205, 212, 220), 1, cv2.LINE_AA)
-        if self.seek_mode_active:
+                    cv2.FONT_HERSHEY_DUPLEX, 0.43, (205, 212, 220), 1, cv2.LINE_AA)
+        if self.seek_is_on():
             if self.selected_pose is not None:
                 xyz = self.selected_pose.origin * METERS_TO_MM
-                pose_text = f"Seek pose XYZ: {xyz[0]:+.1f} {xyz[1]:+.1f} {xyz[2]:+.1f} mm"
+                pose_text = f"Best candidate XYZ: {xyz[0]:+.1f} {xyz[1]:+.1f} {xyz[2]:+.1f} mm"
             else:
-                pose_text = "Seek armed; waiting for valid depth in mask"
+                pose_text = "Need valid depth on selected mask"
         else:
-            pose_text = "Seek creates pose from best mask depth"
-        cv2.putText(canvas, fit_text(pose_text, 48), (x + 12, y + 82),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.43, (165, 170, 176), 1, cv2.LINE_AA)
+            pose_text = "Best = highest-confidence YOLO mask"
+        cv2.putText(canvas, fit_text(pose_text, max(20, w // 9)), (x + 12, y + 82),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.38, (165, 170, 176), 1, cv2.LINE_AA)
 
-    def draw_seek_controls_panel(self, canvas: np.ndarray) -> None:
-        x, y, w, h = (374, 72, 342, 90)
-        self.draw_panel_box(canvas, (x, y, w, h), "Seek Controls")
+        x, y, w, h = seek_rect
         self.draw_slider(
             canvas,
             "seek_window",
-            (x + 12, y + 30, w - 24, 26),
+            (x + 12, y + 37, w - 24, 26),
             f"Window  {self.seek_window_sec:.1f}s",
             self.seek_window_sec,
-            5.0,
-            120.0,
+            SEEK_WINDOW_MIN_SEC,
+            SEEK_WINDOW_MAX_SEC,
             (140, 210, 250),
         )
         self.draw_slider(
             canvas,
             "seek_decay",
-            (x + 12, y + 58, w - 24, 26),
+            (x + 12, y + 67, w - 24, 26),
             f"Decay  {self.seek_decay_sec:.1f}s",
             self.seek_decay_sec,
-            0.0,
-            5.0,
+            SEEK_DECAY_MIN_SEC,
+            SEEK_DECAY_MAX_SEC,
             (154, 230, 170),
         )
 
-    def draw_detection_quality_panel(self, canvas: np.ndarray) -> None:
-        x, y, w, h = (726, 72, 344, 90)
-        self.draw_panel_box(canvas, (x, y, w, h), "Detection Quality")
+        x, y, w, h = quality_rect
         confidence_percent = int(round(np.clip(self.yolo_conf, 0.0, 1.0) * 100.0))
         self.draw_slider(
             canvas,
             "confidence",
-            (x + 12, y + 38, w - 24, 30),
+            (x + 12, y + 49, w - 24, 30),
             f"Confidence  {confidence_percent}%",
             self.yolo_conf,
             0.0,
@@ -1437,12 +1952,19 @@ class ItemDetectYoloNode(Node):
             (85, 225, 255),
         )
 
-    def draw_status_strip(self, canvas: np.ndarray) -> None:
-        x, y, w, h = (20, 170, 1050, 28)
+        x, y, w, h = status_rect
         cv2.rectangle(canvas, (x, y), (x + w, y + h), (34, 36, 40), -1)
         cv2.rectangle(canvas, (x, y), (x + w, y + h), (72, 77, 84), 1)
-        cv2.putText(canvas, f"Status   {fit_text(self.status, 112)}", (x + 12, y + 19),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (202, 208, 214), 1, cv2.LINE_AA)
+        default_status = (
+            f"Ready | Model: {Path(self.active_profile.model_path).name}"
+            if self.active_profile is not None else
+            "Ready | Open Model to choose YOLO ONNX"
+        )
+        status_text = self.status or default_status
+        cv2.putText(canvas, "Status", (x + 10, y + 19),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.43, (202, 208, 214), 1, cv2.LINE_AA)
+        cv2.putText(canvas, fit_text(status_text, max(20, (w - 88) // 8)), (x + 70, y + 19),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.44, (194, 199, 206), 1, cv2.LINE_AA)
 
     def draw_panel_box(self, canvas: np.ndarray, rect: Tuple[int, int, int, int], title: str) -> None:
         x, y, w, h = rect
@@ -1497,6 +2019,16 @@ class ItemDetectYoloNode(Node):
         new_h = max(1, int(round(h * scale)))
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR), scale
 
+    def resize_window_if_needed(self, width: int, height: int) -> None:
+        window_size = (int(width), int(height))
+        if window_size == self.rendered_window_size:
+            return
+        try:
+            cv2.resizeWindow(WINDOW_NAME, window_size[0], window_size[1])
+            self.rendered_window_size = window_size
+        except cv2.error as exc:
+            self.get_logger().warn(f"Could not resize YOLO detect window: {exc}")
+
     def draw_button(
         self,
         canvas: np.ndarray,
@@ -1528,29 +2060,81 @@ class ItemDetectYoloNode(Node):
         if self.active_profile is not None:
             return self.active_profile.label
         if not self.profiles:
-            return "No YOLO profiles"
-        return "Select item profile"
+            return "No YOLO model"
+        return "Open Model"
 
-    def draw_profile_dropdown(self, canvas: np.ndarray) -> None:
-        button = self.buttons.get("profile_dropdown")
-        if button is None:
+    @staticmethod
+    def rect_contains(rect: Tuple[int, int, int, int], x: int, y: int) -> bool:
+        rx, ry, rw, rh = rect
+        return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+    def layout_delete_confirmation(self, frame_shape: Tuple[int, int, int]) -> None:
+        height, width = frame_shape[:2]
+        dialog_w = int(np.clip(width - 120, 420, 640))
+        dialog_h = 170
+        dialog_x = max(20, (width - dialog_w) // 2)
+        dialog_y = max(20, (height - dialog_h) // 2)
+        button_w = 126
+        button_h = 36
+        button_gap = 12
+        button_y = dialog_y + dialog_h - button_h - 16
+        cancel_x = dialog_x + dialog_w - (2 * button_w + button_gap + 16)
+        self.delete_confirm_dialog_rect = (dialog_x, dialog_y, dialog_w, dialog_h)
+        self.delete_confirm_cancel_rect = (cancel_x, button_y, button_w, button_h)
+        self.delete_confirm_accept_rect = (cancel_x + button_w + button_gap, button_y, button_w, button_h)
+
+    def draw_delete_confirmation_overlay(self, frame: np.ndarray) -> None:
+        if not self.delete_confirm_active:
             return
-        x, y, w, h = button.rect
-        rows = min(MAX_DROPDOWN_ROWS, len(self.profiles))
-        for i in range(rows):
-            row_y = y + h + 2 + i * DROPDOWN_ROW_HEIGHT
-            selected = i == self.selected_profile_index
-            fill = (72, 120, 72) if selected else (38, 41, 46)
-            border = (120, 255, 120) if selected else (110, 110, 110)
-            rect = (x, row_y, w, DROPDOWN_ROW_HEIGHT)
-            self.profile_option_rects.append(rect)
-            cv2.rectangle(canvas, (x, row_y), (x + w, row_y + DROPDOWN_ROW_HEIGHT), fill, -1)
-            cv2.rectangle(canvas, (x, row_y), (x + w, row_y + DROPDOWN_ROW_HEIGHT), border, 1)
-            cv2.putText(canvas, fit_text(self.profiles[i].label, 48), (x + 8, row_y + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.47, (238, 242, 245), 1, cv2.LINE_AA)
+        self.layout_delete_confirmation(frame.shape)
+        shaded = frame.copy()
+        shaded[:] = (0, 0, 0)
+        cv2.addWeighted(shaded, 0.38, frame, 0.62, 0.0, frame)
+
+        x, y, w, h = self.delete_confirm_dialog_rect
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (42, 45, 50), -1)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (122, 126, 132), 2)
+        target = Path(self.active_profile.path).name if self.active_profile is not None else "selected model"
+        cv2.putText(frame, "Confirm Item Delete", (x + 16, y + 34),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.66, (242, 242, 242), 1, cv2.LINE_AA)
+        cv2.putText(frame, fit_text(f"Delete model: {target}", 60), (x + 16, y + 74),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, (214, 218, 224), 1, cv2.LINE_AA)
+        cv2.putText(frame, "This action cannot be undone.", (x + 16, y + 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (175, 182, 190), 1, cv2.LINE_AA)
+
+        cx, cy, cw, ch = self.delete_confirm_cancel_rect
+        cv2.rectangle(frame, (cx, cy), (cx + cw, cy + ch), (74, 78, 84), -1)
+        cv2.rectangle(frame, (cx, cy), (cx + cw, cy + ch), (140, 144, 150), 2)
+        cv2.putText(frame, "Cancel", (cx + 30, cy + 24),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.52, (245, 245, 245), 1, cv2.LINE_AA)
+
+        dx, dy, dw, dh = self.delete_confirm_accept_rect
+        cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), (90, 76, 152), -1)
+        cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), (170, 156, 245), 2)
+        cv2.putText(frame, "Delete", (dx + 30, dy + 24),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.52, (245, 245, 245), 1, cv2.LINE_AA)
 
     def mouse_callback(self, event, x: int, y: int, flags, param) -> None:
+        del flags, param
+        if self.delete_confirm_active:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if self.rect_contains(self.delete_confirm_accept_rect, x, y):
+                    self.confirm_delete_profile()
+                    return
+                if (
+                    self.rect_contains(self.delete_confirm_cancel_rect, x, y) or
+                    not self.rect_contains(self.delete_confirm_dialog_rect, x, y)
+                ):
+                    self.delete_confirm_active = False
+                    self.status = "Delete cancelled"
+                    return
+            if event == cv2.EVENT_LBUTTONUP:
+                self.active_slider = None
+            return
+
         if event == cv2.EVENT_LBUTTONUP:
+            if self.active_slider is not None:
+                self.save_runtime_ui_settings()
             self.active_slider = None
             return
         if event == cv2.EVENT_MOUSEMOVE and self.active_slider is not None:
@@ -1559,42 +2143,43 @@ class ItemDetectYoloNode(Node):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
-        for i, rect in enumerate(self.profile_option_rects):
-            rx, ry, rw, rh = rect
-            if rx <= x <= rx + rw and ry <= y <= ry + rh:
-                self.select_profile(i)
-                return
-
         for name, rect in list(self.slider_rects.items()):
-            rx, ry, rw, rh = rect
-            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+            if self.rect_contains(rect, x, y):
                 self.active_slider = name
                 self.update_slider_from_x(name, x)
-                self.profile_dropdown_open = False
                 return
 
         for name, button in list(self.buttons.items()):
-            bx, by, bw, bh = button.rect
-            if bx <= x <= bx + bw and by <= y <= by + bh:
+            if self.rect_contains(button.rect, x, y):
                 if not button.enabled:
                     return
-                if name == "profile_dropdown":
-                    self.profile_dropdown_open = not self.profile_dropdown_open
-                elif name == "view_mode":
-                    self.view_mode = "Depth" if self.view_mode == "RGB" else "RGB"
+                if name == "view_mode":
+                    self.advance_view_mode()
                     self.status = f"View: {self.view_mode}"
-                elif name == "refresh_profiles":
-                    self.refresh_profiles()
                 elif name == "seek":
-                    self.set_seek_mode(not self.seek_mode_active)
+                    self.set_seek_mode(not self.seek_is_on())
                 elif name == "overlay":
                     self.publish_overlay = not self.publish_overlay
+                    self.status = "Overlay toggled"
+                elif name == "debug_images":
+                    self.debug_images_enabled = not self.debug_images_enabled
+                    self.status = "Debug images enabled" if self.debug_images_enabled else "Debug images disabled"
+                elif name == "open_model":
+                    self.request_open_model()
                 elif name == "go_to_teach":
                     self.request_go_to_teach()
                 elif name == "delete_profile":
                     self.request_delete_profile()
+                self.save_runtime_ui_settings()
                 return
-        self.profile_dropdown_open = False
+
+    def advance_view_mode(self) -> None:
+        if self.view_mode == "RGB":
+            self.view_mode = "Binarized"
+        elif self.view_mode == "Binarized":
+            self.view_mode = "Depth"
+        else:
+            self.view_mode = "RGB"
 
     def update_slider_from_x(self, name: str, x: int) -> None:
         rect = self.slider_rects.get(name)
@@ -1608,15 +2193,98 @@ class ItemDetectYoloNode(Node):
             self.last_inference_time = 0.0
             self.status = f"Confidence threshold: {int(round(self.yolo_conf * 100.0))}%"
         elif name == "seek_window":
-            self.seek_window_sec = 5.0 + norm * 115.0
+            self.seek_window_sec = SEEK_WINDOW_MIN_SEC + norm * (SEEK_WINDOW_MAX_SEC - SEEK_WINDOW_MIN_SEC)
             self.status = f"Seek window: {self.seek_window_sec:.1f}s"
         elif name == "seek_decay":
-            self.seek_decay_sec = norm * 5.0
+            self.seek_decay_sec = SEEK_DECAY_MIN_SEC + norm * (SEEK_DECAY_MAX_SEC - SEEK_DECAY_MIN_SEC)
             self.status = f"Seek decay: {self.seek_decay_sec:.1f}s"
+
+    def load_runtime_ui_settings(self) -> None:
+        if not self.runtime_settings_path.exists():
+            return
+        try:
+            root = yaml.safe_load(self.runtime_settings_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(root, dict):
+                return
+            view_mode = str(root.get("view_mode", self.view_mode)).strip()
+            if view_mode in ("RGB", "Binarized", "Depth"):
+                self.view_mode = view_mode
+            elif view_mode.lower() == "rgb":
+                self.view_mode = "RGB"
+            elif view_mode.lower() in ("binarized", "binary", "bw"):
+                self.view_mode = "Binarized"
+            elif view_mode.lower() == "depth":
+                self.view_mode = "Depth"
+            if "overlay_enabled" in root:
+                self.publish_overlay = as_bool(root["overlay_enabled"])
+            if "debug_images_enabled" in root:
+                self.debug_images_enabled = as_bool(root["debug_images_enabled"])
+            if "yolo_conf" in root:
+                self.yolo_conf = float(np.clip(float(root["yolo_conf"]), 0.0, 1.0))
+            if "seek_window_sec" in root:
+                self.seek_window_sec = float(np.clip(
+                    float(root["seek_window_sec"]), SEEK_WINDOW_MIN_SEC, SEEK_WINDOW_MAX_SEC))
+            if "seek_decay_sec" in root:
+                self.seek_decay_sec = float(np.clip(
+                    float(root["seek_decay_sec"]), SEEK_DECAY_MIN_SEC, SEEK_DECAY_MAX_SEC))
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to load YOLO detect runtime UI settings: {exc}")
+
+    def save_runtime_ui_settings(self) -> None:
+        try:
+            self.runtime_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "view_mode": self.view_mode,
+                "overlay_enabled": bool(self.publish_overlay),
+                "debug_images_enabled": bool(self.debug_images_enabled),
+                "yolo_conf": float(self.yolo_conf),
+                "seek_window_sec": float(self.seek_window_sec),
+                "seek_decay_sec": float(self.seek_decay_sec),
+            }
+            tmp_path = self.runtime_settings_path.with_suffix(".tmp")
+            tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+            tmp_path.replace(self.runtime_settings_path)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to save YOLO detect runtime UI settings: {exc}")
+
+    def save_selected_model_export_file(self) -> None:
+        try:
+            self.selected_model_export_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path = ""
+            if self.active_profile is not None and self.active_profile.model_path:
+                model_path = self.active_profile.model_path
+            self.selected_model_export_path.write_text(model_path + "\n", encoding="utf-8")
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to save selected YOLO model file: {exc}")
+
+    def selected_profile_path_text(self) -> str:
+        if self.active_profile is not None:
+            return str(self.active_profile.path)
+        if self.selected_profile_path is not None:
+            return str(self.selected_profile_path)
+        return ""
+
+    def publish_selected_profile(self) -> None:
+        msg = String()
+        msg.data = self.selected_profile_path_text()
+        self.selected_profile_pub.publish(msg)
+
+    def save_selected_profile_export_file(self) -> None:
+        try:
+            self.selected_profile_export_path.parent.mkdir(parents=True, exist_ok=True)
+            self.selected_profile_export_path.write_text(
+                self.selected_profile_path_text() + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to save selected item detect profile file: {exc}")
+
+    def seek_is_on(self) -> bool:
+        return bool(self.seek_mode_active or self.seek_result_latched)
 
     def handle_seek(self, request, response):
         del request
-        self.set_seek_mode(not self.seek_mode_active)
+        self.set_seek_mode(not self.seek_is_on())
         response.success = True
         response.message = "Seek armed" if self.seek_mode_active else "Seek cancelled"
         return response
@@ -1628,10 +2296,33 @@ class ItemDetectYoloNode(Node):
         response.message = "Seek released by item pick"
         return response
 
+    def handle_repick(self, request, response):
+        del request
+        if self.seek_mode_active:
+            response.success = False
+            response.message = "Repick rejected: seek is already acquiring"
+            return response
+        if not self.seek_result_latched:
+            response.success = False
+            response.message = "Repick rejected: no latched seek result"
+            return response
+
+        self.seek_mode_active = True
+        self.seek_result_latched = False
+        self.seek_started_time = time.monotonic()
+        self.last_seek_pose = None
+        self.last_seek_pose_time = 0.0
+        self.last_inference_time = 0.0
+        self.status = "Repick requested: reacquiring YOLO item pose"
+        response.success = True
+        response.message = self.status
+        return response
+
     def handle_seek_status(self, request, response):
         del request
-        response.success = self.seek_mode_active
-        response.message = "Seek: ON" if self.seek_mode_active else "Seek: OFF"
+        active = self.seek_is_on()
+        response.success = active
+        response.message = "Seek: ON" if active else "Seek: OFF"
         return response
 
     def handle_go_to_teach(self, request, response):
@@ -1642,6 +2333,7 @@ class ItemDetectYoloNode(Node):
 
     def set_seek_mode(self, active: bool, message: Optional[str] = None) -> None:
         self.seek_mode_active = active
+        self.seek_result_latched = False
         if active:
             self.seek_started_time = time.monotonic()
             self.last_inference_time = 0.0
@@ -1680,17 +2372,23 @@ class ItemDetectYoloNode(Node):
     def request_delete_profile(self) -> bool:
         profile = self.active_profile
         if profile is None:
-            self.status = "Delete Item: select an item profile"
+            self.status = "Delete Item: select a YOLO model"
             return False
-        if not self.delete_pending():
-            self.pending_delete_profile = profile.path
-            self.pending_delete_deadline = time.monotonic() + 3.0
-            self.status = f"Click Delete again to remove {profile.item_name} profile and model"
+        self.delete_confirm_active = True
+        self.status = f"Confirm delete {profile.item_name} model"
+        return False
+
+    def confirm_delete_profile(self) -> bool:
+        profile = self.active_profile
+        if profile is None:
+            self.delete_confirm_active = False
+            self.status = "Delete Item: select a YOLO model"
             return False
         try:
             deleted_name = profile.path.name
             self.ort_session = None
-            profile.path.unlink()
+            if profile.path.exists() and profile.path.is_file() and self.is_safe_model_path(profile.path):
+                profile.path.unlink()
             deleted_models = self.delete_model_artifacts(profile)
             if deleted_models:
                 deleted_message = f"Deleted profile {deleted_name} and model folder"
@@ -1701,11 +2399,15 @@ class ItemDetectYoloNode(Node):
             self.get_logger().warn(self.status)
             self.pending_delete_profile = None
             self.pending_delete_deadline = 0.0
+            self.delete_confirm_active = False
             return False
         self.pending_delete_profile = None
         self.pending_delete_deadline = 0.0
+        self.delete_confirm_active = False
         self.active_profile = None
         self.selected_profile_index = -1
+        self.selected_model_path = None
+        self.selected_profile_path = None
         self.ort_session = None
         self.latest_detections = []
         self.latest_detection_poses = []
@@ -1713,6 +2415,9 @@ class ItemDetectYoloNode(Node):
         self.selected_pose = None
         self.peak_pixel = None
         self.refresh_profiles()
+        self.save_selected_model_export_file()
+        self.save_selected_profile_export_file()
+        self.publish_selected_profile()
         self.status = deleted_message if self.profiles else f"{deleted_message}; no profiles remaining"
         return True
 

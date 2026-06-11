@@ -36,12 +36,14 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/robot_identity.hpp>
 #include <dobot_common/workspace_paths.hpp>
 
 namespace
@@ -54,6 +56,7 @@ using SetInt32Srv = orbbec_camera_msgs::srv::SetInt32;
 using PoseArrayMsg = geometry_msgs::msg::PoseArray;
 using PoseStampedMsg = geometry_msgs::msg::PoseStamped;
 using MarkerMsg = visualization_msgs::msg::Marker;
+using StringMsg = std_msgs::msg::String;
 using TriggerSrv = std_srvs::srv::Trigger;
 
 constexpr double kMinOutlierDistancePx = 4.0;
@@ -377,6 +380,14 @@ struct ItemMetricEstimate
   std::array<double, 4> edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
 };
 
+struct DetectedItemDimensions
+{
+  double length_mm {0.0};
+  double width_mm {0.0};
+  double area_mm2 {0.0};
+  std::array<double, 4> edge_lengths_mm {0.0, 0.0, 0.0, 0.0};
+};
+
 struct ItemPose3D
 {
   cv::Vec3d origin;
@@ -538,9 +549,23 @@ struct AxisAlignedRoiBounds
   int bottom {0};
 };
 
+struct CameraCalibrationMetadata
+{
+  std::string calibration_type;
+  std::string robot_base_frame;
+  std::string transform_child_frame;
+  std::string tracking_base_frame;
+};
+
 bool isValidRoiBounds(const AxisAlignedRoiBounds &bounds);
 std::optional<AxisAlignedRoiBounds> roiBoundsFromSelection(const std::vector<cv::Point2f> &points);
 std::vector<cv::Point2f> roiPointsFromBounds(const AxisAlignedRoiBounds &bounds);
+std::vector<cv::Point2f> denormalizeRoiPoints(
+  const std::vector<cv::Point2f> &normalized_points,
+  const cv::Size &image_size);
+std::optional<AxisAlignedRoiBounds> denormalizeRoiBounds(
+  const std::array<double, 4> &normalized_bounds,
+  const cv::Size &image_size);
 std::optional<AxisAlignedRoiBounds> combinedRoiBounds(const std::vector<AxisAlignedRoiBounds> &roi_regions);
 std::vector<cv::Point2f> mergeRoiRegionsIntoPolygon(const std::vector<AxisAlignedRoiBounds> &roi_regions);
 int lowerLeftCornerIndex(const std::vector<cv::Point2f> &corners);
@@ -552,6 +577,7 @@ struct ItemProfile
   std::filesystem::path path;
   std::string item_name;
   std::string associated_bin_name;
+  std::string bin_teach_file;
   std::string teach_date;
   std::string display_label;
   std::string color_topic;
@@ -597,11 +623,18 @@ struct ItemProfile
   double depth_plane_c {0.0};
   double depth_plane_reference_depth_m {0.0};
   std::optional<AxisAlignedRoiBounds> depth_plane_roi_bounds;
+  std::optional<std::array<double, 4>> depth_plane_roi_normalized;
   std::vector<AxisAlignedRoiBounds> roi_regions;
   std::vector<cv::Point2f> roi_points;
+  std::vector<cv::Point2f> roi_points_normalized;
+  int roi_image_width {0};
+  int roi_image_height {0};
   std::array<double, 6> teach_joints_deg {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints {false};
   bool has_tool_teach {false};
+  bool has_taught_item_dimensions {false};
+  double taught_item_length_mm {0.0};
+  double taught_item_width_mm {0.0};
 };
 
 struct DepthPlaneModel
@@ -917,6 +950,222 @@ std::optional<ItemProfile> loadItemProfileFile(const std::filesystem::path &path
         return points;
       };
 
+    const auto parseNormalizedPointList = [&parsePoint2fList](const YAML::Node &node) -> std::vector<cv::Point2f>
+      {
+        std::vector<cv::Point2f> points = parsePoint2fList(node);
+        if (points.size() != 4)
+        {
+          return {};
+        }
+        for (const auto &point : points)
+        {
+          if (!std::isfinite(point.x) || !std::isfinite(point.y))
+          {
+            return {};
+          }
+        }
+        return points;
+      };
+
+    const auto parseNormalizedBounds = [](const YAML::Node &node) -> std::optional<std::array<double, 4>>
+      {
+        if (!node || !node.IsSequence() || node.size() < 4)
+        {
+          return std::nullopt;
+        }
+
+        std::array<double, 4> bounds{};
+        for (std::size_t i = 0; i < bounds.size(); ++i)
+        {
+          const double value = node[i].as<double>();
+          if (!std::isfinite(value))
+          {
+            return std::nullopt;
+          }
+          bounds[i] = std::clamp(value, 0.0, 1.0);
+        }
+        return bounds;
+      };
+
+    const auto loadBinTeachNormalizedRoi = [&path, &parseNormalizedPointList, &parsePoint2fList](
+        const std::string &bin_teach_file) -> std::vector<cv::Point2f>
+      {
+        if (bin_teach_file.empty())
+        {
+          return {};
+        }
+        std::filesystem::path bin_path(bin_teach_file);
+        if (bin_path.is_relative())
+        {
+          bin_path = path.parent_path() / bin_path;
+        }
+        std::error_code fs_error;
+        if (!std::filesystem::exists(bin_path, fs_error) || !std::filesystem::is_regular_file(bin_path, fs_error))
+        {
+          return {};
+        }
+        try
+        {
+          const YAML::Node bin_root = YAML::LoadFile(bin_path.string());
+          const YAML::Node bin = bin_root["bin_teach"];
+          if (!bin || !bin.IsMap())
+          {
+            return {};
+          }
+          if (std::vector<cv::Point2f> normalized = parseNormalizedPointList(bin["roi_points_normalized"]);
+              !normalized.empty())
+          {
+            return normalized;
+          }
+          const YAML::Node image = bin["image"];
+          if (!image || !image.IsMap())
+          {
+            return {};
+          }
+          const int width = image["width"] ? image["width"].as<int>() : 0;
+          const int height = image["height"] ? image["height"].as<int>() : 0;
+          if (width <= 1 || height <= 1)
+          {
+            return {};
+          }
+          std::vector<cv::Point2f> roi_points = parsePoint2fList(bin["roi_points"]);
+          if (roi_points.size() != 4)
+          {
+            return {};
+          }
+          for (auto &point : roi_points)
+          {
+            if (!std::isfinite(point.x) || !std::isfinite(point.y))
+            {
+              return {};
+            }
+            point.x = std::clamp(point.x / static_cast<float>(width - 1), 0.0F, 1.0F);
+            point.y = std::clamp(point.y / static_cast<float>(height - 1), 0.0F, 1.0F);
+          }
+          return roi_points;
+        }
+        catch (const YAML::Exception &)
+        {
+          return {};
+        }
+      };
+
+    const auto loadBinTeachNormalizedDepthPlaneRoi = [&path, &parseNormalizedBounds](
+        const std::string &bin_teach_file) -> std::optional<std::array<double, 4>>
+      {
+        if (bin_teach_file.empty())
+        {
+          return std::nullopt;
+        }
+        std::filesystem::path bin_path(bin_teach_file);
+        if (bin_path.is_relative())
+        {
+          bin_path = path.parent_path() / bin_path;
+        }
+        std::error_code fs_error;
+        if (!std::filesystem::exists(bin_path, fs_error) || !std::filesystem::is_regular_file(bin_path, fs_error))
+        {
+          return std::nullopt;
+        }
+        try
+        {
+          const YAML::Node bin_root = YAML::LoadFile(bin_path.string());
+          const YAML::Node bin = bin_root["bin_teach"];
+          if (!bin || !bin.IsMap())
+          {
+            return std::nullopt;
+          }
+          if (const auto normalized = parseNormalizedBounds(bin["depth_plane_roi_normalized"]);
+            normalized.has_value())
+          {
+            return normalized;
+          }
+          const YAML::Node image = bin["image"];
+          const YAML::Node roi = bin["depth_plane_roi"];
+          if (!image || !image.IsMap() || !roi || !roi.IsSequence() || roi.size() < 4)
+          {
+            return std::nullopt;
+          }
+          const int width = image["width"] ? image["width"].as<int>() : 0;
+          const int height = image["height"] ? image["height"].as<int>() : 0;
+          if (width <= 1 || height <= 1)
+          {
+            return std::nullopt;
+          }
+          return std::array<double, 4>{
+            std::clamp(static_cast<double>(roi[0].as<int>()) / static_cast<double>(width - 1), 0.0, 1.0),
+            std::clamp(static_cast<double>(roi[1].as<int>()) / static_cast<double>(height - 1), 0.0, 1.0),
+            std::clamp(static_cast<double>(roi[2].as<int>()) / static_cast<double>(width - 1), 0.0, 1.0),
+            std::clamp(static_cast<double>(roi[3].as<int>()) / static_cast<double>(height - 1), 0.0, 1.0),
+          };
+        }
+        catch (const YAML::Exception &)
+        {
+          return std::nullopt;
+        }
+      };
+
+    if (params["image_width"])
+    {
+      profile.roi_image_width = std::max(0, params["image_width"].as<int>());
+    }
+    if (params["image_height"])
+    {
+      profile.roi_image_height = std::max(0, params["image_height"].as<int>());
+    }
+    if (const YAML::Node image = params["image"]; image && image.IsMap())
+    {
+      if (profile.roi_image_width <= 0 && image["width"])
+      {
+        profile.roi_image_width = std::max(0, image["width"].as<int>());
+      }
+      if (profile.roi_image_height <= 0 && image["height"])
+      {
+        profile.roi_image_height = std::max(0, image["height"].as<int>());
+      }
+    }
+    profile.bin_teach_file = params["bin_teach_file"] ? params["bin_teach_file"].as<std::string>() : "";
+
+    const auto set_taught_dimensions = [&](double length_mm, double width_mm) -> bool
+    {
+      if (
+        !std::isfinite(length_mm) ||
+        !std::isfinite(width_mm) ||
+        length_mm <= 0.0 ||
+        width_mm <= 0.0)
+      {
+        return false;
+      }
+      profile.taught_item_length_mm = std::max(length_mm, width_mm);
+      profile.taught_item_width_mm = std::min(length_mm, width_mm);
+      profile.has_taught_item_dimensions = true;
+      return true;
+    };
+
+    if (params["item_length_mm"] && params["item_width_mm"])
+    {
+      set_taught_dimensions(params["item_length_mm"].as<double>(), params["item_width_mm"].as<double>());
+    }
+    if (
+      !profile.has_taught_item_dimensions &&
+      params["taught_item_average_length_mm"] &&
+      params["taught_item_average_width_mm"])
+    {
+      set_taught_dimensions(
+        params["taught_item_average_length_mm"].as<double>(),
+        params["taught_item_average_width_mm"].as<double>());
+    }
+    if (
+      !profile.has_taught_item_dimensions &&
+      params["item_dimensions_mm"] &&
+      params["item_dimensions_mm"].IsSequence() &&
+      params["item_dimensions_mm"].size() >= 2)
+    {
+      set_taught_dimensions(
+        params["item_dimensions_mm"][0].as<double>(),
+        params["item_dimensions_mm"][1].as<double>());
+    }
+
     const auto setReferenceFromPolygon = [](
         const std::vector<cv::Point> &polygon_points,
         PoseBlobReference2D *reference_out,
@@ -1199,13 +1448,24 @@ std::optional<ItemProfile> loadItemProfileFile(const std::filesystem::path &path
         profile.depth_plane_roi_bounds = roi;
       }
     }
+    profile.depth_plane_roi_normalized = parseNormalizedBounds(params["depth_plane_roi_normalized"]);
+    if (!profile.depth_plane_roi_normalized.has_value())
+    {
+      profile.depth_plane_roi_normalized = loadBinTeachNormalizedDepthPlaneRoi(profile.bin_teach_file);
+    }
+    if (!profile.depth_plane_roi_bounds.has_value() && profile.depth_plane_roi_normalized.has_value())
+    {
+      profile.depth_plane_roi_bounds = denormalizeRoiBounds(
+        *profile.depth_plane_roi_normalized,
+        cv::Size(profile.roi_image_width, profile.roi_image_height));
+    }
     if (
       !std::isfinite(profile.depth_plane_a) ||
       !std::isfinite(profile.depth_plane_b) ||
       !std::isfinite(profile.depth_plane_c) ||
       !std::isfinite(profile.depth_plane_reference_depth_m) ||
       profile.depth_plane_reference_depth_m <= 0.0 ||
-      !profile.depth_plane_roi_bounds.has_value())
+      (!profile.depth_plane_roi_bounds.has_value() && !profile.depth_plane_roi_normalized.has_value()))
     {
       profile.depth_plane_enabled = false;
       profile.depth_plane_a = 0.0;
@@ -1259,12 +1519,17 @@ std::optional<ItemProfile> loadItemProfileFile(const std::filesystem::path &path
         }
       }
     }
+    profile.roi_points_normalized = parseNormalizedPointList(params["roi_points_normalized"]);
     profile.item_name = params["item_name"]
       ? params["item_name"].as<std::string>()
       : path.stem().string();
     profile.associated_bin_name = params["associated_bin_name"]
       ? params["associated_bin_name"].as<std::string>()
       : "";
+    if (profile.roi_points_normalized.empty())
+    {
+      profile.roi_points_normalized = loadBinTeachNormalizedRoi(profile.bin_teach_file);
+    }
     profile.teach_date = params["teach_date"] ? params["teach_date"].as<std::string>() : "";
     if (const YAML::Node teach_joints = params["teach_joints_deg"];
         teach_joints && teach_joints.IsSequence())
@@ -1281,8 +1546,7 @@ std::optional<ItemProfile> loadItemProfileFile(const std::filesystem::path &path
     }
     else if (
       profile.roi_regions.empty() &&
-      profile.roi_points.size() >= 2 &&
-      profile.roi_points.size() <= 4)
+      profile.roi_points.size() == 2)
     {
       if (const auto selected_bounds = roiBoundsFromSelection(profile.roi_points); selected_bounds.has_value())
       {
@@ -1878,6 +2142,58 @@ double normalizedImageCoord(int value, int max_value)
     return 0.0;
   }
   return static_cast<double>(value) / static_cast<double>(max_value - 1);
+}
+
+std::vector<cv::Point2f> denormalizeRoiPoints(
+  const std::vector<cv::Point2f> &normalized_points,
+  const cv::Size &image_size)
+{
+  if (normalized_points.size() < 4 || image_size.width <= 1 || image_size.height <= 1)
+  {
+    return {};
+  }
+
+  std::vector<cv::Point2f> points;
+  points.reserve(normalized_points.size());
+  const float max_x = static_cast<float>(image_size.width - 1);
+  const float max_y = static_cast<float>(image_size.height - 1);
+  for (const auto &point : normalized_points)
+  {
+    points.emplace_back(
+      std::clamp(point.x, 0.0F, 1.0F) * max_x,
+      std::clamp(point.y, 0.0F, 1.0F) * max_y);
+  }
+  return points;
+}
+
+std::optional<AxisAlignedRoiBounds> denormalizeRoiBounds(
+  const std::array<double, 4> &normalized_bounds,
+  const cv::Size &image_size)
+{
+  if (image_size.width <= 1 || image_size.height <= 1)
+  {
+    return std::nullopt;
+  }
+
+  AxisAlignedRoiBounds bounds{
+    static_cast<int>(std::lround(std::clamp(normalized_bounds[0], 0.0, 1.0) * static_cast<double>(image_size.width - 1))),
+    static_cast<int>(std::lround(std::clamp(normalized_bounds[1], 0.0, 1.0) * static_cast<double>(image_size.height - 1))),
+    static_cast<int>(std::lround(std::clamp(normalized_bounds[2], 0.0, 1.0) * static_cast<double>(image_size.width - 1))),
+    static_cast<int>(std::lround(std::clamp(normalized_bounds[3], 0.0, 1.0) * static_cast<double>(image_size.height - 1))),
+  };
+  if (bounds.left > bounds.right)
+  {
+    std::swap(bounds.left, bounds.right);
+  }
+  if (bounds.top > bounds.bottom)
+  {
+    std::swap(bounds.top, bounds.bottom);
+  }
+  if (!isValidRoiBounds(bounds))
+  {
+    return std::nullopt;
+  }
+  return bounds;
 }
 
 cv::Mat applyFixedDepthPlaneNormalization(const cv::Mat &depth_m, const DepthPlaneModel &plane)
@@ -7832,6 +8148,7 @@ public:
       "bin_item_poses");
     item_cube_marker_topic_ = declare_parameter<std::string>("bin_cube_marker_topic", "bin_cube_marker");
     seek_service_name_ = declare_parameter<std::string>("seek_service", "item_detect/seek");
+    repick_service_name_ = declare_parameter<std::string>("repick_service", "item_detect/repick");
     go_to_teach_service_name_ = declare_parameter<std::string>(
       "go_to_teach_service",
       "item_detect/go_to_teach");
@@ -7851,10 +8168,12 @@ public:
       true);
     calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "base_link");
     calibration_child_frame_ = declare_parameter<std::string>(
-      "calibration_child_frame", "bin_calibrated_link");
+      "calibration_child_frame", "bin_calibrated_camera_link");
     calibration_dir_ = declare_parameter<std::string>(
       "calibration_dir", defaultCalibrationDir());
     calibration_file_ = declare_parameter<std::string>("calibration_file", "");
+    robot_ip_address_ = dobot_common::robot_identity::resolveRobotIpAddress(
+      declare_parameter<std::string>("robot_ip_address", ""), __FILE__);
     auto_discover_calibration_ = declare_parameter<bool>("auto_discover_calibration", true);
     const std::string runtime_settings_file_param = declare_parameter<std::string>(
       "runtime_settings_file",
@@ -7864,6 +8183,9 @@ public:
       "selected_profile_export_file",
       defaultSelectedProfileExportFile(profiles_dir_));
     selected_profile_export_path_ = resolvePath(selected_profile_export_file_param);
+    selected_profile_topic_ = declare_parameter<std::string>(
+      "selected_profile_topic",
+      "item_detect/selected_profile");
     const std::string default_camera_frame =
       use_calibration_ ? calibration_child_frame_ : std::string("");
     camera_frame_id_ = declare_parameter<std::string>("camera_frame", default_camera_frame);
@@ -8092,7 +8414,7 @@ public:
       get_logger(),
       "item_detect ready. Overlay topic=%s seek_pose topic=%s item_pose_array topic=%s item_marker topic=%s "
       "(enabled=%s thickness=%.1fmm) detect_mode=%s depth_threshold=+/- %dmm depth_plane=%s "
-      "z_axis_align=%s movj_service=%s seek_service=%s go_to_teach_service=%s "
+      "z_axis_align=%s movj_service=%s seek_service=%s repick_service=%s go_to_teach_service=%s "
       "selected_profile=%s profiles=%zu headless=%s",
       overlay_topic_.c_str(),
       seek_pose_topic_.c_str(),
@@ -8106,6 +8428,7 @@ public:
       align_item_z_axis_to_depth_plane_ ? "depth-plane" : "off",
       movj_service_name_.c_str(),
       seek_service_name_.c_str(),
+      repick_service_name_.c_str(),
       go_to_teach_service_name_.c_str(),
 	      selectedProfileDisplayText().c_str(),
 	      item_profiles_.size(),
@@ -8120,8 +8443,12 @@ public:
     {
       RCLCPP_INFO(
         get_logger(),
-        "Calibration loaded from %s. Publishing %s -> %s in-node: %s",
-        calibration_file_.c_str(), calibration_parent_frame_.c_str(), calibration_child_frame_.c_str(),
+        "Calibration loaded from %s. type=%s yaml_tracking_base=%s publishing %s -> %s in-node: %s",
+        calibration_file_.c_str(),
+        calibration_metadata_.calibration_type.empty() ? "<missing>" : calibration_metadata_.calibration_type.c_str(),
+        calibration_metadata_.tracking_base_frame.empty() ? "<missing>" : calibration_metadata_.tracking_base_frame.c_str(),
+        calibration_parent_frame_.c_str(),
+        calibration_child_frame_.c_str(),
         publish_static_calibration_tf_ ? "enabled" : "disabled");
     }
     else
@@ -8296,8 +8623,7 @@ private:
         return {};
       }
 
-      std::filesystem::path preferred_path;
-      std::filesystem::file_time_type preferred_time;
+      dobot_common::robot_identity::LatestRobotFileSelection selection;
       for (const auto &entry : std::filesystem::directory_iterator(base))
       {
         if (!entry.is_regular_file())
@@ -8318,19 +8644,49 @@ private:
         {
           continue;
         }
-        if (preferred_path.empty() || entry.last_write_time() > preferred_time)
-        {
-          preferred_path = p;
-          preferred_time = entry.last_write_time();
-        }
+        selection.consider(p, entry.last_write_time(), robot_ip_address_);
       }
-      return preferred_path.string();
+      return selection.selected().string();
     }
     catch (const std::exception &ex)
     {
       RCLCPP_WARN(get_logger(), "Failed to discover calibration files: %s", ex.what());
       return {};
     }
+  }
+
+  static std::string yamlScalarString(const YAML::Node &node)
+  {
+    if (!node || !node.IsScalar())
+    {
+      return {};
+    }
+    try
+    {
+      return node.as<std::string>();
+    }
+    catch (const std::exception &)
+    {
+      return {};
+    }
+  }
+
+  static std::string normalizeCalibrationType(std::string type)
+  {
+    std::string normalized;
+    normalized.reserve(type.size());
+    for (const unsigned char ch : type)
+    {
+      if (std::isalnum(ch) != 0)
+      {
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+      }
+      else if (ch == '_' || ch == '-')
+      {
+        normalized.push_back('_');
+      }
+    }
+    return normalized;
   }
 
   bool loadCalibrationFromFile(const std::string &file_path, std::string &reason)
@@ -8380,6 +8736,55 @@ private:
       return false;
     }
 
+    CameraCalibrationMetadata metadata;
+    if (const auto params = root["parameters"]; params && params.IsMap())
+    {
+      metadata.calibration_type = yamlScalarString(params["calibration_type"]);
+      metadata.robot_base_frame = yamlScalarString(params["robot_base_frame"]);
+      metadata.transform_child_frame = yamlScalarString(params["transform_child_frame"]);
+      metadata.tracking_base_frame = yamlScalarString(params["tracking_base_frame"]);
+    }
+
+    // camera_calibration writes eye-to-hand as eye_on_base and broadcasts the
+    // transform directly from robot_base_frame to the saved calibrated camera frame.
+    const std::string normalized_type = normalizeCalibrationType(metadata.calibration_type);
+    if (normalized_type != "eye_on_base")
+    {
+      reason = "Expected eye-to-hand calibration YAML with parameters.calibration_type=eye_on_base, got '" +
+        (metadata.calibration_type.empty() ? std::string("<missing>") : metadata.calibration_type) + "'";
+      return false;
+    }
+
+    if (metadata.robot_base_frame.empty())
+    {
+      metadata.robot_base_frame = calibration_parent_frame_;
+      RCLCPP_WARN(
+        get_logger(),
+        "Calibration YAML %s has no parameters.robot_base_frame; keeping configured parent frame %s.",
+        resolved_path.string().c_str(),
+        calibration_parent_frame_.c_str());
+    }
+    else if (metadata.robot_base_frame != calibration_parent_frame_)
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "Calibration YAML robot_base_frame is %s but item_detect was configured with parent %s. "
+        "Using YAML parent frame so eye-to-hand TF matches camera_calibration.",
+        metadata.robot_base_frame.c_str(),
+        calibration_parent_frame_.c_str());
+      calibration_parent_frame_ = metadata.robot_base_frame;
+    }
+    if (!metadata.transform_child_frame.empty() && metadata.transform_child_frame != calibration_child_frame_)
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "Calibration YAML transform_child_frame is %s but item_detect was configured with child %s. "
+        "Using YAML child frame so eye-to-hand TF matches camera_calibration.",
+        metadata.transform_child_frame.c_str(),
+        calibration_child_frame_.c_str());
+      calibration_child_frame_ = metadata.transform_child_frame;
+    }
+
     double qx = 0.0;
     double qy = 0.0;
     double qz = 0.0;
@@ -8411,14 +8816,15 @@ private:
     calibration_rotation_.y = qy * inv;
     calibration_rotation_.z = qz * inv;
     calibration_rotation_.w = qw * inv;
+    calibration_metadata_ = metadata;
     return true;
   }
 
-	  void publishCalibrationTransform()
-	  {
-	    if (!static_tf_broadcaster_)
-	    {
-	      return;
+  void publishCalibrationTransform()
+  {
+    if (!static_tf_broadcaster_)
+    {
+      return;
     }
 
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -8427,8 +8833,8 @@ private:
     tf_msg.child_frame_id = calibration_child_frame_;
     tf_msg.transform.translation = calibration_translation_;
     tf_msg.transform.rotation = calibration_rotation_;
-	    static_tf_broadcaster_->sendTransform(tf_msg);
-	  }
+    static_tf_broadcaster_->sendTransform(tf_msg);
+  }
 
 	  void markCameraExposureDirty()
 	  {
@@ -8599,6 +9005,9 @@ private:
     item_cube_marker_pub_ = create_publisher<MarkerMsg>(
       item_cube_marker_topic_,
       rclcpp::QoS(1).reliable().transient_local());
+    selected_profile_pub_ = create_publisher<StringMsg>(
+      selected_profile_topic_,
+      rclcpp::QoS(1).reliable().transient_local());
     color_sub_ = create_subscription<ImageMsg>(
       color_topic_, rclcpp::SensorDataQoS(),
       std::bind(&ItemDetectNode::colorCallback, this, std::placeholders::_1));
@@ -8624,6 +9033,16 @@ private:
         seek_complete_service_name_,
         std::bind(
           &ItemDetectNode::handleSeekCompleteService,
+          this,
+          std::placeholders::_1,
+          std::placeholders::_2));
+    }
+    if (!repick_service_)
+    {
+      repick_service_ = create_service<TriggerSrv>(
+        repick_service_name_,
+        std::bind(
+          &ItemDetectNode::handleRepickService,
           this,
           std::placeholders::_1,
           std::placeholders::_2));
@@ -8654,6 +9073,7 @@ private:
           std::placeholders::_1,
           std::placeholders::_2));
     }
+    publishSelectedProfile();
 
     std::lock_guard<std::mutex> lock(data_mutex_);
     latest_depth_.release();
@@ -8696,6 +9116,33 @@ private:
     clearSeekResultFreeze();
     resetSeekSessionState();
     profile_status_message_ = "Seek released by item pick";
+    response->success = true;
+    response->message = profile_status_message_;
+  }
+
+  void handleRepickService(
+    const std::shared_ptr<TriggerSrv::Request> request,
+    std::shared_ptr<TriggerSrv::Response> response)
+  {
+    (void)request;
+    if (seek_mode_active_)
+    {
+      response->success = false;
+      response->message = "Repick rejected: seek is already acquiring";
+      return;
+    }
+    if (!seek_result_latched_)
+    {
+      response->success = false;
+      response->message = "Repick rejected: no latched seek result";
+      return;
+    }
+
+    seek_mode_active_ = true;
+    seek_result_latched_ = false;
+    clearSeekResultFreeze();
+    resetSeekSessionState();
+    profile_status_message_ = "Repick requested: reacquiring item pose";
     response->success = true;
     response->message = profile_status_message_;
   }
@@ -8782,6 +9229,158 @@ private:
       return std::nullopt;
     }
     return plane_depth_m;
+  }
+
+  std::optional<DetectedItemDimensions> measureBlobDimensionsOnDepthPlane(
+    const BinarizedPoseEstimate2D::BlobPose2D &blob_pose,
+    const cv::Size &image_size,
+    const CameraInfoMsg &camera_info) const
+  {
+    if (
+      blob_pose.corners.size() != 4 ||
+      !depth_plane_model_.valid ||
+      image_size.width <= 0 ||
+      image_size.height <= 0 ||
+      camera_info.k[0] <= 1e-6 ||
+      camera_info.k[4] <= 1e-6)
+    {
+      return std::nullopt;
+    }
+
+    std::array<cv::Vec3d, 4> camera_points;
+    for (std::size_t i = 0; i < blob_pose.corners.size(); ++i)
+    {
+      const auto depth = depthPlaneDepthAtPixel(depth_plane_model_, blob_pose.corners[i], image_size);
+      if (!depth.has_value())
+      {
+        return std::nullopt;
+      }
+      camera_points[i] = projectPixelToCamera(blob_pose.corners[i], *depth, camera_info);
+    }
+
+    const int origin_idx = lowerLeftCornerIndex(blob_pose.corners);
+    if (origin_idx < 0)
+    {
+      return std::nullopt;
+    }
+
+    const auto edge_length_mm = [&](int a, int b) -> double
+    {
+      return vectorNorm(
+        camera_points[static_cast<std::size_t>(a)] -
+        camera_points[static_cast<std::size_t>(b)]) * kMetersToMillimeters;
+    };
+
+    const int prev_idx = (origin_idx + 3) % 4;
+    const int next_idx = (origin_idx + 1) % 4;
+    const int opposite_idx = (origin_idx + 2) % 4;
+    const double origin_prev_len_mm = edge_length_mm(origin_idx, prev_idx);
+    const double next_opposite_len_mm = edge_length_mm(next_idx, opposite_idx);
+    const double origin_next_len_mm = edge_length_mm(origin_idx, next_idx);
+    const double prev_opposite_len_mm = edge_length_mm(prev_idx, opposite_idx);
+
+    std::array<double, 4> ordered_edges_mm;
+    if (origin_prev_len_mm >= origin_next_len_mm)
+    {
+      ordered_edges_mm = {
+        origin_prev_len_mm,
+        next_opposite_len_mm,
+        origin_next_len_mm,
+        prev_opposite_len_mm,
+      };
+    }
+    else
+    {
+      ordered_edges_mm = {
+        origin_next_len_mm,
+        prev_opposite_len_mm,
+        origin_prev_len_mm,
+        next_opposite_len_mm,
+      };
+    }
+
+    for (const double edge_mm : ordered_edges_mm)
+    {
+      if (!std::isfinite(edge_mm) || edge_mm <= 0.0)
+      {
+        return std::nullopt;
+      }
+    }
+
+    const double x_size_mm = 0.5 * (ordered_edges_mm[0] + ordered_edges_mm[1]);
+    const double y_size_mm = 0.5 * (ordered_edges_mm[2] + ordered_edges_mm[3]);
+    const double area_m2 =
+      triangleArea3D(camera_points[0], camera_points[1], camera_points[2]) +
+      triangleArea3D(camera_points[0], camera_points[2], camera_points[3]);
+    const double area_mm2 = area_m2 > 0.0
+      ? area_m2 * kMetersToMillimeters * kMetersToMillimeters
+      : x_size_mm * y_size_mm;
+    if (
+      !std::isfinite(x_size_mm) ||
+      !std::isfinite(y_size_mm) ||
+      !std::isfinite(area_mm2) ||
+      x_size_mm <= 0.0 ||
+      y_size_mm <= 0.0 ||
+      area_mm2 <= 0.0)
+    {
+      return std::nullopt;
+    }
+
+    DetectedItemDimensions dimensions;
+    dimensions.length_mm = std::max(x_size_mm, y_size_mm);
+    dimensions.width_mm = std::min(x_size_mm, y_size_mm);
+    dimensions.area_mm2 = area_mm2;
+    dimensions.edge_lengths_mm = ordered_edges_mm;
+    return dimensions;
+  }
+
+  bool detectedDimensionsWithinTaughtBand(
+    const DetectedItemDimensions &dimensions,
+    int tolerance_percent,
+    std::string *status_text = nullptr) const
+  {
+    if (!has_taught_item_dimensions_)
+    {
+      if (status_text != nullptr)
+      {
+        *status_text = "Dimension gate unavailable: selected teach file has no item dimensions.";
+      }
+      return true;
+    }
+
+    const int clamped_tolerance_percent = std::clamp(
+      tolerance_percent,
+      kBlobToleranceMinPercent,
+      kBlobToleranceMaxPercent);
+    const double tolerance_fraction = static_cast<double>(clamped_tolerance_percent) / 100.0;
+    const double length_lower = taught_item_length_mm_ * (1.0 - tolerance_fraction);
+    const double length_upper = taught_item_length_mm_ * (1.0 + tolerance_fraction);
+    const double width_lower = taught_item_width_mm_ * (1.0 - tolerance_fraction);
+    const double width_upper = taught_item_width_mm_ * (1.0 + tolerance_fraction);
+    const bool length_ok = dimensions.length_mm >= length_lower && dimensions.length_mm <= length_upper;
+    const bool width_ok = dimensions.width_mm >= width_lower && dimensions.width_mm <= width_upper;
+
+    if (status_text != nullptr)
+    {
+      const double length_error_percent = taught_item_length_mm_ > 1e-6
+        ? 100.0 * std::fabs(dimensions.length_mm - taught_item_length_mm_) / taught_item_length_mm_
+        : 0.0;
+      const double width_error_percent = taught_item_width_mm_ > 1e-6
+        ? 100.0 * std::fabs(dimensions.width_mm - taught_item_width_mm_) / taught_item_width_mm_
+        : 0.0;
+      *status_text = cv::format(
+        "%s: measured %.1f x %.1f mm, taught %.1f x %.1f mm, err %.1f/%.1f%%, tol +/- %d%%",
+        (length_ok && width_ok) ? "Dimension OK" : "Rejected size",
+        dimensions.length_mm,
+        dimensions.width_mm,
+        taught_item_length_mm_,
+        taught_item_width_mm_,
+        length_error_percent,
+        width_error_percent,
+        clamped_tolerance_percent);
+    }
+
+    return length_ok && width_ok;
   }
 
   std::optional<cv::Vec3d> depthPlaneNormalInFrame(
@@ -9090,6 +9689,7 @@ private:
     depth_plane_model_.c = profile.depth_plane_c;
     depth_plane_model_.reference_depth_m = profile.depth_plane_reference_depth_m;
     depth_plane_roi_bounds_ = profile.depth_plane_roi_bounds;
+    depth_plane_roi_normalized_ = profile.depth_plane_roi_normalized;
     if (
       !depth_plane_model_.valid ||
       !std::isfinite(depth_plane_model_.a) ||
@@ -9097,15 +9697,21 @@ private:
       !std::isfinite(depth_plane_model_.c) ||
       !std::isfinite(depth_plane_model_.reference_depth_m) ||
       depth_plane_model_.reference_depth_m <= 0.0 ||
-      !depth_plane_roi_bounds_.has_value())
+      (!depth_plane_roi_bounds_.has_value() && !depth_plane_roi_normalized_.has_value()))
     {
       depth_plane_model_ = DepthPlaneModel{};
+      depth_plane_roi_normalized_.reset();
     }
     roi_points_ = profile.roi_points;
+    roi_points_normalized_ = profile.roi_points_normalized;
+    roi_points_source_image_size_ = cv::Size(profile.roi_image_width, profile.roi_image_height);
     item_name_ = profile.item_name;
     teach_date_ = profile.teach_date;
     teach_joints_deg_ = profile.teach_joints_deg;
     has_teach_joints_ = profile.has_teach_joints;
+    has_taught_item_dimensions_ = profile.has_taught_item_dimensions;
+    taught_item_length_mm_ = profile.taught_item_length_mm;
+    taught_item_width_mm_ = profile.taught_item_width_mm;
     resetMotionTracking();
 
     if (
@@ -9137,6 +9743,7 @@ private:
     applyProfile(item_profiles_[index], interfaces_ready);
     profile_status_message_ = "Loaded " + item_profiles_[index].display_label;
     saveSelectedProfileExportFile();
+    publishSelectedProfile();
     if (persist_runtime)
     {
       saveRuntimeUiSettings();
@@ -9397,6 +10004,22 @@ private:
     }
   }
 
+  void publishSelectedProfile()
+  {
+    if (!selected_profile_pub_)
+    {
+      return;
+    }
+
+    const std::filesystem::path selected_profile_path =
+      (selected_profile_index_ >= 0 && selected_profile_index_ < static_cast<int>(item_profiles_.size()))
+      ? item_profiles_[selected_profile_index_].path
+      : selected_profile_path_;
+    StringMsg msg;
+    msg.data = selected_profile_path.string();
+    selected_profile_pub_->publish(msg);
+  }
+
   void saveSelectedProfileExportFile() const
   {
     if (selected_profile_export_path_.empty())
@@ -9531,6 +10154,7 @@ private:
       selected_profile_index_ = -1;
       profile_status_message_ = "Deleted " + delete_path.filename().string();
       saveSelectedProfileExportFile();
+      publishSelectedProfile();
       saveRuntimeUiSettings();
     }
 
@@ -10396,10 +11020,12 @@ private:
   {
     if (!seek_last_valid_capture_.has_value())
     {
-      seek_mode_active_ = false;
+      seek_mode_active_ = true;
       seek_result_latched_ = false;
       resetSeekSessionState();
-      profile_status_message_ = cv::format("Seek done (%.1fs): no valid item frame", seekWindowSeconds());
+      profile_status_message_ = cv::format(
+        "Seek still ON: no valid item frame in %.1fs window; reacquiring",
+        seekWindowSeconds());
       return false;
     }
 
@@ -10547,6 +11173,97 @@ private:
     (void)info;
   }
 
+  std::vector<cv::Point2f> effectiveRoiPointsForImage(const cv::Size &image_size) const
+  {
+    if (
+      hasValidRoiPoints(roi_points_) &&
+      roi_points_source_image_size_.width > 1 &&
+      roi_points_source_image_size_.height > 1 &&
+      image_size.width > 1 &&
+      image_size.height > 1 &&
+      (roi_points_source_image_size_.width != image_size.width ||
+       roi_points_source_image_size_.height != image_size.height))
+    {
+      const float scale_x = static_cast<float>(image_size.width - 1) /
+        static_cast<float>(roi_points_source_image_size_.width - 1);
+      const float scale_y = static_cast<float>(image_size.height - 1) /
+        static_cast<float>(roi_points_source_image_size_.height - 1);
+      std::vector<cv::Point2f> scaled;
+      scaled.reserve(roi_points_.size());
+      for (const auto &point : roi_points_)
+      {
+        scaled.emplace_back(
+          std::clamp(point.x * scale_x, 0.0F, static_cast<float>(image_size.width - 1)),
+          std::clamp(point.y * scale_y, 0.0F, static_cast<float>(image_size.height - 1)));
+      }
+      return scaled;
+    }
+
+    if (hasValidRoiPoints(roi_points_))
+    {
+      return roi_points_;
+    }
+
+    if (roi_points_normalized_.size() >= 4)
+    {
+      const std::vector<cv::Point2f> points = denormalizeRoiPoints(roi_points_normalized_, image_size);
+      if (hasValidRoiPoints(points))
+      {
+        return points;
+      }
+    }
+
+    return {};
+  }
+
+  std::optional<AxisAlignedRoiBounds> effectiveDepthPlaneRoiBoundsForImage(const cv::Size &image_size) const
+  {
+    if (
+      depth_plane_roi_bounds_.has_value() &&
+      roi_points_source_image_size_.width > 1 &&
+      roi_points_source_image_size_.height > 1 &&
+      image_size.width > 1 &&
+      image_size.height > 1 &&
+      (roi_points_source_image_size_.width != image_size.width ||
+       roi_points_source_image_size_.height != image_size.height))
+    {
+      const double scale_x = static_cast<double>(image_size.width - 1) /
+        static_cast<double>(roi_points_source_image_size_.width - 1);
+      const double scale_y = static_cast<double>(image_size.height - 1) /
+        static_cast<double>(roi_points_source_image_size_.height - 1);
+      AxisAlignedRoiBounds scaled{
+        static_cast<int>(std::lround(static_cast<double>(depth_plane_roi_bounds_->left) * scale_x)),
+        static_cast<int>(std::lround(static_cast<double>(depth_plane_roi_bounds_->top) * scale_y)),
+        static_cast<int>(std::lround(static_cast<double>(depth_plane_roi_bounds_->right) * scale_x)),
+        static_cast<int>(std::lround(static_cast<double>(depth_plane_roi_bounds_->bottom) * scale_y)),
+      };
+      scaled.left = std::clamp(scaled.left, 0, image_size.width - 1);
+      scaled.right = std::clamp(scaled.right, 0, image_size.width - 1);
+      scaled.top = std::clamp(scaled.top, 0, image_size.height - 1);
+      scaled.bottom = std::clamp(scaled.bottom, 0, image_size.height - 1);
+      if (isValidRoiBounds(scaled))
+      {
+        return scaled;
+      }
+    }
+
+    if (depth_plane_roi_bounds_.has_value())
+    {
+      return depth_plane_roi_bounds_;
+    }
+
+    if (depth_plane_roi_normalized_.has_value())
+    {
+      const auto bounds = denormalizeRoiBounds(*depth_plane_roi_normalized_, image_size);
+      if (bounds.has_value())
+      {
+        return bounds;
+      }
+    }
+
+    return depth_plane_roi_bounds_;
+  }
+
   void colorCallback(const ImageMsg::ConstSharedPtr msg)
   {
     cv_bridge::CvImageConstPtr color_cv;
@@ -10588,11 +11305,14 @@ private:
 
     const rclcpp::Time stamp(msg->header.stamp);
     const std::string resolved_frame_id = resolvedCameraFrameId(msg->header, info);
-    const bool roi_ready = hasValidRoiPoints(roi_points_);
+    const std::vector<cv::Point2f> effective_roi_points = effectiveRoiPointsForImage(color_size);
+    const std::optional<AxisAlignedRoiBounds> effective_depth_plane_roi =
+      effectiveDepthPlaneRoiBoundsForImage(color_size);
+    const bool roi_ready = hasValidRoiPoints(effective_roi_points);
     cv::Mat roi_mask;
     if (roi_ready)
     {
-      roi_mask = buildRoiMask(color_cv->image.size(), roi_points_);
+      roi_mask = buildRoiMask(color_cv->image.size(), effective_roi_points);
     }
 
     const cv::Mat color_mask = buildRgbMask(
@@ -10611,11 +11331,12 @@ private:
     {
       cv::bitwise_and(detection_mask, roi_mask, detection_mask);
     }
+    const bool depth_plane_ready = depth_plane_model_.valid && effective_depth_plane_roi.has_value();
 
     if (detection_use_depth_)
     {
       depth_m = fillInvalidDepthNearby(depth_m, depth_null_fill_sensitivity_);
-      if (depth_plane_model_.valid)
+      if (depth_plane_ready)
       {
         const cv::Mat depth_residual_m = computeDepthPlaneResidual(depth_m, depth_plane_model_);
         cv::Mat finite_depth_residual_mask = buildFiniteDepthResidualMask(depth_residual_m);
@@ -10697,7 +11418,7 @@ private:
         };
 
         const cv::Mat detection_mask_snapshot = detection_mask;
-        const std::vector<cv::Point2f> roi_points_snapshot = roi_points_;
+        const std::vector<cv::Point2f> roi_points_snapshot = effective_roi_points;
         const DepthWindowPeakInfo depth_window_peak_info_snapshot = depth_window_peak_info;
         const int blob_tolerance_percent_snapshot = blob_tolerance_percent_;
         const auto collapse_single_result_if_needed =
@@ -10941,11 +11662,46 @@ private:
     std::vector<std::optional<ItemPose3D>> blob_poses_3d;
     int selected_blob_index = -1;
     std::optional<ItemPose3D> selected_blob_pose_3d;
+    std::optional<BinarizedPoseEstimate2D> accepted_pose_estimate;
+    int accepted_pose_count = 0;
+    std::string dimension_status_text;
     if (pose_estimate.has_value())
     {
       blob_poses_3d.resize(pose_estimate->blob_poses.size());
+      accepted_pose_estimate = BinarizedPoseEstimate2D{};
       for (std::size_t i = 0; i < pose_estimate->blob_poses.size(); ++i)
       {
+        if (has_taught_item_dimensions_)
+        {
+          const auto dimensions = measureBlobDimensionsOnDepthPlane(
+            pose_estimate->blob_poses[i],
+            color_size,
+            *info);
+          if (!dimensions.has_value())
+          {
+            if (dimension_status_text.empty())
+            {
+              dimension_status_text = depth_plane_model_.valid
+                ? "Rejected size: unable to measure detected item on taught depth plane."
+                : "Rejected size: taught depth plane unavailable for item dimension check.";
+            }
+            continue;
+          }
+
+          std::string candidate_dimension_status;
+          if (!detectedDimensionsWithinTaughtBand(
+              *dimensions,
+              blob_tolerance_percent_,
+              &candidate_dimension_status))
+          {
+            if (dimension_status_text.empty())
+            {
+              dimension_status_text = candidate_dimension_status;
+            }
+            continue;
+          }
+        }
+
         const auto pose_3d = estimateBlobPose3D(pose_estimate->blob_poses[i], depth_for_pose_m, *info);
         if (!pose_3d.has_value())
         {
@@ -10967,6 +11723,13 @@ private:
         // keep the original detected pose orientation.
         alignItemPoseZAxisToNormal(aligned_pose, plane_normal_opt);
         blob_poses_3d[i] = aligned_pose;
+        accepted_pose_estimate->blob_poses.push_back(pose_estimate->blob_poses[i]);
+        ++accepted_pose_count;
+        accepted_pose_estimate->matched_blob_count = accepted_pose_count;
+      }
+      if (accepted_pose_count <= 0)
+      {
+        accepted_pose_estimate.reset();
       }
 
       if (depth_window_peak_info.valid)
@@ -11013,15 +11776,21 @@ private:
       }
       else
       {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "Matched blobs found, but 3D pose estimation failed for all blob items.");
+        if (dimension_status_text.empty())
+        {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "Matched blobs found, but 3D pose estimation failed for all blob items.");
+        }
       }
     }
 
-    item_summary_.detected_items = pose_estimate.has_value()
-      ? static_cast<int>(pose_estimate->blob_poses.size())
-      : 0;
+    if (pose_estimate.has_value() && !selected_blob_pose_3d.has_value() && !dimension_status_text.empty())
+    {
+      pose_status_text = dimension_status_text;
+    }
+
+    item_summary_.detected_items = accepted_pose_count;
     item_summary_.has_best_candidate = selected_blob_pose_3d.has_value();
     if (selected_blob_pose_3d.has_value())
     {
@@ -11064,18 +11833,18 @@ private:
     }
     if (overlay_enabled_)
     {
-      drawRoiOverlay(overlay, roi_points_);
-      drawCenterCursor(overlay, roi_points_);
+      drawRoiOverlay(overlay, effective_roi_points);
+      drawCenterCursor(overlay, effective_roi_points);
       drawItemName(overlay, item_name_);
-      drawPoseHullOverlay(overlay, pose_estimate);
-      if (!pose_estimate.has_value() && fallback_anchor_preview_pose.has_value())
+      drawPoseHullOverlay(overlay, accepted_pose_estimate);
+      if (!accepted_pose_estimate.has_value() && fallback_anchor_preview_pose.has_value())
       {
         BinarizedPoseEstimate2D preview_estimate;
         preview_estimate.matched_blob_count = 1;
         preview_estimate.blob_poses.push_back(*fallback_anchor_preview_pose);
         drawPoseHullOverlay(overlay, std::optional<BinarizedPoseEstimate2D>(preview_estimate), true);
       }
-      if (!pose_estimate.has_value())
+      if (!accepted_pose_estimate.has_value() && !pose_estimate.has_value())
       {
         drawPredictedCompanionOverlay(overlay, fallback_pair_debug_info);
       }
@@ -11155,7 +11924,7 @@ private:
             2);
         }
       }
-      else if (pose_estimate.has_value())
+      else if (accepted_pose_estimate.has_value())
       {
         const bool multi_pose_mode = pose_reference_slots_.size() > 1;
         const bool pair_pose_mode =
@@ -11167,7 +11936,7 @@ private:
             ? matched_pose_reference_slot_index + 1
             : 0,
             matched_pose_reference_used_fallback ? "fallback " : "",
-            pose_estimate->matched_blob_count,
+            accepted_pose_estimate->matched_blob_count,
             static_cast<int>(pose_reference_slots_.size()),
             selected_blob_index >= 0 ? (selected_blob_index + 1) : 0,
             blob_tolerance_percent_)
@@ -11175,12 +11944,12 @@ private:
           pair_pose_mode
           ? cv::format(
             "Pair pose ready: groups=%d selected=%d edge=+/-%d%%",
-            pose_estimate->matched_blob_count,
+            accepted_pose_estimate->matched_blob_count,
             selected_blob_index >= 0 ? (selected_blob_index + 1) : 0,
             blob_tolerance_percent_)
           : cv::format(
             "Single pose ready: matches=%d selected=%d edge=+/-%d%%",
-            pose_estimate->matched_blob_count,
+            accepted_pose_estimate->matched_blob_count,
             selected_blob_index >= 0 ? (selected_blob_index + 1) : 0,
             blob_tolerance_percent_));
         cv::putText(
@@ -11905,7 +12674,9 @@ private:
   std::string seek_pose_topic_;
   std::string item_pose_array_topic_;
   std::string item_cube_marker_topic_;
+  std::string selected_profile_topic_;
   std::string seek_service_name_;
+  std::string repick_service_name_;
   std::string seek_complete_service_name_;
   std::string seek_status_service_name_;
 	  std::string go_to_teach_service_name_;
@@ -11915,6 +12686,7 @@ private:
   std::string calibration_child_frame_;
   std::string calibration_dir_;
   std::string calibration_file_;
+  std::string robot_ip_address_;
   std::filesystem::path runtime_settings_path_;
   std::filesystem::path selected_profile_export_path_;
   std::string profiles_dir_;
@@ -11976,6 +12748,9 @@ private:
 		  std::string item_name_ {"item"};
   std::array<double, 6> teach_joints_deg_ {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints_ {false};
+  bool has_taught_item_dimensions_ {false};
+  double taught_item_length_mm_ {0.0};
+  double taught_item_width_mm_ {0.0};
   bool go_to_teach_in_progress_ {false};
   double item_marker_thickness_mm_ {15.0};
   double motion_update_period_sec_ {0.1};
@@ -11985,6 +12760,7 @@ private:
   int seek_valid_frame_count_ {0};
   bool debug_images_enabled_ {false};
   std::optional<AxisAlignedRoiBounds> depth_plane_roi_bounds_;
+  std::optional<std::array<double, 4>> depth_plane_roi_normalized_;
   UiButton view_toggle_button_ {"View", cv::Rect(18, 14, 180, 42)};
   UiButton overlay_toggle_button_ {"Overlay", cv::Rect(18, 14, 150, 42)};
   UiButton seek_toggle_button_ {"Seek", cv::Rect(18, 14, 120, 42)};
@@ -12011,6 +12787,8 @@ private:
   std::vector<cv::Rect> profile_option_rects_;
   std::vector<ItemProfile> item_profiles_;
   std::vector<cv::Point2f> roi_points_;
+  std::vector<cv::Point2f> roi_points_normalized_;
+  cv::Size roi_points_source_image_size_;
   std::optional<PoseBlobReference2D> pose_blob_reference_;
   std::vector<PoseReferenceSlot2D> pose_reference_slots_;
   std::size_t fallback_pose_slot_cursor_ {0};
@@ -12033,7 +12811,9 @@ private:
   rclcpp::Publisher<PoseStampedMsg>::SharedPtr seek_pose_pub_;
   rclcpp::Publisher<PoseArrayMsg>::SharedPtr item_pose_array_pub_;
   rclcpp::Publisher<MarkerMsg>::SharedPtr item_cube_marker_pub_;
+  rclcpp::Publisher<StringMsg>::SharedPtr selected_profile_pub_;
   rclcpp::Service<TriggerSrv>::SharedPtr seek_service_;
+  rclcpp::Service<TriggerSrv>::SharedPtr repick_service_;
   rclcpp::Service<TriggerSrv>::SharedPtr seek_complete_service_;
   rclcpp::Service<TriggerSrv>::SharedPtr seek_status_service_;
 	  rclcpp::Service<TriggerSrv>::SharedPtr go_to_teach_service_;
@@ -12051,6 +12831,7 @@ private:
 
   geometry_msgs::msg::Quaternion calibration_rotation_;
   geometry_msgs::msg::Vector3 calibration_translation_;
+  CameraCalibrationMetadata calibration_metadata_;
 
   std::mutex data_mutex_;
   cv::Mat latest_depth_;

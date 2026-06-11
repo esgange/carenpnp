@@ -1495,6 +1495,10 @@ class RobotCellOrchestratorGui:
         return workspace_path('teach', 'item_teach')
 
     @property
+    def item_detect_profile_dir(self) -> Path:
+        return workspace_path('teach', 'item_teach_yolo')
+
+    @property
     def tray_teach_dir(self) -> Path:
         return workspace_path('teach', 'tray_teach')
 
@@ -1807,7 +1811,11 @@ class RobotCellOrchestratorGui:
         offline_tray_teach = lambda mode, headless: [f'profiles_dir:={self.tray_teach_dir}']
 
         def item_detect(mode: str, headless: bool) -> list[str]:
-            args = [f'profiles_dir:={self.runtime_dir if mode == MODE_ONLINE else self.item_teach_dir}']
+            profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.item_detect_profile_dir
+            args = [
+                f'profiles_dir:={profiles_dir}',
+                f'model_root:={profiles_dir}',
+            ]
             args.extend(self._selected_detect_profile_launch_args(TEACH_KIND_ITEM, mode))
             args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
             if headless:
@@ -1894,8 +1902,8 @@ class RobotCellOrchestratorGui:
             'item_pick': LaunchSpec('Item Pick', 'item_pick', 'item_pick.launch.py', item_pick, headless_label='Item Pick Headless'),
             'item_detect': LaunchSpec(
                 'Item Detect',
-                'item_perception',
-                'item_detect.launch.py',
+                'item_perception_yolo',
+                'item_detect_yolo.launch.py',
                 item_detect,
                 CALIBRATION_EYE_TO_HAND,
                 headless_label='Item Detect Headless',
@@ -2108,7 +2116,7 @@ class RobotCellOrchestratorGui:
         dropdown_frame.columnconfigure(1, weight=1)
         dropdown_frame.columnconfigure(2, weight=0)
         self._make_teach_picker_button(dropdown_frame, 'Bin', TEACH_KIND_BIN, self.bin_teach_var, self.bin_teach_dir, 0)
-        self._make_teach_picker_button(dropdown_frame, 'Item', TEACH_KIND_ITEM, self.item_teach_var, self.item_teach_dir, 1)
+        self._make_teach_picker_button(dropdown_frame, 'Item', TEACH_KIND_ITEM, self.item_teach_var, self.item_detect_profile_dir, 1)
         self._make_teach_picker_button(dropdown_frame, 'Tray', TEACH_KIND_TRAY, self.tray_teach_var, self.tray_teach_dir, 2)
 
         calibration_frame = tk.LabelFrame(right, text='Calibration Files', padx=10, pady=8)
@@ -2486,12 +2494,25 @@ class RobotCellOrchestratorGui:
         return scan
 
     def _teach_paths_by_kind(self, directory: Path, kind: str) -> list[Path]:
-        return [path for path in yaml_files_in(directory) if classify_teach_yaml(path) == kind]
+        candidates = yaml_files_in(directory)
+        if kind == TEACH_KIND_ITEM:
+            try:
+                if directory.resolve() == self.item_detect_profile_dir.resolve():
+                    candidates = sorted(
+                        [
+                            candidate for candidate in directory.rglob('*')
+                            if candidate.is_file() and candidate.suffix in ('.yaml', '.yml')
+                        ],
+                        key=lambda candidate: str(candidate.relative_to(directory)).lower(),
+                    )
+            except Exception:
+                pass
+        return [path for path in candidates if classify_teach_yaml(path) == kind]
 
     def _refresh_teach_buttons(self) -> None:
         self._teach_options = {
             TEACH_KIND_BIN: self._teach_paths_by_kind(self.bin_teach_dir, TEACH_KIND_BIN),
-            TEACH_KIND_ITEM: self._teach_paths_by_kind(self.item_teach_dir, TEACH_KIND_ITEM),
+            TEACH_KIND_ITEM: self._teach_paths_by_kind(self.item_detect_profile_dir, TEACH_KIND_ITEM),
             TEACH_KIND_TRAY: self._teach_paths_by_kind(self.tray_teach_dir, TEACH_KIND_TRAY),
         }
         self._ensure_teach_selection(TEACH_KIND_BIN, self.bin_teach_var)
@@ -2535,7 +2556,7 @@ class RobotCellOrchestratorGui:
             if not path.is_absolute():
                 path = {
                     TEACH_KIND_BIN: self.bin_teach_dir,
-                    TEACH_KIND_ITEM: self.item_teach_dir,
+                    TEACH_KIND_ITEM: self.item_detect_profile_dir,
                     TEACH_KIND_TRAY: self.tray_teach_dir,
                 }[kind] / path
             if path.exists() and path.is_file() and classify_teach_yaml(path) == kind:
@@ -2651,10 +2672,21 @@ class RobotCellOrchestratorGui:
         raw_name: str,
         expected_kind: str,
         label: str,
+        *,
+        recursive: bool = False,
     ) -> tuple[Path | None, str | None]:
         if not self._is_safe_yaml_filename(raw_name):
             return None, f'{label} filename must be a local .yaml/.yml basename: {raw_name!r}'
         path = directory / raw_name
+        if recursive and (not path.exists() or not path.is_file()):
+            matches = [
+                candidate for candidate in directory.rglob(raw_name)
+                if candidate.is_file() and candidate.suffix.lower() in ('.yaml', '.yml')
+            ]
+            if len(matches) == 1:
+                path = matches[0]
+            elif len(matches) > 1:
+                return None, f'{label} teach file {raw_name!r} is ambiguous under {directory}'
         if not path.exists() or not path.is_file():
             return None, f'{label} teach file not found: {path}'
         kind = classify_teach_yaml(path)
@@ -2720,10 +2752,11 @@ class RobotCellOrchestratorGui:
         if error:
             return OnlineProgramLoadResult(False, error)
         item_path, error = self._resolve_requested_teach_file(
-            self.item_teach_dir,
+            self.item_detect_profile_dir,
             load.item_teach_file,
             TEACH_KIND_ITEM,
             'item',
+            recursive=True,
         )
         if error:
             return OnlineProgramLoadResult(False, error)

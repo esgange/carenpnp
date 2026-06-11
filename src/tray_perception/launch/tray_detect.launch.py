@@ -36,6 +36,30 @@ def _repo_path(*parts: str) -> str:
     return str(_workspace_root().joinpath(*parts))
 
 
+def _calibration_selection_helper():
+    import importlib.util
+
+    helper_candidates = []
+    for parent in Path(__file__).resolve().parents:
+        helper_candidates.extend([
+            parent / "src" / "dobot_bringup_v4" / "launch" / "calibration_selection.py",
+            parent / "install" / "cr_robot_ros2" / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+            parent / "cr_robot_ros2" / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+            parent / "share" / "cr_robot_ros2" / "launch" / "calibration_selection.py",
+        ])
+
+    for helper_path in helper_candidates:
+        if helper_path.exists():
+            spec = importlib.util.spec_from_file_location("_dobot_calibration_selection", helper_path)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+    raise RuntimeError("Could not find calibration_selection.py helper")
+
+
 def _to_bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
@@ -62,21 +86,94 @@ def _show_missing_calibration_dialog(message: str) -> None:
         print(message)
 
 
-def _find_latest_calibration(calibration_dir: str) -> str:
+def _unquote_config_value(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    return text.strip()
+
+
+def _station_config_value(*keys: str) -> str:
+    try:
+        values = {}
+        with Path(_repo_path("station_config")).open("r", encoding="utf-8") as stream:
+            for raw_line in stream:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = _unquote_config_value(value)
+    except OSError:
+        return ""
+
+    for key in keys:
+        value = values.get(key)
+        if value:
+            return value
+    return ""
+
+
+def _resolve_robot_ip_address(value: str = "") -> str:
+    requested = str(value or "").strip()
+    if requested:
+        return requested
+    env_ip = os.environ.get("ROBOT_IP_ADDRESS", "").strip()
+    if env_ip:
+        return env_ip
+    return _station_config_value("ROBOT_IP_ADDRESS", "ip_address")
+
+
+def _sanitize_filename_token(value: str) -> str:
+    token = []
+    previous_underscore = False
+    for ch in str(value or "").strip():
+        if ch.isalnum() or ch in "._-":
+            token.append(ch)
+            previous_underscore = False
+        elif not previous_underscore:
+            token.append("_")
+            previous_underscore = True
+    return "".join(token).strip("_")
+
+
+def _looks_like_ip_token(token: str) -> bool:
+    return "." in token and all(ch.isdigit() or ch == "." for ch in token)
+
+
+def _classify_robot_file(path: Path, robot_ip_address: str) -> str:
+    ip_token = _sanitize_filename_token(robot_ip_address)
+    if not ip_token:
+        return "legacy"
+    stem = path.stem
+    if stem.endswith(f"_{ip_token}"):
+        return "exact"
+    last_token = stem.rsplit("_", 1)[-1]
+    if _looks_like_ip_token(last_token):
+        return "different"
+    return "legacy"
+
+
+def _find_latest_calibration(calibration_dir: str, robot_ip_address: str = "") -> str:
     try:
         base = Path(calibration_dir).expanduser()
         if not base.exists() or not base.is_dir():
             return ""
-        yaml_files = []
+        exact_files = []
         for path in base.iterdir():
             if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
                 continue
             name = path.name
             if name.startswith("axab_calibration_eyeonhand_"):
-                yaml_files.append(path)
-        if not yaml_files:
+                classification = _classify_robot_file(path, robot_ip_address)
+                if classification == "exact":
+                    exact_files.append(path)
+        if not exact_files:
             return ""
-        latest = max(yaml_files, key=lambda p: p.stat().st_mtime)
+        latest = max(exact_files, key=lambda p: p.stat().st_mtime)
         return str(latest)
     except Exception as exc:
         print(f"[tray_detect.launch] Failed to search calibrations in {calibration_dir}: {exc}")
@@ -131,6 +228,9 @@ def _launch_setup(context, *args, **kwargs):
     child_frame = LaunchConfiguration("child_frame").perform(context)
     calibration_dir = os.path.expanduser(LaunchConfiguration("calibration_dir").perform(context))
     calibration_file = os.path.expanduser(LaunchConfiguration("calibration_file").perform(context))
+    robot_ip_address = _resolve_robot_ip_address(
+        LaunchConfiguration("robot_ip_address").perform(context)
+    )
     camera_frame_override = LaunchConfiguration("camera_frame").perform(context).strip()
     start_visualization = _to_bool(LaunchConfiguration("start_visualization").perform(context))
     headless = _to_bool(LaunchConfiguration("headless").perform(context))
@@ -147,10 +247,21 @@ def _launch_setup(context, *args, **kwargs):
                 _show_missing_calibration_dialog(msg)
                 raise RuntimeError(msg)
         else:
-            selected_file = _find_latest_calibration(calibration_dir)
+            selection = _calibration_selection_helper()
+            if selection.requires_manual_selection(robot_ip_address):
+                selected_file = selection.choose_required_calibration(
+                    calibration_dir=calibration_dir,
+                    filename_pattern="axab_calibration_eyeonhand_*.yaml",
+                    calibration_label="eye-on-hand calibration",
+                    launch_label="tray_detect.launch",
+                    robot_ip_address=robot_ip_address,
+                )
+            else:
+                selected_file = _find_latest_calibration(calibration_dir, robot_ip_address)
             if not selected_file:
                 msg = (
-                    "[tray_detect.launch] No non-empty calibration YAML found in "
+                    "[tray_detect.launch] No non-empty calibration YAML "
+                    f"for robot IP {robot_ip_address or 'auto'} found in "
                     f"{calibration_dir}. Provide one via calibration_file:=<path>."
                 )
                 _show_missing_calibration_dialog(msg)
@@ -161,43 +272,48 @@ def _launch_setup(context, *args, **kwargs):
     if not tray_camera_frame and use_calibration:
         tray_camera_frame = child_frame
 
+    parameter_sources = []
+    if params_file and Path(os.path.expanduser(params_file)).exists():
+        parameter_sources.append(params_file)
+    parameter_sources.append(
+        {
+            "color_topic": color_topic,
+            "depth_topic": depth_topic,
+            "camera_info_topic": camera_info_topic,
+            "overlay_topic": overlay_topic,
+            "publish_overlay": publish_overlay,
+            "camera_control_service_root": camera_control_service_root,
+            "color_exposure_min_us": color_exposure_min_us,
+            "color_exposure_max_us": color_exposure_max_us,
+            "depth_exposure_min_us": depth_exposure_min_us,
+            "depth_exposure_max_us": depth_exposure_max_us,
+            "tray_pose_topic": tray_pose_topic,
+            "tray_axis_overlay_topic": tray_axis_overlay_topic,
+            "tray_vector_topic": tray_vector_topic,
+            "profiles_dir": profiles_dir,
+            "selected_profile_path": selected_profile_path,
+            "runtime_settings_file": runtime_settings_file,
+            "camera_frame": tray_camera_frame,
+            "start_visualization": start_visualization,
+            "headless": headless,
+            "use_calibration": use_calibration,
+            "publish_static_calibration_tf": use_calibration,
+            "calibration_parent_frame": parent_frame,
+            "calibration_child_frame": child_frame,
+            "calibration_dir": calibration_dir,
+            "calibration_file": selected_file,
+            "robot_ip_address": robot_ip_address,
+            "auto_discover_calibration": False,
+        }
+    )
+
     return [
         Node(
             package="tray_perception",
             executable="tray_detect_node",
             name="tray_detect",
             output="screen",
-            parameters=[
-                params_file,
-                {
-                    "color_topic": color_topic,
-                    "depth_topic": depth_topic,
-                    "camera_info_topic": camera_info_topic,
-                    "overlay_topic": overlay_topic,
-                    "publish_overlay": publish_overlay,
-                    "camera_control_service_root": camera_control_service_root,
-                    "color_exposure_min_us": color_exposure_min_us,
-                    "color_exposure_max_us": color_exposure_max_us,
-                    "depth_exposure_min_us": depth_exposure_min_us,
-                    "depth_exposure_max_us": depth_exposure_max_us,
-                    "tray_pose_topic": tray_pose_topic,
-                    "tray_axis_overlay_topic": tray_axis_overlay_topic,
-                    "tray_vector_topic": tray_vector_topic,
-                    "profiles_dir": profiles_dir,
-                    "selected_profile_path": selected_profile_path,
-                    "runtime_settings_file": runtime_settings_file,
-                    "camera_frame": tray_camera_frame,
-                    "start_visualization": start_visualization,
-                    "headless": headless,
-                    "use_calibration": use_calibration,
-                    "publish_static_calibration_tf": use_calibration,
-                    "calibration_parent_frame": parent_frame,
-                    "calibration_child_frame": child_frame,
-                    "calibration_dir": calibration_dir,
-                    "calibration_file": selected_file,
-                    "auto_discover_calibration": False,
-                },
-            ],
+            parameters=parameter_sources,
         )
     ]
 
@@ -230,7 +346,7 @@ def generate_launch_description():
         _ros_domain_action(),
         DeclareLaunchArgument(
             "params_file",
-            default_value=_repo_path("config", "tray_perception", "tray_teach_settings.yaml"),
+            default_value="",
         ),
         DeclareLaunchArgument(
             "profiles_dir",
@@ -306,7 +422,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "child_frame",
-            default_value="calibrated_camera_link",
+            default_value="arm_calibrated_camera_link",
         ),
         DeclareLaunchArgument(
             "calibration_dir",
@@ -315,6 +431,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "calibration_file",
             default_value="",
+        ),
+        DeclareLaunchArgument(
+            "robot_ip_address",
+            default_value="",
+            description="Robot controller IP for calibration file discovery. Empty uses ROBOT_IP_ADDRESS/station_config.",
         ),
         DeclareLaunchArgument(
             "camera_frame",

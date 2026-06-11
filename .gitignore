@@ -3,6 +3,7 @@ build/
 install/
 log/
 devel/
+.colcon/
 
 # Local Python/SAM2 workspace
 .venv/
@@ -20,9 +21,9 @@ third_party/wheels/*
 !third_party/wheels/.gitkeep
 !third_party/wheels/SHA256SUMS
 config/bins_yolo/runtime/
-runs/
 
 # Workspace runtime/generated data
+station_config
 Log/
 runtime/
 debug files/
@@ -31,14 +32,25 @@ config/item_perception/
 config/item_perception_yolo/
 config/tray_perception/
 config/camera_bringup/
+config/motion_calibrate/
+config/robot_cell_orchestrator/*runtime*.yaml
 calibration/*.yaml
 calibration/*.json
 calibration/*.csv
+runs/
+*.bag
+*.db3
+*.mcap
+*.log
 
 # Python cache
 __pycache__/
 *.pyc
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Calibration outputs
 src/camera_calibration/calib/axab_calibration_*.yaml

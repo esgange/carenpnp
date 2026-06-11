@@ -43,6 +43,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <dobot_common/robot_identity.hpp>
 #include <dobot_common/workspace_paths.hpp>
 
 namespace
@@ -70,8 +71,6 @@ constexpr int kToleranceHitPadding = 14;
 constexpr int kPreviewCanvasWidth = 1080;
 constexpr int kPreviewCanvasHeight = 680;
 constexpr double kMetersToMillimeters = 1000.0;
-constexpr double kCentimetersToMillimeters = 10.0;
-constexpr double kSquareCentimetersToSquareMillimeters = 100.0;
 constexpr double kRadiansToDegrees = 57.29577951308232;
 constexpr int kDepthThresholdMinMm = 1;
 constexpr int kDepthThresholdMaxMm = 20;
@@ -249,6 +248,9 @@ struct TrayEstimate
   double area_cm2 {0.0};
   double mean_depth_m {0.0};
   std::array<double, 4> edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
+  bool has_dimension_estimate {false};
+  double tray_width_mm {0.0};
+  double tray_height_mm {0.0};
   cv::Point2f center;
   std::vector<cv::Point2f> edge_points;
   std::vector<cv::Point2f> filtered_edge_points;
@@ -273,6 +275,12 @@ struct TrayMetricEstimate
   double mean_depth_m {0.0};
   // Ordered as: origin X edge, opposite X edge, origin Y edge, opposite Y edge.
   std::array<double, 4> edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
+};
+
+struct TrayDimensionsMm
+{
+  double width {0.0};
+  double height {0.0};
 };
 
 struct TrayPose3D
@@ -324,6 +332,7 @@ std::vector<cv::Point2f> mergeRoiRegionsIntoPolygon(const std::vector<AxisAligne
 int lowerLeftCornerIndex(const std::vector<cv::Point2f> &corners);
 std::optional<TrayOverlayAxes> computeTrayOverlayAxes(const TrayEstimate &estimate);
 double medianValue(std::vector<double> values);
+double vectorNorm(const cv::Vec3d &vec);
 
 struct TrayProfile
 {
@@ -356,18 +365,18 @@ struct TrayProfile
   int outlier_sensitivity {50};
   bool detect_black_to_white {true};
   bool trace_out_to_in {false};
-  bool depth_plane_enabled {false};
-  double depth_plane_a {0.0};
-  double depth_plane_b {0.0};
-  double depth_plane_c {0.0};
-  double depth_plane_reference_depth_m {0.0};
-  std::optional<AxisAlignedRoiBounds> depth_plane_roi_bounds;
+  bool tray_plane_enabled {false};
+  double tray_plane_a {0.0};
+  double tray_plane_b {0.0};
+  double tray_plane_c {0.0};
+  double tray_plane_reference_depth_m {0.0};
+  std::optional<AxisAlignedRoiBounds> tray_plane_roi_bounds;
+  double tray_width_mm {0.0};
+  double tray_height_mm {0.0};
   std::vector<AxisAlignedRoiBounds> roi_regions;
   std::vector<cv::Point2f> roi_points;
   std::array<double, 6> teach_joints_deg {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints {false};
-  std::array<double, 4> taught_edge_lengths_cm {0.0, 0.0, 0.0, 0.0};
-  double taught_area_cm2 {0.0};
 };
 
 struct DepthPlaneModel
@@ -422,6 +431,14 @@ bool hasValidEdgeLengthsCm(const std::array<double, 4> &edge_lengths_cm)
     {
       return length_cm > 0.0;
     });
+}
+
+bool hasValidTrayDimensionsMm(double width_mm, double height_mm)
+{
+  return std::isfinite(width_mm) &&
+    std::isfinite(height_mm) &&
+    width_mm > 0.0 &&
+    height_mm > 0.0;
 }
 
 std::string buildProfileLabel(
@@ -484,10 +501,7 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
     profile.depth_topic = params["depth_topic"] ? params["depth_topic"].as<std::string>() : "/robot_camera/depth/image_raw";
     profile.camera_info_topic = params["camera_info_topic"] ? params["camera_info_topic"].as<std::string>() : "/robot_camera/color/camera_info";
     profile.overlay_topic = params["overlay_topic"] ? params["overlay_topic"].as<std::string>() : "tray_overlay";
-    if (params["detection_mode"])
-    {
-      profile.detection_use_depth = isDepthDetectionMode(params["detection_mode"].as<std::string>());
-    }
+    profile.detection_use_depth = false;
     profile.depth_threshold_mm = std::clamp(
       params["depth_threshold_mm"] ? params["depth_threshold_mm"].as<int>() : 10,
       kDepthThresholdMinMm,
@@ -558,39 +572,35 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
       100);
     profile.detect_black_to_white = params["detect_black_to_white"] ? params["detect_black_to_white"].as<bool>() : true;
     profile.trace_out_to_in = params["trace_out_to_in"] ? params["trace_out_to_in"].as<bool>() : false;
-    profile.depth_plane_enabled = params["depth_plane_enabled"] ? params["depth_plane_enabled"].as<bool>() : false;
-    profile.depth_plane_a = params["depth_plane_a"] ? params["depth_plane_a"].as<double>() : 0.0;
-    profile.depth_plane_b = params["depth_plane_b"] ? params["depth_plane_b"].as<double>() : 0.0;
-    profile.depth_plane_c = params["depth_plane_c"] ? params["depth_plane_c"].as<double>() : 0.0;
-    profile.depth_plane_reference_depth_m =
-      params["depth_plane_reference_depth_m"] ? params["depth_plane_reference_depth_m"].as<double>() : 0.0;
-    if (const YAML::Node depth_plane_roi = params["depth_plane_roi"];
-        depth_plane_roi && depth_plane_roi.IsSequence() && depth_plane_roi.size() >= 4)
+    profile.tray_plane_enabled = params["tray_plane_enabled"] ? params["tray_plane_enabled"].as<bool>() : false;
+    profile.tray_plane_a = params["tray_plane_a"] ? params["tray_plane_a"].as<double>() : 0.0;
+    profile.tray_plane_b = params["tray_plane_b"] ? params["tray_plane_b"].as<double>() : 0.0;
+    profile.tray_plane_c = params["tray_plane_c"] ? params["tray_plane_c"].as<double>() : 0.0;
+    profile.tray_plane_reference_depth_m =
+      params["tray_plane_reference_depth_m"] ? params["tray_plane_reference_depth_m"].as<double>() : 0.0;
+    if (const YAML::Node tray_plane_roi = params["tray_plane_roi"];
+        tray_plane_roi && tray_plane_roi.IsSequence() && tray_plane_roi.size() >= 4)
     {
       AxisAlignedRoiBounds roi{
-        depth_plane_roi[0].as<int>(),
-        depth_plane_roi[1].as<int>(),
-        depth_plane_roi[2].as<int>(),
-        depth_plane_roi[3].as<int>(),
+        tray_plane_roi[0].as<int>(),
+        tray_plane_roi[1].as<int>(),
+        tray_plane_roi[2].as<int>(),
+        tray_plane_roi[3].as<int>(),
       };
       if (isValidRoiBounds(roi))
       {
-        profile.depth_plane_roi_bounds = roi;
+        profile.tray_plane_roi_bounds = roi;
       }
     }
     if (
-      !std::isfinite(profile.depth_plane_a) ||
-      !std::isfinite(profile.depth_plane_b) ||
-      !std::isfinite(profile.depth_plane_c) ||
-      !std::isfinite(profile.depth_plane_reference_depth_m) ||
-      profile.depth_plane_reference_depth_m <= 0.0 ||
-      !profile.depth_plane_roi_bounds.has_value())
+      !profile.tray_plane_enabled ||
+      !std::isfinite(profile.tray_plane_a) ||
+      !std::isfinite(profile.tray_plane_b) ||
+      !std::isfinite(profile.tray_plane_c) ||
+      !std::isfinite(profile.tray_plane_reference_depth_m) ||
+      profile.tray_plane_reference_depth_m <= 0.0)
     {
-      profile.depth_plane_enabled = false;
-      profile.depth_plane_a = 0.0;
-      profile.depth_plane_b = 0.0;
-      profile.depth_plane_c = 0.0;
-      profile.depth_plane_reference_depth_m = 0.0;
+      return std::nullopt;
     }
     if (const YAML::Node roi_regions = params["roi_regions"]; roi_regions && roi_regions.IsSequence())
     {
@@ -649,15 +659,12 @@ std::optional<TrayProfile> loadTrayProfileFile(const std::filesystem::path &path
       }
       profile.has_teach_joints = teach_joints.size() >= profile.teach_joints_deg.size();
     }
-    if (const YAML::Node taught_edge_lengths = params["taught_edge_lengths_cm"];
-        taught_edge_lengths && taught_edge_lengths.IsSequence())
+    profile.tray_width_mm = params["tray_width_mm"] ? params["tray_width_mm"].as<double>() : 0.0;
+    profile.tray_height_mm = params["tray_height_mm"] ? params["tray_height_mm"].as<double>() : 0.0;
+    if (!hasValidTrayDimensionsMm(profile.tray_width_mm, profile.tray_height_mm))
     {
-      for (std::size_t i = 0; i < profile.taught_edge_lengths_cm.size() && i < taught_edge_lengths.size(); ++i)
-      {
-        profile.taught_edge_lengths_cm[i] = taught_edge_lengths[i].as<double>();
-      }
+      return std::nullopt;
     }
-    profile.taught_area_cm2 = params["taught_area_cm2"] ? params["taught_area_cm2"].as<double>() : 0.0;
     if (profile.roi_points.size() < 4 && !profile.roi_regions.empty())
     {
       profile.roi_points = mergeRoiRegionsIntoPolygon(profile.roi_regions);
@@ -737,21 +744,10 @@ std::vector<TrayProfile> loadTrayProfilesFromDirectory(const std::filesystem::pa
 
   auto same_teach_profile = [](const TrayProfile &a, const TrayProfile &b)
   {
-    const bool has_edges_a = hasValidEdgeLengthsCm(a.taught_edge_lengths_cm);
-    const bool has_edges_b = hasValidEdgeLengthsCm(b.taught_edge_lengths_cm);
-    const bool edge_lengths_match =
-      has_edges_a && has_edges_b &&
-      std::equal(
-        a.taught_edge_lengths_cm.begin(),
-        a.taught_edge_lengths_cm.end(),
-        b.taught_edge_lengths_cm.begin(),
-        [](double lhs, double rhs)
-        {
-          return std::fabs(lhs - rhs) < 1e-6;
-        });
     return a.tray_name == b.tray_name &&
       a.teach_date == b.teach_date &&
-      (edge_lengths_match || std::fabs(a.taught_area_cm2 - b.taught_area_cm2) < 1e-6);
+      std::fabs(a.tray_width_mm - b.tray_width_mm) < 1e-6 &&
+      std::fabs(a.tray_height_mm - b.tray_height_mm) < 1e-6;
   };
 
   for (const auto &alias_profile : alias_profiles)
@@ -1394,6 +1390,75 @@ cv::Vec3d projectPixelToCamera(const cv::Point2f &pixel, double depth_m, const C
   const double x = (static_cast<double>(pixel.x) - cx) * depth_m / fx;
   const double y = (static_cast<double>(pixel.y) - cy) * depth_m / fy;
   return cv::Vec3d(x, y, depth_m);
+}
+
+std::optional<double> trayPlaneDepthAtPixel(
+  const cv::Point2f &pixel,
+  const cv::Size &image_size,
+  const DepthPlaneModel &plane)
+{
+  if (!plane.valid || image_size.width <= 1 || image_size.height <= 1)
+  {
+    return std::nullopt;
+  }
+
+  const double clamped_x = std::clamp(static_cast<double>(pixel.x), 0.0, static_cast<double>(image_size.width - 1));
+  const double clamped_y = std::clamp(static_cast<double>(pixel.y), 0.0, static_cast<double>(image_size.height - 1));
+  const double x_norm = clamped_x / static_cast<double>(image_size.width - 1);
+  const double y_norm = clamped_y / static_cast<double>(image_size.height - 1);
+  const double depth_m = (plane.a * x_norm) + (plane.b * y_norm) + plane.c;
+  if (!std::isfinite(depth_m) || depth_m <= 0.0)
+  {
+    return std::nullopt;
+  }
+  return depth_m;
+}
+
+std::optional<std::array<cv::Vec3d, 4>> estimateTrayCornerCameraPointsFromTrayPlane(
+  const std::vector<cv::Point2f> &corners,
+  const cv::Size &image_size,
+  const DepthPlaneModel &plane,
+  const CameraInfoMsg &camera_info)
+{
+  if (corners.size() != 4 || camera_info.k[0] <= 1e-6 || camera_info.k[4] <= 1e-6)
+  {
+    return std::nullopt;
+  }
+
+  std::array<cv::Vec3d, 4> camera_points;
+  for (std::size_t i = 0; i < corners.size(); ++i)
+  {
+    const auto depth = trayPlaneDepthAtPixel(corners[i], image_size, plane);
+    if (!depth.has_value())
+    {
+      return std::nullopt;
+    }
+    camera_points[i] = projectPixelToCamera(corners[i], *depth, camera_info);
+  }
+  return camera_points;
+}
+
+std::optional<TrayDimensionsMm> estimateTrayDimensionsFromCameraPoints(
+  const std::array<cv::Vec3d, 4> &camera_points)
+{
+  std::array<double, 4> sides_mm {};
+  for (std::size_t i = 0; i < camera_points.size(); ++i)
+  {
+    const cv::Vec3d edge = camera_points[(i + 1) % camera_points.size()] - camera_points[i];
+    const double length_mm = vectorNorm(edge) * kMetersToMillimeters;
+    if (!std::isfinite(length_mm) || length_mm <= 0.0)
+    {
+      return std::nullopt;
+    }
+    sides_mm[i] = length_mm;
+  }
+
+  const double side_a_mm = 0.5 * (sides_mm[0] + sides_mm[2]);
+  const double side_b_mm = 0.5 * (sides_mm[1] + sides_mm[3]);
+  return TrayDimensionsMm{
+    std::min(side_a_mm, side_b_mm),
+    std::max(side_a_mm, side_b_mm),
+  };
 }
 
 std::optional<cv::Point2f> projectCameraPointToPixel(const cv::Vec3d &point, const CameraInfoMsg &camera_info)
@@ -2094,6 +2159,10 @@ std::optional<TrayEstimate> buildTrayEstimateFromIsolatedSideSamples(
   int depth_edge_offset_px,
   int outlier_sensitivity)
 {
+  (void)depth_m;
+  (void)camera_info;
+  (void)depth_edge_offset_px;
+
   if (edge_points.size() < 8 ||
       left_samples.size() < 2 ||
       right_samples.size() < 2 ||
@@ -2177,24 +2246,6 @@ std::optional<TrayEstimate> buildTrayEstimateFromIsolatedSideSamples(
     bottom_fit.line,
   };
   estimate.polygon = polygon;
-  const std::array<std::vector<cv::Point2f>, 4> side_samples_by_segment{
-    top_fit.inliers,
-    right_fit.inliers,
-    bottom_fit.inliers,
-    left_fit.inliers,
-  };
-  if (const auto metrics = estimateTrayMetricsFromCorners(
-        corners_f,
-        side_samples_by_segment,
-        depth_m,
-        camera_info,
-        depth_edge_offset_px); metrics.has_value())
-  {
-    estimate.has_metric_estimate = true;
-    estimate.area_cm2 = metrics->area_cm2;
-    estimate.mean_depth_m = metrics->mean_depth_m;
-    estimate.edge_lengths_cm = metrics->edge_lengths_cm;
-  }
   return estimate;
 }
 
@@ -2358,19 +2409,15 @@ int lowerLeftCornerIndex(const std::vector<cv::Point2f> &corners)
 
 std::optional<TrayPose3D> estimateTrayPose3D(
   const TrayEstimate &estimate,
-  const cv::Mat &depth_m,
-  const CameraInfoMsg &camera_info,
-  int depth_edge_offset_px)
+  const cv::Size &image_size,
+  const DepthPlaneModel &plane,
+  const CameraInfoMsg &camera_info)
 {
-  auto camera_points = estimateTrayCornerCameraPointsFromDepthLines(
+  auto camera_points = estimateTrayCornerCameraPointsFromTrayPlane(
     estimate.corners,
-    depth_m,
-    camera_info,
-    depth_edge_offset_px);
-  if (!camera_points.has_value())
-  {
-    camera_points = estimateTrayCornerCameraPoints(estimate.corners, depth_m, camera_info);
-  }
+    image_size,
+    plane,
+    camera_info);
   if (!camera_points.has_value())
   {
     return std::nullopt;
@@ -3594,76 +3641,51 @@ std::optional<TrayEstimate> detectTrayFromAxisAlignedRoi(
     outlier_sensitivity);
 }
 
-bool isAreaWithinTaughtBand(double measured_area_cm2, double taught_area_cm2, int tolerance_percent)
-{
-  if (taught_area_cm2 <= 0.0)
-  {
-    return true;
-  }
-  const double tolerance_fraction = static_cast<double>(std::clamp(tolerance_percent, 1, 20)) / 100.0;
-  const double lower = taught_area_cm2 * (1.0 - tolerance_fraction);
-  const double upper = taught_area_cm2 * (1.0 + tolerance_fraction);
-  return measured_area_cm2 >= lower && measured_area_cm2 <= upper;
-}
-
-bool areEdgeLengthsWithinTaughtBand(
-  const std::array<double, 4> &measured_edge_lengths_cm,
-  const std::array<double, 4> &taught_edge_lengths_cm,
+bool areTrayDimensionsWithinTaughtBand(
+  const TrayDimensionsMm &measured_dimensions,
+  double taught_width_mm,
+  double taught_height_mm,
   int tolerance_percent)
 {
-  if (!hasValidEdgeLengthsCm(measured_edge_lengths_cm) || !hasValidEdgeLengthsCm(taught_edge_lengths_cm))
+  if (!hasValidTrayDimensionsMm(measured_dimensions.width, measured_dimensions.height) ||
+      !hasValidTrayDimensionsMm(taught_width_mm, taught_height_mm))
   {
-    return true;
+    return false;
   }
-
-  std::array<double, 4> measured_sorted = measured_edge_lengths_cm;
-  std::array<double, 4> taught_sorted = taught_edge_lengths_cm;
-  std::sort(measured_sorted.begin(), measured_sorted.end(), std::greater<double>());
-  std::sort(taught_sorted.begin(), taught_sorted.end(), std::greater<double>());
 
   const double tolerance_fraction = static_cast<double>(std::clamp(tolerance_percent, 1, 20)) / 100.0;
-  for (std::size_t i = 0; i < measured_sorted.size(); ++i)
-  {
-    const double lower = taught_sorted[i] * (1.0 - tolerance_fraction);
-    const double upper = taught_sorted[i] * (1.0 + tolerance_fraction);
-    if (measured_sorted[i] < lower || measured_sorted[i] > upper)
-    {
-      return false;
-    }
-  }
-  return true;
+  const double width_lower = taught_width_mm * (1.0 - tolerance_fraction);
+  const double width_upper = taught_width_mm * (1.0 + tolerance_fraction);
+  const double height_lower = taught_height_mm * (1.0 - tolerance_fraction);
+  const double height_upper = taught_height_mm * (1.0 + tolerance_fraction);
+  return measured_dimensions.width >= width_lower &&
+    measured_dimensions.width <= width_upper &&
+    measured_dimensions.height >= height_lower &&
+    measured_dimensions.height <= height_upper;
 }
 
-double maxEdgeLengthDeviationPercent(
-  const std::array<double, 4> &measured_edge_lengths_cm,
-  const std::array<double, 4> &taught_edge_lengths_cm)
+double maxTrayDimensionDeviationPercent(
+  const TrayDimensionsMm &measured_dimensions,
+  double taught_width_mm,
+  double taught_height_mm)
 {
-  if (!hasValidEdgeLengthsCm(measured_edge_lengths_cm) || !hasValidEdgeLengthsCm(taught_edge_lengths_cm))
+  if (!hasValidTrayDimensionsMm(measured_dimensions.width, measured_dimensions.height) ||
+      !hasValidTrayDimensionsMm(taught_width_mm, taught_height_mm))
   {
     return 0.0;
   }
 
-  std::array<double, 4> measured_sorted = measured_edge_lengths_cm;
-  std::array<double, 4> taught_sorted = taught_edge_lengths_cm;
-  std::sort(measured_sorted.begin(), measured_sorted.end(), std::greater<double>());
-  std::sort(taught_sorted.begin(), taught_sorted.end(), std::greater<double>());
-
-  double max_error_percent = 0.0;
-  for (std::size_t i = 0; i < measured_sorted.size(); ++i)
-  {
-    if (taught_sorted[i] <= 1e-6)
-    {
-      continue;
-    }
-    const double error_percent =
-      100.0 * std::fabs(measured_sorted[i] - taught_sorted[i]) / taught_sorted[i];
-    max_error_percent = std::max(max_error_percent, error_percent);
-  }
-  return max_error_percent;
+  const double width_error_percent =
+    100.0 * std::fabs(measured_dimensions.width - taught_width_mm) / taught_width_mm;
+  const double height_error_percent =
+    100.0 * std::fabs(measured_dimensions.height - taught_height_mm) / taught_height_mm;
+  return std::max(width_error_percent, height_error_percent);
 }
 
 void drawTrayEstimate(cv::Mat &binary_bgr, const std::optional<TrayEstimate> &estimate, int depth_edge_offset_px)
 {
+  (void)depth_edge_offset_px;
+
   if (!estimate.has_value())
   {
     return;
@@ -3683,125 +3705,45 @@ void drawTrayEstimate(cv::Mat &binary_bgr, const std::optional<TrayEstimate> &es
       3);
   }
 
-  for (const auto &segment : buildDepthMeasurementSegments(estimate->corners, depth_edge_offset_px))
-  {
-    cv::line(binary_bgr, segment.first, segment.second, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-  }
-
   for (const auto &point : estimate->filtered_edge_points)
   {
     cv::circle(binary_bgr, point, 4, cv::Scalar(0, 165, 255), -1);
   }
 
-  const std::string area_label =
-    estimate->has_metric_estimate && estimate->area_cm2 > 0.0
-      ? cv::format("tray area=%.0f mm2", estimate->area_cm2 * kSquareCentimetersToSquareMillimeters)
-      : "tray area=n/a";
-  int area_baseline = 0;
-  const cv::Size area_text_size = cv::getTextSize(
-    area_label,
+  if (!estimate->has_dimension_estimate)
+  {
+    return;
+  }
+
+  const std::string dimension_label = cv::format(
+    "W %.1f mm  H %.1f mm",
+    estimate->tray_width_mm,
+    estimate->tray_height_mm);
+  int baseline = 0;
+  const cv::Size text_size = cv::getTextSize(
+    dimension_label,
     cv::FONT_HERSHEY_SIMPLEX,
     0.65,
     2,
-    &area_baseline);
-  const cv::Point area_text_origin(
-    static_cast<int>(std::round(estimate->rect.center.x - 0.5F * static_cast<float>(area_text_size.width))),
-    static_cast<int>(std::round(estimate->rect.center.y + 0.5F * static_cast<float>(area_text_size.height))));
-  const cv::Rect area_text_box(
-    area_text_origin.x - 8,
-    area_text_origin.y - area_text_size.height - 8,
-    area_text_size.width + 16,
-    area_text_size.height + area_baseline + 12);
-  cv::rectangle(binary_bgr, area_text_box, cv::Scalar(24, 24, 24), cv::FILLED);
-  cv::rectangle(binary_bgr, area_text_box, cv::Scalar(0, 255, 0), 1);
+    &baseline);
+  const cv::Point text_origin(
+    static_cast<int>(std::round(estimate->rect.center.x - 0.5F * static_cast<float>(text_size.width))),
+    static_cast<int>(std::round(estimate->rect.center.y + 0.5F * static_cast<float>(text_size.height))));
+  const cv::Rect text_box(
+    text_origin.x - 8,
+    text_origin.y - text_size.height - 8,
+    text_size.width + 16,
+    text_size.height + baseline + 12);
+  cv::rectangle(binary_bgr, text_box, cv::Scalar(24, 24, 24), cv::FILLED);
+  cv::rectangle(binary_bgr, text_box, cv::Scalar(0, 255, 0), 1);
   cv::putText(
     binary_bgr,
-    area_label,
-    area_text_origin,
+    dimension_label,
+    text_origin,
     cv::FONT_HERSHEY_SIMPLEX,
     0.65,
     cv::Scalar(0, 255, 0),
     2);
-
-  if (!estimate->has_metric_estimate || estimate->corners.size() != 4)
-  {
-    return;
-  }
-
-  const int origin_idx = lowerLeftCornerIndex(estimate->corners);
-  if (origin_idx < 0)
-  {
-    return;
-  }
-
-  const int prev_idx = (origin_idx + 3) % 4;
-  const int next_idx = (origin_idx + 1) % 4;
-  const int opposite_idx = (origin_idx + 2) % 4;
-  const float origin_prev_px = cv::norm(estimate->corners[origin_idx] - estimate->corners[prev_idx]);
-  const float origin_next_px = cv::norm(estimate->corners[origin_idx] - estimate->corners[next_idx]);
-
-  std::array<std::pair<int, int>, 4> edge_segments;
-  if (origin_prev_px >= origin_next_px)
-  {
-    edge_segments = {{
-      {origin_idx, prev_idx},
-      {next_idx, opposite_idx},
-      {origin_idx, next_idx},
-      {prev_idx, opposite_idx},
-    }};
-  }
-  else
-  {
-    edge_segments = {{
-      {origin_idx, next_idx},
-      {prev_idx, opposite_idx},
-      {origin_idx, prev_idx},
-      {next_idx, opposite_idx},
-    }};
-  }
-
-  for (std::size_t i = 0; i < edge_segments.size(); ++i)
-  {
-    const cv::Point2f start = estimate->corners[edge_segments[i].first];
-    const cv::Point2f end = estimate->corners[edge_segments[i].second];
-    const cv::Point2f mid = 0.5F * (start + end);
-    cv::Point2f edge_dir = end - start;
-    const float edge_len = std::sqrt(edge_dir.dot(edge_dir));
-    if (edge_len < 1e-3F)
-    {
-      continue;
-    }
-
-    edge_dir *= (1.0F / edge_len);
-    cv::Point2f normal(-edge_dir.y, edge_dir.x);
-    const cv::Point2f outward_a = mid + 18.0F * normal;
-    const cv::Point2f outward_b = mid - 18.0F * normal;
-    const float dist_a = cv::norm(outward_a - estimate->rect.center);
-    const float dist_b = cv::norm(outward_b - estimate->rect.center);
-    const cv::Point2f label_anchor = dist_a >= dist_b ? outward_a : outward_b;
-
-    const std::string label = cv::format("%.1f mm", estimate->edge_lengths_cm[i] * kCentimetersToMillimeters);
-    int baseline = 0;
-    const cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.52, 2, &baseline);
-    const cv::Point text_origin(
-      static_cast<int>(std::round(label_anchor.x - 0.5F * static_cast<float>(text_size.width))),
-      static_cast<int>(std::round(label_anchor.y + 0.5F * static_cast<float>(text_size.height))));
-    const cv::Rect text_box(
-      text_origin.x - 6,
-      text_origin.y - text_size.height - 6,
-      text_size.width + 12,
-      text_size.height + baseline + 10);
-    cv::rectangle(binary_bgr, text_box, cv::Scalar(24, 24, 24), cv::FILLED);
-    cv::rectangle(binary_bgr, text_box, cv::Scalar(0, 255, 0), 1);
-    cv::putText(
-      binary_bgr,
-      label,
-      text_origin,
-      cv::FONT_HERSHEY_SIMPLEX,
-      0.52,
-      cv::Scalar(0, 255, 0),
-      2);
-  }
 }
 
 void drawTrayName(cv::Mat &image, const std::string &tray_name)
@@ -4099,10 +4041,12 @@ public:
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link");
     calibration_parent_frame_ = declare_parameter<std::string>("calibration_parent_frame", "Link6");
     calibration_child_frame_ = declare_parameter<std::string>(
-      "calibration_child_frame", "calibrated_camera_link");
+      "calibration_child_frame", "arm_calibrated_camera_link");
     calibration_dir_ = declare_parameter<std::string>(
       "calibration_dir", defaultCalibrationDir());
     calibration_file_ = declare_parameter<std::string>("calibration_file", "");
+    robot_ip_address_ = dobot_common::robot_identity::resolveRobotIpAddress(
+      declare_parameter<std::string>("robot_ip_address", ""), __FILE__);
     auto_discover_calibration_ = declare_parameter<bool>("auto_discover_calibration", true);
     const std::string runtime_settings_file_param = declare_parameter<std::string>(
       "runtime_settings_file",
@@ -4145,7 +4089,8 @@ public:
     display_view_ = start_visualization ? DisplayView::kRgb : DisplayView::kBinarized;
     const std::string detection_mode_param =
       declare_parameter<std::string>("detection_mode", "rgb");
-    detection_use_depth_ = isDepthDetectionMode(detection_mode_param);
+    (void)detection_mode_param;
+    detection_use_depth_ = false;
     depth_threshold_mm_ = std::clamp(
       static_cast<int>(declare_parameter<int>("depth_threshold_mm", 10)),
       kDepthThresholdMinMm,
@@ -4166,13 +4111,13 @@ public:
       }
       return declare_parameter<double>(name, default_value);
     };
-    depth_plane_model_.valid = declare_parameter<bool>("depth_plane_enabled", false);
-    depth_plane_model_.a = declare_double_param("depth_plane_a", 0.0);
-    depth_plane_model_.b = declare_double_param("depth_plane_b", 0.0);
-    depth_plane_model_.c = declare_double_param("depth_plane_c", 0.0);
-    depth_plane_model_.reference_depth_m = declare_double_param("depth_plane_reference_depth_m", 0.0);
+    depth_plane_model_.valid = declare_parameter<bool>("tray_plane_enabled", false);
+    depth_plane_model_.a = declare_double_param("tray_plane_a", 0.0);
+    depth_plane_model_.b = declare_double_param("tray_plane_b", 0.0);
+    depth_plane_model_.c = declare_double_param("tray_plane_c", 0.0);
+    depth_plane_model_.reference_depth_m = declare_double_param("tray_plane_reference_depth_m", 0.0);
     const auto depth_plane_roi_values = declare_parameter<std::vector<int64_t>>(
-      "depth_plane_roi",
+      "tray_plane_roi",
       std::vector<int64_t>{0, 0, 0, 0});
     if (depth_plane_roi_values.size() >= 4)
     {
@@ -4192,8 +4137,7 @@ public:
       !std::isfinite(depth_plane_model_.b) ||
       !std::isfinite(depth_plane_model_.c) ||
       !std::isfinite(depth_plane_model_.reference_depth_m) ||
-      depth_plane_model_.reference_depth_m <= 0.0 ||
-      !depth_plane_roi_bounds_.has_value())
+      depth_plane_model_.reference_depth_m <= 0.0)
     {
       depth_plane_model_ = DepthPlaneModel{};
     }
@@ -4225,22 +4169,9 @@ public:
     trace_out_to_in_ = declare_parameter<bool>("trace_out_to_in", false);
     tray_name_ = declare_parameter<std::string>("tray_name", "tray");
     teach_date_ = declare_parameter<std::string>("teach_date", "");
-    const auto declared_taught_edge_lengths = declare_parameter<std::vector<double>>("taught_edge_lengths_cm", std::vector<double>{});
-    for (std::size_t i = 0; i < taught_edge_lengths_cm_.size() && i < declared_taught_edge_lengths.size(); ++i)
-    {
-      taught_edge_lengths_cm_[i] = declared_taught_edge_lengths[i];
-    }
-    const auto taught_area_override = parameter_overrides.find("taught_area_cm2");
-    if (taught_area_override != parameter_overrides.end() &&
-        taught_area_override->second.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
-    {
-      taught_area_cm2_ = static_cast<double>(declare_parameter<int64_t>("taught_area_cm2", 0));
-    }
-    else
-    {
-      taught_area_cm2_ = declare_parameter<double>("taught_area_cm2", 0.0);
-    }
-    area_tolerance_percent_ = declare_parameter<int>("area_tolerance_percent", 15);
+    tray_width_mm_ = declare_double_param("tray_width_mm", 0.0);
+    tray_height_mm_ = declare_double_param("tray_height_mm", 0.0);
+    dimension_tolerance_percent_ = declare_parameter<int>("tray_dimension_tolerance_percent", 15);
     if (motion_update_period_sec_ <= 0.0)
     {
       motion_update_period_sec_ = 0.1;
@@ -4318,7 +4249,7 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "Tray detect ready. Overlay topic=%s tray_pose topic=%s tray_vector topic=%s tray_cube_marker topic=%s "
-      "(enabled=%s thickness=%.1fmm) detect_mode=%s depth_threshold=+/- %dmm depth_plane=%s "
+      "(enabled=%s thickness=%.1fmm) detect_mode=%s tray_plane=%s "
       "z_axis=natural_edge base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
       "selected_profile=%s profiles=%zu headless=%s",
       overlay_topic_.c_str(),
@@ -4328,7 +4259,6 @@ public:
       publish_tray_cube_marker_ ? "true" : "false",
       tray_thickness_mm_,
       detectionModeToString(detection_use_depth_).c_str(),
-      depth_threshold_mm_,
       depth_plane_model_.valid ? "fixed" : "missing",
       robot_base_frame_.c_str(),
       pose_filter_window_sec_,
@@ -4518,8 +4448,7 @@ private:
         return {};
       }
 
-      std::filesystem::path preferred_path;
-      std::filesystem::file_time_type preferred_time;
+      dobot_common::robot_identity::LatestRobotFileSelection selection;
       for (const auto &entry : std::filesystem::directory_iterator(base))
       {
         if (!entry.is_regular_file())
@@ -4540,13 +4469,9 @@ private:
         {
           continue;
         }
-        if (preferred_path.empty() || entry.last_write_time() > preferred_time)
-        {
-          preferred_path = p;
-          preferred_time = entry.last_write_time();
-        }
+        selection.consider(p, entry.last_write_time(), robot_ip_address_);
       }
-      return preferred_path.string();
+      return selection.selected().string();
     }
     catch (const std::exception &ex)
     {
@@ -5121,21 +5046,10 @@ private:
 
   static bool profilesMatchForAliasSync(const TrayProfile &a, const TrayProfile &b)
   {
-    const bool has_edges_a = hasValidEdgeLengthsCm(a.taught_edge_lengths_cm);
-    const bool has_edges_b = hasValidEdgeLengthsCm(b.taught_edge_lengths_cm);
-    const bool edge_lengths_match =
-      has_edges_a && has_edges_b &&
-      std::equal(
-        a.taught_edge_lengths_cm.begin(),
-        a.taught_edge_lengths_cm.end(),
-        b.taught_edge_lengths_cm.begin(),
-        [](double lhs, double rhs)
-        {
-          return std::fabs(lhs - rhs) < 1e-6;
-        });
     return a.tray_name == b.tray_name &&
       a.teach_date == b.teach_date &&
-      (edge_lengths_match || std::fabs(a.taught_area_cm2 - b.taught_area_cm2) < 1e-6);
+      std::fabs(a.tray_width_mm - b.tray_width_mm) < 1e-6 &&
+      std::fabs(a.tray_height_mm - b.tray_height_mm) < 1e-6;
   }
 
   void syncLatestAliasProfileAfterDelete(const TrayProfile &deleted_profile)
@@ -5179,7 +5093,7 @@ private:
     depth_topic_ = profile.depth_topic;
     camera_info_topic_ = profile.camera_info_topic;
     overlay_topic_ = profile.overlay_topic;
-    detection_use_depth_ = profile.detection_use_depth;
+    detection_use_depth_ = false;
     depth_threshold_mm_ = std::clamp(
       profile.depth_threshold_mm,
       kDepthThresholdMinMm,
@@ -5214,20 +5128,19 @@ private:
     outlier_sensitivity_ = std::clamp(profile.outlier_sensitivity, 1, 100);
     detect_black_to_white_ = profile.detect_black_to_white;
     trace_out_to_in_ = profile.trace_out_to_in;
-    depth_plane_model_.valid = profile.depth_plane_enabled;
-    depth_plane_model_.a = profile.depth_plane_a;
-    depth_plane_model_.b = profile.depth_plane_b;
-    depth_plane_model_.c = profile.depth_plane_c;
-    depth_plane_model_.reference_depth_m = profile.depth_plane_reference_depth_m;
-    depth_plane_roi_bounds_ = profile.depth_plane_roi_bounds;
+    depth_plane_model_.valid = profile.tray_plane_enabled;
+    depth_plane_model_.a = profile.tray_plane_a;
+    depth_plane_model_.b = profile.tray_plane_b;
+    depth_plane_model_.c = profile.tray_plane_c;
+    depth_plane_model_.reference_depth_m = profile.tray_plane_reference_depth_m;
+    depth_plane_roi_bounds_ = profile.tray_plane_roi_bounds;
     if (
       !depth_plane_model_.valid ||
       !std::isfinite(depth_plane_model_.a) ||
       !std::isfinite(depth_plane_model_.b) ||
       !std::isfinite(depth_plane_model_.c) ||
       !std::isfinite(depth_plane_model_.reference_depth_m) ||
-      depth_plane_model_.reference_depth_m <= 0.0 ||
-      !depth_plane_roi_bounds_.has_value())
+      depth_plane_model_.reference_depth_m <= 0.0)
     {
       depth_plane_model_ = DepthPlaneModel{};
     }
@@ -5236,8 +5149,8 @@ private:
     teach_date_ = profile.teach_date;
     teach_joints_deg_ = profile.teach_joints_deg;
     has_teach_joints_ = profile.has_teach_joints;
-    taught_edge_lengths_cm_ = profile.taught_edge_lengths_cm;
-    taught_area_cm2_ = profile.taught_area_cm2;
+    tray_width_mm_ = profile.tray_width_mm;
+    tray_height_mm_ = profile.tray_height_mm;
     resetMotionTracking();
 
     if (
@@ -5440,9 +5353,12 @@ private:
       {
         overlay_enabled_ = overlay_enabled.as<bool>();
       }
-      if (const YAML::Node edge_tolerance = root["edge_tolerance_percent"]; edge_tolerance)
+      if (const YAML::Node dimension_tolerance = root["tray_dimension_tolerance_percent"]; dimension_tolerance)
       {
-        area_tolerance_percent_ = std::clamp(edge_tolerance.as<int>(), tolerance_slider_.min_value, tolerance_slider_.max_value);
+        dimension_tolerance_percent_ = std::clamp(
+          dimension_tolerance.as<int>(),
+          tolerance_slider_.min_value,
+          tolerance_slider_.max_value);
       }
       if (const YAML::Node seek_window_sec = root["seek_window_sec"]; seek_window_sec)
       {
@@ -5509,7 +5425,7 @@ private:
       out << YAML::BeginMap;
       out << YAML::Key << "view_mode" << YAML::Value << runtimeViewModeToken();
       out << YAML::Key << "overlay_enabled" << YAML::Value << overlay_enabled_;
-      out << YAML::Key << "edge_tolerance_percent" << YAML::Value << area_tolerance_percent_;
+      out << YAML::Key << "tray_dimension_tolerance_percent" << YAML::Value << dimension_tolerance_percent_;
       out << YAML::Key << "seek_window_sec" << YAML::Value << seekWindowSeconds();
       out << YAML::Key << "seek_decay_sec" << YAML::Value << seekDecaySeconds();
       out << YAML::Key << "seek_valid_frames_confidence" << YAML::Value << seek_valid_confidence_frames_;
@@ -5918,7 +5834,7 @@ private:
       tolerance_slider_.track_rect.x + tolerance_slider_.track_rect.width);
     const double t = static_cast<double>(clamped_x - tolerance_slider_.track_rect.x) /
       std::max(1, tolerance_slider_.track_rect.width);
-    area_tolerance_percent_ = static_cast<int>(std::round(
+    dimension_tolerance_percent_ = static_cast<int>(std::round(
       tolerance_slider_.min_value + t * (tolerance_slider_.max_value - tolerance_slider_.min_value)));
   }
 
@@ -6182,40 +6098,13 @@ private:
     tray_axis_overlay_pub_->publish(msg);
   }
 
-  std::optional<std::pair<double, double>> planarSizeMetersFromEdgeLengths(
-    const std::array<double, 4> &edge_lengths_cm) const
-  {
-    if (!hasValidEdgeLengthsCm(edge_lengths_cm))
-    {
-      return std::nullopt;
-    }
-
-    const double x_size_m = 0.5 * (edge_lengths_cm[0] + edge_lengths_cm[1]) / 100.0;
-    const double y_size_m = 0.5 * (edge_lengths_cm[2] + edge_lengths_cm[3]) / 100.0;
-    if (x_size_m <= 1e-6 || y_size_m <= 1e-6)
-    {
-      return std::nullopt;
-    }
-    return std::make_pair(x_size_m, y_size_m);
-  }
-
-  std::optional<std::pair<double, double>> measuredTrayPlanarSizeMeters(
-    const std::optional<TrayEstimate> &accepted_estimate) const
-  {
-    if (accepted_estimate.has_value() &&
-        accepted_estimate->has_metric_estimate &&
-        hasValidEdgeLengthsCm(accepted_estimate->edge_lengths_cm))
-    {
-      return planarSizeMetersFromEdgeLengths(accepted_estimate->edge_lengths_cm);
-    }
-    return std::nullopt;
-  }
-
   std::optional<std::pair<double, double>> taughtTrayPlanarSizeMeters() const
   {
-    if (hasValidEdgeLengthsCm(taught_edge_lengths_cm_))
+    if (hasValidTrayDimensionsMm(tray_width_mm_, tray_height_mm_))
     {
-      return planarSizeMetersFromEdgeLengths(taught_edge_lengths_cm_);
+      return std::make_pair(
+        tray_height_mm_ / kMetersToMillimeters,
+        tray_width_mm_ / kMetersToMillimeters);
     }
     return std::nullopt;
   }
@@ -6223,11 +6112,7 @@ private:
   std::optional<std::pair<double, double>> trayPlanarSizeMeters(
     const std::optional<TrayEstimate> &accepted_estimate) const
   {
-    if (const auto measured_size_m = measuredTrayPlanarSizeMeters(accepted_estimate);
-        measured_size_m.has_value())
-    {
-      return measured_size_m;
-    }
+    (void)accepted_estimate;
     return taughtTrayPlanarSizeMeters();
   }
 
@@ -6297,33 +6182,26 @@ private:
       return;
     }
 
-    std::optional<std::pair<double, double>> tray_size_m = latest_live_tray_size_m_;
-    bool live_detection = tray_size_m.has_value();
-    if (!tray_size_m.has_value())
-    {
-      tray_size_m = taughtTrayPlanarSizeMeters();
-    }
+    std::optional<std::pair<double, double>> tray_size_m = taughtTrayPlanarSizeMeters();
 
     response->tray_name = tray_name_;
-    response->live_detection = live_detection;
+    response->live_detection = false;
     if (!tray_size_m.has_value())
     {
       response->success = false;
       response->x_size_mm = 0.0;
       response->y_size_mm = 0.0;
       response->message = tray_name_.empty()
-        ? "Tray dimensions are unavailable: no live detection and no taught profile size."
+        ? "Tray dimensions are unavailable: no taught profile size."
         : "Tray dimensions are unavailable for '" + tray_name_ +
-            "': no live detection and no taught profile size.";
+            "': no taught profile size.";
       return;
     }
 
     response->success = true;
     response->x_size_mm = tray_size_m->first * kMetersToMillimeters;
     response->y_size_mm = tray_size_m->second * kMetersToMillimeters;
-    response->message = live_detection
-      ? "Using live detected tray dimensions."
-      : "Using taught tray profile dimensions.";
+    response->message = "Using taught tray profile dimensions.";
   }
 
   void resetSeekSessionState()
@@ -6695,7 +6573,7 @@ private:
     CameraInfoMsg::ConstSharedPtr info;
     {
       std::lock_guard<std::mutex> lock(data_mutex_);
-      if (latest_depth_.empty() || !latest_camera_info_)
+      if (!latest_camera_info_)
       {
         return;
       }
@@ -6705,29 +6583,7 @@ private:
 
     const rclcpp::Time stamp(msg->header.stamp);
     const std::string resolved_frame_id = resolvedCameraFrameId(msg->header, info);
-    cv::Mat mask;
-    if (detection_use_depth_)
-    {
-      if (depth_plane_model_.valid)
-      {
-        const cv::Mat normalized_depth = applyFixedDepthPlaneNormalization(depth_m, depth_plane_model_);
-        mask = buildDepthMask(
-          normalized_depth,
-          depth_threshold_mm_,
-          depth_plane_model_.reference_depth_m);
-      }
-      else if (!depth_m.empty() && depth_m.type() == CV_32FC1)
-      {
-        mask = cv::Mat::zeros(depth_m.size(), CV_8UC1);
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *this->get_clock(), 2000,
-          "Depth mode enabled but fixed depth plane is missing; run tray teach depth-plane ROI and save profile.");
-      }
-    }
-    else
-    {
-      mask = buildRgbMask(color_cv->image, red_threshold_, green_threshold_, blue_threshold_);
-    }
+    cv::Mat mask = buildRgbMask(color_cv->image, red_threshold_, green_threshold_, blue_threshold_);
     const bool roi_ready = hasValidRoiPoints(roi_points_);
     cv::Mat detection_mask = mask.clone();
     if (roi_ready)
@@ -6754,49 +6610,56 @@ private:
         trace_out_to_in_);
     }
 
-    bool rejected_by_edge_lengths = false;
-    bool rejected_by_missing_edge_metrics = false;
-    bool rejected_by_area = false;
-    double max_edge_error_percent = 0.0;
+    bool rejected_by_dimensions = false;
+    bool rejected_by_missing_plane_metrics = false;
+    double max_dimension_error_percent = 0.0;
     std::optional<TrayEstimate> accepted_estimate = tray_estimate;
     std::optional<TrayPose3D> detected_tray_pose_3d;
-    if (tray_estimate.has_value() && hasValidEdgeLengthsCm(taught_edge_lengths_cm_))
+    if (tray_estimate.has_value())
     {
-      if (!tray_estimate->has_metric_estimate || !hasValidEdgeLengthsCm(tray_estimate->edge_lengths_cm))
+      const auto camera_points = estimateTrayCornerCameraPointsFromTrayPlane(
+        tray_estimate->corners,
+        color_cv->image.size(),
+        depth_plane_model_,
+        *info);
+      const auto measured_dimensions = camera_points.has_value()
+        ? estimateTrayDimensionsFromCameraPoints(*camera_points)
+        : std::optional<TrayDimensionsMm>{};
+      if (!depth_plane_model_.valid || !measured_dimensions.has_value())
       {
         accepted_estimate.reset();
-        rejected_by_edge_lengths = true;
-        rejected_by_missing_edge_metrics = true;
+        rejected_by_dimensions = true;
+        rejected_by_missing_plane_metrics = true;
       }
-      else if (!areEdgeLengthsWithinTaughtBand(
-          tray_estimate->edge_lengths_cm,
-          taught_edge_lengths_cm_,
-          area_tolerance_percent_))
+      else if (!areTrayDimensionsWithinTaughtBand(
+          *measured_dimensions,
+          tray_width_mm_,
+          tray_height_mm_,
+          dimension_tolerance_percent_))
       {
         accepted_estimate.reset();
-        rejected_by_edge_lengths = true;
-        max_edge_error_percent = maxEdgeLengthDeviationPercent(
-          tray_estimate->edge_lengths_cm,
-          taught_edge_lengths_cm_);
+        rejected_by_dimensions = true;
+        max_dimension_error_percent = maxTrayDimensionDeviationPercent(
+          *measured_dimensions,
+          tray_width_mm_,
+          tray_height_mm_);
       }
-    }
-    else if (tray_estimate.has_value() &&
-             tray_estimate->has_metric_estimate &&
-             tray_estimate->area_cm2 > 0.0 &&
-             taught_area_cm2_ > 0.0 &&
-             !isAreaWithinTaughtBand(tray_estimate->area_cm2, taught_area_cm2_, area_tolerance_percent_))
-    {
-      accepted_estimate.reset();
-      rejected_by_area = true;
+      else
+      {
+        tray_estimate->has_dimension_estimate = true;
+        tray_estimate->tray_width_mm = measured_dimensions->width;
+        tray_estimate->tray_height_mm = measured_dimensions->height;
+        accepted_estimate = tray_estimate;
+      }
     }
 
     if (accepted_estimate.has_value())
     {
       const auto tray_pose_3d = estimateTrayPose3D(
         *accepted_estimate,
-        depth_m,
-        *info,
-        depth_edge_offset_px_);
+        color_cv->image.size(),
+        depth_plane_model_,
+        *info);
       if (tray_pose_3d.has_value())
       {
         detected_tray_pose_3d = tray_pose_3d;
@@ -6808,7 +6671,6 @@ private:
           "Tray detected in image but natural 3D tray pose estimation failed.");
       }
     }
-    latest_live_tray_size_m_ = measuredTrayPlanarSizeMeters(accepted_estimate);
     const std::optional<TrayPose3D> filtered_tray_pose_3d = filterTrayPoseOutliers(
       stamp,
       resolved_frame_id,
@@ -6821,10 +6683,17 @@ private:
         overlay = color_cv->image.clone();
         break;
       case DisplayView::kDepth:
-        overlay = colorizeDepth(depth_m);
-        if (overlay.size() != color_cv->image.size())
+        if (!depth_m.empty())
         {
-          cv::resize(overlay, overlay, color_cv->image.size(), 0.0, 0.0, cv::INTER_NEAREST);
+          overlay = colorizeDepth(depth_m);
+          if (overlay.size() != color_cv->image.size())
+          {
+            cv::resize(overlay, overlay, color_cv->image.size(), 0.0, 0.0, cv::INTER_NEAREST);
+          }
+        }
+        else
+        {
+          overlay = color_cv->image.clone();
         }
         break;
       case DisplayView::kBinarized:
@@ -6832,7 +6701,7 @@ private:
         cv::cvtColor(roi_ready ? detection_mask : mask, overlay, cv::COLOR_GRAY2BGR);
         break;
     }
-    drawModeLabel(overlay, detection_use_depth_ ? "Depth" : "RGB");
+    drawModeLabel(overlay, "RGB");
     if (overlay_enabled_)
     {
       drawRoiOverlay(overlay, roi_points_);
@@ -6860,11 +6729,11 @@ private:
           cv::Scalar(0, 180, 255),
           2);
       }
-      else if (detection_use_depth_ && !depth_plane_model_.valid)
+      else if (!depth_plane_model_.valid)
       {
         cv::putText(
           overlay,
-          "Depth plane missing in profile",
+          "Tray plane missing in profile",
           cv::Point(18, 68),
           cv::FONT_HERSHEY_SIMPLEX,
           0.72,
@@ -6872,39 +6741,24 @@ private:
           2);
         cv::putText(
           overlay,
-          "Teach depth plane ROI and save profile",
+          "Teach tray plane ROI and save profile",
           cv::Point(18, 94),
           cv::FONT_HERSHEY_SIMPLEX,
           0.62,
           cv::Scalar(0, 200, 255),
           2);
       }
-      if (rejected_by_edge_lengths && tray_estimate.has_value())
+      if (rejected_by_dimensions && tray_estimate.has_value())
       {
-        const std::string reject_text = rejected_by_missing_edge_metrics
-          ? "Rejected: edge tolerance needs valid depth"
+        const std::string reject_text = rejected_by_missing_plane_metrics
+          ? "Rejected: tray plane measurement unavailable"
           : cv::format(
-              "Rejected edge lengths, max error %.1f%% (+/-%d%%)",
-              max_edge_error_percent,
-              area_tolerance_percent_);
+              "Rejected dimensions, max error %.1f%% (+/-%d%%)",
+              max_dimension_error_percent,
+              dimension_tolerance_percent_);
         cv::putText(
           overlay,
           reject_text,
-          cv::Point(18, 68),
-          cv::FONT_HERSHEY_SIMPLEX,
-          0.72,
-          cv::Scalar(0, 0, 255),
-          2);
-      }
-      else if (rejected_by_area && tray_estimate.has_value() && tray_estimate->has_metric_estimate)
-      {
-        cv::putText(
-          overlay,
-          cv::format(
-            "Rejected area %.0f mm2, teach %.0f mm2 (+/-%d%%)",
-            tray_estimate->area_cm2 * kSquareCentimetersToSquareMillimeters,
-            taught_area_cm2_ * kSquareCentimetersToSquareMillimeters,
-            area_tolerance_percent_),
           cv::Point(18, 68),
           cv::FONT_HERSHEY_SIMPLEX,
           0.72,
@@ -7453,14 +7307,14 @@ private:
 
     cv::putText(
       bar,
-      cv::format("Edge Tolerance +/-%d%%", area_tolerance_percent_),
+      cv::format("Dimension Tolerance +/-%d%%", dimension_tolerance_percent_),
       tolerance_label_origin_,
       cv::FONT_HERSHEY_DUPLEX,
       0.48,
       cv::Scalar(225, 230, 236),
       1,
       cv::LINE_AA);
-    draw_slider(tolerance_slider_, area_tolerance_percent_, cv::Scalar(85, 225, 255));
+    draw_slider(tolerance_slider_, dimension_tolerance_percent_, cv::Scalar(85, 225, 255));
 
     cv::putText(
       bar,
@@ -7675,6 +7529,7 @@ private:
   std::string calibration_child_frame_;
   std::string calibration_dir_;
   std::string calibration_file_;
+  std::string robot_ip_address_;
   std::filesystem::path runtime_settings_path_;
   std::string profiles_dir_;
   std::string teach_date_;
@@ -7709,7 +7564,7 @@ private:
   int horizontal_ray_count_ {50};
   int vertical_ray_count_ {50};
   int outlier_sensitivity_ {50};
-  int area_tolerance_percent_ {15};
+  int dimension_tolerance_percent_ {15};
   bool detect_black_to_white_ {true};
   bool trace_out_to_in_ {false};
   DisplayView display_view_ {DisplayView::kBinarized};
@@ -7728,8 +7583,8 @@ private:
   std::array<double, 6> teach_joints_deg_ {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   bool has_teach_joints_ {false};
   bool go_to_teach_in_progress_ {false};
-  std::array<double, 4> taught_edge_lengths_cm_ {0.0, 0.0, 0.0, 0.0};
-  double taught_area_cm2_ {0.0};
+  double tray_width_mm_ {0.0};
+  double tray_height_mm_ {0.0};
   double tray_thickness_mm_ {15.0};
   double motion_update_period_sec_ {0.1};
   double pose_filter_window_sec_ {0.8};
@@ -7780,7 +7635,6 @@ private:
     std::optional<SeekCapture> seek_last_valid_capture_;
     std::deque<SeekMotionSample> seek_valid_motion_samples_;
     SeekVectorSummary seek_vector_summary_;
-    std::optional<std::pair<double, double>> latest_live_tray_size_m_;
     std::string seek_snapshots_dir_;
     bool camera_exposure_dirty_ {true};
     rclcpp::Time last_camera_exposure_attempt_time_ {0, 0, RCL_ROS_TIME};

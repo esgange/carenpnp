@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -8,6 +9,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 try:
     import yaml
@@ -33,6 +35,11 @@ DEFAULT_ORBBEC_LAUNCH_ARGS = {
     'enable_point_cloud': False,
 }
 DEFAULT_SCAN_TIMEOUT_SEC = 8.0
+DEFAULT_WATCHDOG_STARTUP_TIMEOUT_SEC = 20.0
+DEFAULT_WATCHDOG_HEALTH_TIMEOUT_SEC = 5.0
+DEFAULT_WATCHDOG_CHECK_PERIOD_SEC = 1.0
+DEFAULT_WATCHDOG_RESTART_DELAY_SEC = 3.0
+DEFAULT_WATCHDOG_RESTART_BACKOFF_MAX_SEC = 30.0
 SERIAL_LABEL_RE = re.compile(
     r'(?:serial(?:\s+number)?|serial_number|sn)\s*[:=]\s*([A-Za-z0-9_.:-]+)',
     re.IGNORECASE,
@@ -228,6 +235,10 @@ def _launch_setup(context, *args, **kwargs):
         LaunchConfiguration('scan_timeout_sec').perform(context),
         DEFAULT_SCAN_TIMEOUT_SEC,
     )
+    watchdog_enabled = _to_bool(
+        LaunchConfiguration('watchdog_enabled').perform(context),
+        True,
+    )
     payload = _load_config(config_file)
     pairs = _selected_pairs(_camera_pairs(payload), enabled_cameras)
     if not pairs:
@@ -284,6 +295,47 @@ def _launch_setup(context, *args, **kwargs):
         raise RuntimeError(f'Orbbec launch file does not exist: {orbbec_launch_path}')
 
     actions = [LogInfo(msg=message) for message in connection_messages]
+    if watchdog_enabled:
+        watchdog_namespace = LaunchConfiguration('watchdog_namespace').perform(context).strip()
+        actions.append(
+            Node(
+                package='orbbec_camera_launcher',
+                executable='camera_watchdog',
+                namespace=watchdog_namespace,
+                name='supervisor',
+                output='screen',
+                parameters=[{
+                    'camera_names': [pair['camera_name'] for pair in pairs],
+                    'serial_numbers': [pair['serial_number'] for pair in pairs],
+                    'orbbec_launch_file': launch_file,
+                    'device_num': device_num,
+                    'launch_args_json': json.dumps(launch_args),
+                    'workspace_root': str(_workspace_root()),
+                    'startup_timeout_sec': _to_positive_float(
+                        LaunchConfiguration('watchdog_startup_timeout_sec').perform(context),
+                        DEFAULT_WATCHDOG_STARTUP_TIMEOUT_SEC,
+                    ),
+                    'health_timeout_sec': _to_positive_float(
+                        LaunchConfiguration('watchdog_health_timeout_sec').perform(context),
+                        DEFAULT_WATCHDOG_HEALTH_TIMEOUT_SEC,
+                    ),
+                    'check_period_sec': _to_positive_float(
+                        LaunchConfiguration('watchdog_check_period_sec').perform(context),
+                        DEFAULT_WATCHDOG_CHECK_PERIOD_SEC,
+                    ),
+                    'restart_delay_sec': _to_positive_float(
+                        LaunchConfiguration('watchdog_restart_delay_sec').perform(context),
+                        DEFAULT_WATCHDOG_RESTART_DELAY_SEC,
+                    ),
+                    'restart_backoff_max_sec': _to_positive_float(
+                        LaunchConfiguration('watchdog_restart_backoff_max_sec').perform(context),
+                        DEFAULT_WATCHDOG_RESTART_BACKOFF_MAX_SEC,
+                    ),
+                }],
+            )
+        )
+        return actions
+
     for pair in pairs:
         include_args = {
             'camera_name': pair['camera_name'],
@@ -311,6 +363,28 @@ def generate_launch_description():
         DeclareLaunchArgument('device_num', default_value=''),
         DeclareLaunchArgument('require_connected', default_value='true'),
         DeclareLaunchArgument('scan_timeout_sec', default_value=str(DEFAULT_SCAN_TIMEOUT_SEC)),
+        DeclareLaunchArgument('watchdog_enabled', default_value='true'),
+        DeclareLaunchArgument('watchdog_namespace', default_value='camera_watchdog'),
+        DeclareLaunchArgument(
+            'watchdog_startup_timeout_sec',
+            default_value=str(DEFAULT_WATCHDOG_STARTUP_TIMEOUT_SEC),
+        ),
+        DeclareLaunchArgument(
+            'watchdog_health_timeout_sec',
+            default_value=str(DEFAULT_WATCHDOG_HEALTH_TIMEOUT_SEC),
+        ),
+        DeclareLaunchArgument(
+            'watchdog_check_period_sec',
+            default_value=str(DEFAULT_WATCHDOG_CHECK_PERIOD_SEC),
+        ),
+        DeclareLaunchArgument(
+            'watchdog_restart_delay_sec',
+            default_value=str(DEFAULT_WATCHDOG_RESTART_DELAY_SEC),
+        ),
+        DeclareLaunchArgument(
+            'watchdog_restart_backoff_max_sec',
+            default_value=str(DEFAULT_WATCHDOG_RESTART_BACKOFF_MAX_SEC),
+        ),
     ]
     for key in DEFAULT_ORBBEC_LAUNCH_ARGS:
         launch_arguments.append(DeclareLaunchArgument(key, default_value=''))

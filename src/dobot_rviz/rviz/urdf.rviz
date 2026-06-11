@@ -90,10 +90,6 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        camera_link:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
       Mass Properties:
         Inertia: false
         Mass: false
@@ -121,6 +117,8 @@ Visualization Manager:
           Value: true
         base_link:
           Value: true
+        bin_calibrated_camera_link:
+          Value: true
         bin_item_1:
           Value: true
         bin_item_2:
@@ -129,7 +127,7 @@ Visualization Manager:
           Value: true
         bin_item_4:
           Value: true
-        calibrated_camera_link:
+        arm_calibrated_camera_link:
           Value: true
         camera_color_frame:
           Value: false
@@ -138,8 +136,6 @@ Visualization Manager:
         camera_depth_frame:
           Value: false
         camera_depth_optical_frame:
-          Value: false
-        camera_link:
           Value: false
         world:
           Value: true
@@ -151,28 +147,23 @@ Visualization Manager:
       Tree:
         world:
           base_link:
+            bin_calibrated_camera_link:
+              bin_item_1:
+                {}
+              bin_item_2:
+                {}
+              bin_item_3:
+                {}
+              bin_item_4:
+                {}
             Link1:
               Link2:
                 Link3:
                   Link4:
                     Link5:
                       Link6:
-                        calibrated_camera_link:
-                          bin_item_1:
-                            {}
-                          bin_item_2:
-                            {}
-                          bin_item_3:
-                            {}
-                          bin_item_4:
-                            {}
-                        camera_link:
-                          camera_depth_frame:
-                            camera_color_frame:
-                              camera_color_optical_frame:
-                                {}
-                            camera_depth_optical_frame:
-                              {}
+                        arm_calibrated_camera_link:
+                          {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/MarkerArray

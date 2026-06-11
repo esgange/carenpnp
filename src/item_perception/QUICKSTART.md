@@ -17,7 +17,7 @@ source install/setup.bash
 If this robot setup does not already have a platform reference, create it once:
 
 ```bash
-ros2 launch camera_calibration platform_teach.launch.py
+ros2 launch platform_calibration platform_calibration.launch.py
 ```
 
 Then teach or update the bin:

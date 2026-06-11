@@ -1,3 +1,4 @@
+import json
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -7,6 +8,14 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 
 from dobot_msgs_v4.srv import DO
+from std_msgs.msg import String
+
+
+DI_STATUS_TOPIC_DEFAULT = '/dobot_bringup_ros2/DIStatus_200mS'
+SUCTION_STATUS_DI_INDEX = 1
+SUCTION_STATUS_BIT_INDEX = SUCTION_STATUS_DI_INDEX - 1
+SUCTION_EXHAUST_PULSE_MS = 250
+GRIPPER_OPEN_PULSE_MS = 100
 
 
 class GripperControlNode(Node):
@@ -16,14 +25,50 @@ class GripperControlNode(Node):
             'do_service',
             '/dobot_bringup_ros2/srv/DO',
         ).value
+        self._di_status_topic = self.declare_parameter(
+            'di_status_topic',
+            DI_STATUS_TOPIC_DEFAULT,
+        ).value
+        self._feedback_lock = threading.Lock()
+        self._digital_inputs_change_handler = None
+        self._last_digital_input_bits = None
         self._do_client = self.create_client(DO, self._do_service_name)
+        self.create_subscription(String, self._di_status_topic, self._di_status_callback, 10)
 
     @property
     def do_service_name(self) -> str:
         return self._do_service_name
 
-    def is_service_ready(self) -> bool:
+    @property
+    def di_status_topic(self) -> str:
+        return self._di_status_topic
+
+    def is_do_service_ready(self) -> bool:
         return self._do_client.service_is_ready()
+
+    def set_digital_inputs_change_handler(self, handler) -> None:
+        with self._feedback_lock:
+            self._digital_inputs_change_handler = handler
+            bits = self._last_digital_input_bits
+        if bits is not None:
+            handler(bits)
+
+    def _di_status_callback(self, msg: String) -> None:
+        try:
+            payload = json.loads(str(msg.data))
+            digital_input_bits = int(payload.get('digital_input_bits'))
+        except Exception as ex:  # noqa: BLE001
+            self.get_logger().warn(f'Could not parse DI status digital_input_bits: {ex}')
+            return
+
+        handler = None
+        with self._feedback_lock:
+            changed = digital_input_bits != self._last_digital_input_bits
+            self._last_digital_input_bits = digital_input_bits
+            if changed:
+                handler = self._digital_inputs_change_handler
+        if handler is not None:
+            handler(digital_input_bits)
 
     def send_do(self, index: int, status: int, on_complete, time_ms: int = 0) -> None:
         request = DO.Request()
@@ -81,14 +126,20 @@ class GripperControlApp:
 
         self._status_var = tk.StringVar(value='Ready')
         self._service_var = tk.StringVar(value='Checking service...')
+        self._suction_status_var = tk.StringVar(value='Suction Status: unknown')
+        self._suction_detail_var = tk.StringVar(value=f'DI{SUCTION_STATUS_DI_INDEX}: waiting')
+        self._suction_led_canvas = None
+        self._suction_led_item = None
+        self._suction_status_label = None
 
         self._build_ui()
         self._root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._update_service_indicator()
+        self._node.set_digital_inputs_change_handler(self._on_digital_inputs_changed)
 
     def _build_ui(self) -> None:
-        self._root.title('Dobot Gripper Control (DO1/DO2/DO3)')
-        self._root.geometry('560x330')
+        self._root.title('Dobot Gripper Diagnostics (DO1-DO4 + Suction Status)')
+        self._root.geometry('640x430')
         self._root.resizable(False, False)
 
         outer = ttk.Frame(self._root, padding=14)
@@ -96,7 +147,7 @@ class GripperControlApp:
 
         header = ttk.Label(
             outer,
-            text='Dobot DO Gripper Control',
+            text='Dobot Gripper Diagnostics',
             font=('TkDefaultFont', 12, 'bold'),
         )
         header.grid(row=0, column=0, sticky='w')
@@ -111,9 +162,15 @@ class GripperControlApp:
         self._create_channel_row(panel, do_index=1, row=0)
         self._create_channel_row(panel, do_index=2, row=1)
         self._create_channel_row(panel, do_index=3, row=2)
+        self._create_channel_row(panel, do_index=4, row=3)
+
+        suction_panel = ttk.LabelFrame(outer, text='Suction Status', padding=10)
+        suction_panel.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        suction_panel.columnconfigure(2, weight=1)
+        self._create_suction_status_row(suction_panel)
 
         action_panel = ttk.LabelFrame(outer, text='Quick Actions', padding=10)
-        action_panel.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        action_panel.grid(row=4, column=0, sticky='ew', pady=(10, 0))
         self._grip_button = tk.Button(
             action_panel,
             text='Grip',
@@ -134,15 +191,14 @@ class GripperControlApp:
             command=self._on_release,
         )
         self._release_button.grid(row=0, column=1, padx=(0, 12))
-
         status = ttk.Label(outer, textvariable=self._status_var, foreground='#204a87')
-        status.grid(row=4, column=0, sticky='w', pady=(10, 0))
+        status.grid(row=5, column=0, sticky='w', pady=(10, 0))
 
         hint = ttk.Label(
             outer,
             text='Behavior: 0 ms = keep ON until manual OFF. >0 ms = auto OFF after delay.',
         )
-        hint.grid(row=5, column=0, sticky='w', pady=(6, 0))
+        hint.grid(row=6, column=0, sticky='w', pady=(6, 0))
         self._update_action_buttons()
 
     def _create_channel_row(self, parent: ttk.LabelFrame, do_index: int, row: int) -> None:
@@ -179,16 +235,86 @@ class GripperControlApp:
             'timer_after_id': None,
         }
 
+    def _create_suction_status_row(self, parent: ttk.LabelFrame) -> None:
+        self._suction_led_canvas = tk.Canvas(
+            parent,
+            width=18,
+            height=18,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._suction_led_canvas.grid(row=0, column=0, sticky='w', padx=(0, 8))
+        self._suction_led_item = self._suction_led_canvas.create_oval(
+            3,
+            3,
+            15,
+            15,
+            fill='#9a9a9a',
+            outline='#666666',
+            width=1,
+        )
+
+        self._suction_status_label = tk.Label(
+            parent,
+            textvariable=self._suction_status_var,
+            width=24,
+            fg='#8a6d1d',
+        )
+        self._suction_status_label.grid(row=0, column=1, sticky='w', padx=(0, 12))
+
+        detail_label = ttk.Label(parent, textvariable=self._suction_detail_var)
+        detail_label.grid(row=0, column=2, sticky='w')
+
     def _update_service_indicator(self) -> None:
         if self._closing:
             return
 
-        if self._node.is_service_ready():
-            self._service_var.set(f'Service ready: {self._node.do_service_name}')
-        else:
-            self._service_var.set(f'Waiting for service: {self._node.do_service_name}')
+        do_state = 'ready' if self._node.is_do_service_ready() else 'waiting'
+        self._service_var.set(
+            f'DO {do_state}: {self._node.do_service_name}\n'
+            f'DI status: {self._node.di_status_topic}'
+        )
 
         self._root.after(400, self._update_service_indicator)
+
+    def _is_bit_active(self, digital_input_bits: int, bit_index: int) -> bool:
+        return bool(int(digital_input_bits) & (1 << int(bit_index)))
+
+    def _set_suction_status(self, active: bool, digital_input_bits: int) -> None:
+        if active:
+            fill = '#20d060'
+            outline = '#0f8a3f'
+            text = 'Suction Status: active'
+            label_fg = '#1f7a1f'
+        else:
+            fill = '#303030'
+            outline = '#777777'
+            text = 'Suction Status: clear'
+            label_fg = '#555555'
+
+        self._suction_status_var.set(text)
+        self._suction_detail_var.set(
+            f'DI{SUCTION_STATUS_DI_INDEX} bit {SUCTION_STATUS_BIT_INDEX}, '
+            f'digital_input_bits={digital_input_bits}'
+        )
+
+        if self._suction_led_canvas is not None and self._suction_led_item is not None:
+            self._suction_led_canvas.itemconfigure(
+                self._suction_led_item,
+                fill=fill,
+                outline=outline,
+            )
+        if self._suction_status_label is not None:
+            self._suction_status_label.configure(fg=label_fg)
+
+    def _on_digital_inputs_changed(self, digital_input_bits: int) -> None:
+        def _apply() -> None:
+            if self._closing:
+                return
+            active = self._is_bit_active(digital_input_bits, SUCTION_STATUS_BIT_INDEX)
+            self._set_suction_status(active, digital_input_bits)
+
+        self._root.after(0, _apply)
 
     def _set_status(self, text: str) -> None:
         self._status_var.set(text)
@@ -270,7 +396,9 @@ class GripperControlApp:
         duration_ms_do1 = self._parse_duration_ms(1)
         if duration_ms_do1 is None:
             return
-        self._set_status('Grip: DO1 ON + DO3 suction ON')
+        self._set_status('Grip: DO2 OFF + DO4 exhaust OFF + DO1 ON + DO3 suction ON')
+        self._request_off(2, reason='grip')
+        self._request_off(4, reason='grip')
         self._request_on(1, duration_ms_do1)
         self._request_on(3, 0)
 
@@ -281,25 +409,39 @@ class GripperControlApp:
         channel_1 = self._channels[1]
         channel_2 = self._channels[2]
         channel_3 = self._channels[3]
-        self._cancel_auto_off_timer(1)
-        self._cancel_auto_off_timer(2)
-        self._cancel_auto_off_timer(3)
+        channel_4 = self._channels[4]
+        for do_index in (1, 2, 3, 4):
+            self._cancel_auto_off_timer(do_index)
         channel_1['pending'] = True
         channel_2['pending'] = True
         channel_3['pending'] = True
-        self._set_status('Release: DO1 OFF, DO3 OFF (vent), DO2 pulse 100 ms')
-        self._set_channel_ui(1)
-        self._set_channel_ui(2)
-        self._set_channel_ui(3)
+        channel_4['pending'] = True
+        self._set_status(
+            f'Release: DO1 OFF, DO3 OFF, DO4 exhaust {SUCTION_EXHAUST_PULSE_MS} ms, '
+            f'DO2 open {GRIPPER_OPEN_PULSE_MS} ms'
+        )
+        for do_index in (1, 2, 3, 4):
+            self._set_channel_ui(do_index)
+
+        release_done = {'do2': False, 'do4': False}
+        warnings = []
 
         def _finish_release(status_text: str) -> None:
             channel_1['pending'] = False
             channel_2['pending'] = False
             channel_3['pending'] = False
+            channel_4['pending'] = False
             self._set_status(status_text)
-            self._set_channel_ui(1)
-            self._set_channel_ui(2)
-            self._set_channel_ui(3)
+            for idx in (1, 2, 3, 4):
+                self._set_channel_ui(idx)
+
+        def _maybe_finish_release() -> None:
+            if not (release_done['do2'] and release_done['do4']):
+                return
+            if warnings:
+                _finish_release('Release done with warnings: ' + '; '.join(warnings))
+            else:
+                _finish_release('Release done: neutral grip, suction off, exhaust pulse complete')
 
         def _do2_off() -> None:
             self._send_do(2, 0, _on_do2_off_complete)
@@ -308,37 +450,68 @@ class GripperControlApp:
             _ = result_code
             if success:
                 channel_2['on'] = False
-                _finish_release(f'Release done: DO2 OFF ({detail})')
+                self._set_status(f'Release: DO2 OFF ({detail})')
             else:
-                _finish_release(f'Release warning: DO2 OFF failed ({detail})')
+                warnings.append(f'DO2 OFF failed ({detail})')
+            self._set_channel_ui(2)
+            release_done['do2'] = True
+            _maybe_finish_release()
 
         def _on_do2_on_complete(success: bool, result_code: int, detail: str) -> None:
             _ = result_code
             if success:
                 channel_2['on'] = True
-                self._set_status(f'Release: DO2 ON ({detail}), waiting 100 ms')
+                self._set_status(f'Release: DO2 ON ({detail}), waiting {GRIPPER_OPEN_PULSE_MS} ms')
                 self._set_channel_ui(2)
-                self._root.after(100, _do2_off)
+                self._root.after(GRIPPER_OPEN_PULSE_MS, _do2_off)
             else:
-                _finish_release(f'Release failed: DO2 ON failed ({detail})')
+                warnings.append(f'DO2 ON failed ({detail})')
+                release_done['do2'] = True
+                _maybe_finish_release()
+
+        def _do4_off() -> None:
+            self._send_do(4, 0, _on_do4_off_complete)
+
+        def _on_do4_off_complete(success: bool, result_code: int, detail: str) -> None:
+            _ = result_code
+            if success:
+                channel_4['on'] = False
+                self._set_status(f'Release: DO4 exhaust OFF ({detail})')
+            else:
+                warnings.append(f'DO4 OFF failed ({detail})')
+            self._set_channel_ui(4)
+            release_done['do4'] = True
+            _maybe_finish_release()
+
+        def _on_do4_on_complete(success: bool, result_code: int, detail: str) -> None:
+            _ = result_code
+            if success:
+                channel_4['on'] = True
+                self._set_status(f'Release: DO4 exhaust ON ({detail}), pulsing DO2')
+                self._set_channel_ui(4)
+                self._root.after(SUCTION_EXHAUST_PULSE_MS, _do4_off)
+            else:
+                warnings.append(f'DO4 ON failed ({detail})')
+                release_done['do4'] = True
+            self._send_do(2, 1, _on_do2_on_complete)
 
         def _on_do3_off_complete(success: bool, result_code: int, detail: str) -> None:
             _ = result_code
             if success:
                 channel_3['on'] = False
-                self._set_status(f'Release: DO3 OFF / vent ({detail}), pulsing DO2')
+                self._set_status(f'Release: DO3 suction OFF ({detail}), starting exhaust')
             else:
-                self._set_status(f'Release warning: DO3 OFF / vent failed ({detail}), pulsing DO2')
+                warnings.append(f'DO3 OFF failed ({detail})')
             self._set_channel_ui(3)
-            self._send_do(2, 1, _on_do2_on_complete)
+            self._send_do(4, 1, _on_do4_on_complete)
 
         def _on_do1_off_complete(success: bool, result_code: int, detail: str) -> None:
             _ = result_code
             if success:
                 channel_1['on'] = False
-                self._set_status(f'Release: DO1 OFF ({detail}), switching DO3 to vent')
+                self._set_status(f'Release: DO1 OFF ({detail}), switching suction off')
             else:
-                self._set_status(f'Release warning: DO1 OFF failed ({detail}), switching DO3 to vent')
+                warnings.append(f'DO1 OFF failed ({detail})')
             self._set_channel_ui(1)
             self._send_do(3, 0, _on_do3_off_complete)
 
@@ -429,7 +602,7 @@ class GripperControlApp:
             return
         self._closing = True
 
-        for do_index in (1, 2, 3):
+        for do_index in self._channels:
             self._cancel_auto_off_timer(do_index)
 
         if not self._auto_off_on_exit:

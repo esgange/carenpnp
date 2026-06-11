@@ -7,35 +7,49 @@ This guide is for an arm/client PC that already has:
 - This workspace copied onto the machine with the offline dependency bundle.
 
 After the workspace is copied, the install does not need internet access. The
-remaining system packages come from `third_party/debs`, and Python packages come
-from `third_party/wheels`.
+remaining system packages come from `third_party/debs`. Python wheels under
+`third_party/wheels` are only needed when the PC will run YOLO/SAM2 item
+perception or the RabbitMQ-facing `cell-external-bridge`.
 
 ## What Must Be In The Copied Workspace
 
-A plain git clone is not enough because large payloads are ignored by git. The
-client PC needs the full workspace folder, including:
+A plain git clone is enough for normal source work, but it is not enough for an
+offline client PC because large payloads are ignored by git.
+
+For a core robot-cell client, the copied workspace needs:
+
+```text
+DOBOT_pickn_place/
+  config/
+  src/
+  station_config.example
+  third_party/debs/
+  tools/deps/
+```
+
+For YOLO/SAM2 or the external bridge, also include:
 
 ```text
 DOBOT_pickn_place/
   cell_external_bridge/
-  config/
-  src/
-  station_config
-  third_party/debs/
   third_party/wheels/
   third_party/sam2/
   third_party/yolo/
-  tools/deps/
 ```
 
 Quick check from the workspace root:
 
 ```bash
 test -d third_party/debs
+test -f third_party/manifest.yaml
+```
+
+Full bundle quick checks:
+
+```bash
 test -d third_party/wheels
 test -f third_party/sam2/checkpoints/sam2.1_hiera_tiny.pt
 test -f third_party/yolo/checkpoints/yolo11n-seg.pt
-test -f third_party/manifest.yaml
 ```
 
 ## Prepare The Bundle On The Source PC
@@ -45,8 +59,10 @@ Run this only on the development/staging PC, not on the offline client PC:
 ```bash
 cd /home/erds/DOBOT_pickn_place
 tools/deps/fetch_offline_deps.sh
-tools/deps/verify_offline_env.sh
 ```
+
+For a full YOLO/SAM2 or bridge bundle, also run
+`tools/deps/verify_offline_env.sh` after the bundle is installed.
 
 Create a transfer archive from the parent directory. This keeps the dependency
 payloads but leaves out local build output and the local virtual environment,
@@ -80,7 +96,14 @@ cd ~/DOBOT_pickn_place
 export DOBOT_PICKN_PLACE_ROOT="$PWD"
 ```
 
-Install the frozen local system and Python dependencies:
+Install the frozen local system dependencies for the core robot cell:
+
+```bash
+tools/deps/install_offline_deps.sh --system-only
+```
+
+For a full client PC that will run YOLO/SAM2 or `cell-external-bridge`, install
+both system and Python dependencies:
 
 ```bash
 tools/deps/install_offline_deps.sh
@@ -89,9 +112,9 @@ tools/deps/install_offline_deps.sh
 The script uses local files only:
 
 - `third_party/debs/*.deb` through `dpkg` and `apt-get --no-download`.
-- `third_party/wheels/*` through `pip --no-index`.
-- `third_party/sam2` as an editable local package.
-- `cell_external_bridge` as an editable local package.
+- Optional `third_party/wheels/*` through `pip --no-index`.
+- Optional `third_party/sam2` as an editable local package.
+- Optional `cell_external_bridge` as an editable local package.
 
 Build the ROS 2 workspace:
 
@@ -101,7 +124,7 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
-Verify the install:
+Verify the full offline Python/AI/bridge install:
 
 ```bash
 tools/deps/verify_offline_env.sh
@@ -118,6 +141,7 @@ Offline environment verification passed.
 Edit the station file:
 
 ```bash
+cp -n station_config.example station_config
 nano station_config
 ```
 
@@ -153,7 +177,9 @@ set +a
 ```
 
 `source_third_party_env.sh` sources ROS, the workspace overlay, and
-`third_party/.venv` when they exist.
+`third_party/.venv` when they exist. For core-only terminals, sourcing
+`/opt/ros/humble/setup.bash`, `install/setup.bash`, and `station_config` is
+enough.
 
 ## Run The System
 
@@ -223,7 +249,6 @@ If a ROS package is missing after build:
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 source install/setup.bash
-tools/deps/verify_offline_env.sh
 ```
 
 If `cell-external-bridge` is missing:

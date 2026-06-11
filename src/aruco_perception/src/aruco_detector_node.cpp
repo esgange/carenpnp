@@ -59,6 +59,16 @@ double stampDiffSec(const rclcpp::Time &a, const rclcpp::Time &b)
 {
   return std::fabs((a - b).seconds());
 }
+
+std::string normalizeFrameId(const std::string &frame_id)
+{
+  std::string normalized = frame_id;
+  while (!normalized.empty() && normalized.front() == '/')
+  {
+    normalized.erase(normalized.begin());
+  }
+  return normalized;
+}
 }  // namespace
 
 ArucoDetectorNode::ArucoDetectorNode()
@@ -76,14 +86,16 @@ ArucoDetectorNode::ArucoDetectorNode()
     "detections_topic", "/aruco_detections");
   use_calibration_ = this->declare_parameter<bool>("use_calibration", true);
   publish_static_calibration_tf_ = this->declare_parameter<bool>("publish_static_calibration_tf", true);
+  publish_marker_tfs_ = this->declare_parameter<bool>("publish_marker_tfs", true);
   calibration_file_ = this->declare_parameter<std::string>("calibration_file", "");
   calibration_parent_frame_ = this->declare_parameter<std::string>("calibration_parent_frame", "Link6");
   calibration_child_frame_ = this->declare_parameter<std::string>(
-    "calibration_child_frame", "calibrated_camera_link");
+    "calibration_child_frame", "arm_calibrated_camera_link");
   marker_frame_prefix_ = "aruco_marker";
   const std::string default_camera_frame =
-    use_calibration_ ? calibration_child_frame_ : std::string("camera_link");
+    use_calibration_ ? calibration_child_frame_ : std::string("robot_camera_color_optical_frame");
   camera_frame_id_ = this->declare_parameter<std::string>("camera_frame", default_camera_frame);
+  camera_frame_id_ = normalizeFrameId(camera_frame_id_);
   target_marker_id_ = -1;
   sync_tolerance_sec_ = 0.1;
   depth_average_kernel_ = 5;
@@ -249,13 +261,13 @@ rcl_interfaces::msg::SetParametersResult ArucoDetectorNode::handleParameterUpdat
     const std::string value = parameter.as_string();
     if (name == "camera_frame")
     {
-      if (value.empty())
+      new_camera_frame = normalizeFrameId(value);
+      if (new_camera_frame.empty())
       {
         result.successful = false;
         result.reason = name + " must be non-empty.";
         return result;
       }
-      new_camera_frame = value.front() == '/' ? value.substr(1) : value;
       continue;
     }
     if (value.empty() || value.front() != '/')
@@ -390,6 +402,51 @@ void ArucoDetectorNode::processFrame(const ImageMsg::ConstSharedPtr &color,
   cv_bridge::CvImageConstPtr color_cv;
   cv_bridge::CvImageConstPtr depth_cv;
 
+  const std::string color_frame = normalizeFrameId(color->header.frame_id);
+  const std::string depth_frame = normalizeFrameId(depth->header.frame_id);
+  const std::string info_frame = normalizeFrameId(info->header.frame_id);
+  if (!color_frame.empty() && color_frame != camera_frame_id_)
+  {
+    if (!use_calibration_)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *this->get_clock(), 2000,
+        "Color image frame_id is '%s' but detector camera_frame is '%s'; not publishing ArUco poses.",
+        color_frame.c_str(), camera_frame_id_.c_str());
+      return;
+    }
+    RCLCPP_INFO_ONCE(
+      get_logger(),
+      "Color image frame_id is '%s'; calibrated ArUco poses will be published in '%s'.",
+      color_frame.c_str(), camera_frame_id_.c_str());
+  }
+  const std::string expected_info_frame = color_frame.empty() ? camera_frame_id_ : color_frame;
+  if (!info_frame.empty() && info_frame != expected_info_frame)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "CameraInfo frame_id is '%s' but color/camera frame is '%s'; not publishing ArUco poses.",
+      info_frame.c_str(), expected_info_frame.c_str());
+    return;
+  }
+  if (!depth_frame.empty() && !color_frame.empty() && depth_frame != color_frame)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 5000,
+      "Depth image frame_id is '%s' while color frame_id is '%s'; continuing only because "
+      "depth_registration/align-to-color is expected.",
+      depth_frame.c_str(), color_frame.c_str());
+  }
+  if (!std::isfinite(info->k[0]) || !std::isfinite(info->k[4]) ||
+      info->k[0] <= 1e-6 || info->k[4] <= 1e-6)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "Invalid camera intrinsics fx=%.6f fy=%.6f; not publishing ArUco poses.",
+      info->k[0], info->k[4]);
+    return;
+  }
+
   try
   {
     color_cv = cv_bridge::toCvShare(color, sensor_msgs::image_encodings::BGR8);
@@ -426,6 +483,16 @@ void ArucoDetectorNode::processFrame(const ImageMsg::ConstSharedPtr &color,
   catch (const cv_bridge::Exception &ex)
   {
     RCLCPP_WARN(get_logger(), "Failed to convert depth image: %s", ex.what());
+    return;
+  }
+
+  if (depth_cv->image.cols != color_cv->image.cols || depth_cv->image.rows != color_cv->image.rows)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "Depth image size (%d x %d) does not match color image size (%d x %d); "
+      "depth must be registered to color for ArUco pose estimation.",
+      depth_cv->image.cols, depth_cv->image.rows, color_cv->image.cols, color_cv->image.rows);
     return;
   }
 
@@ -492,24 +559,27 @@ void ArucoDetectorNode::processFrame(const ImageMsg::ConstSharedPtr &color,
     {
       marker_frame += "_" + std::to_string(instance_index);
     }
-    geometry_msgs::msg::TransformStamped tf_msg;
-    tf_msg.header.stamp = pose_msg.header.stamp;
-    tf_msg.header.frame_id = camera_frame_id_;
-    tf_msg.child_frame_id = marker_frame;
-    tf_msg.transform.translation.x = marker.pose.translation().x();
-    tf_msg.transform.translation.y = marker.pose.translation().y();
-    tf_msg.transform.translation.z = marker.pose.translation().z();
+    if (publish_marker_tfs_)
+    {
+      geometry_msgs::msg::TransformStamped tf_msg;
+      tf_msg.header.stamp = pose_msg.header.stamp;
+      tf_msg.header.frame_id = camera_frame_id_;
+      tf_msg.child_frame_id = marker_frame;
+      tf_msg.transform.translation.x = marker.pose.translation().x();
+      tf_msg.transform.translation.y = marker.pose.translation().y();
+      tf_msg.transform.translation.z = marker.pose.translation().z();
 
-    Eigen::Quaterniond q(marker.pose.rotation());
-    q.normalize();
-    tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
-    tf_msg.transform.rotation = tf2::toMsg(tf_q);
-    tf_broadcaster_->sendTransform(tf_msg);
+      Eigen::Quaterniond q(marker.pose.rotation());
+      q.normalize();
+      tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
+      tf_msg.transform.rotation = tf2::toMsg(tf_q);
+      tf_broadcaster_->sendTransform(tf_msg);
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *this->get_clock(), 2000,
-      "Marker %d pose published as %s in frame %s.",
-      marker.id, marker_frame.c_str(), camera_frame_id_.c_str());
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *this->get_clock(), 2000,
+        "Marker %d pose published as %s in frame %s.",
+        marker.id, marker_frame.c_str(), camera_frame_id_.c_str());
+    }
   }
 
   if (publish_viz_)
@@ -546,6 +616,8 @@ void ArucoDetectorNode::publishDetections(const rclcpp::Time &image_stamp,
   msg.poses.reserve(markers.size());
   msg.pixel_centers.reserve(markers.size());
   msg.pixel_corners.reserve(markers.size());
+  msg.camera_centers.reserve(markers.size());
+  msg.camera_corners.reserve(markers.size());
 
   for (const auto &marker : markers)
   {
@@ -579,6 +651,24 @@ void ArucoDetectorNode::publishDetections(const rclcpp::Time &image_stamp,
       corner_msg.points.push_back(point);
     }
     msg.pixel_corners.push_back(corner_msg);
+
+    geometry_msgs::msg::Point camera_center_msg;
+    camera_center_msg.x = marker.center_cam.x();
+    camera_center_msg.y = marker.center_cam.y();
+    camera_center_msg.z = marker.center_cam.z();
+    msg.camera_centers.push_back(camera_center_msg);
+
+    geometry_msgs::msg::Polygon camera_corner_msg;
+    camera_corner_msg.points.reserve(marker.cam_corners.size());
+    for (const auto &corner : marker.cam_corners)
+    {
+      geometry_msgs::msg::Point32 point;
+      point.x = static_cast<float>(corner.x());
+      point.y = static_cast<float>(corner.y());
+      point.z = static_cast<float>(corner.z());
+      camera_corner_msg.points.push_back(point);
+    }
+    msg.camera_corners.push_back(camera_corner_msg);
   }
 
   detections_pub_->publish(msg);

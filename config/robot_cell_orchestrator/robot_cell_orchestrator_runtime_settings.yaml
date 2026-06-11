@@ -1,7 +1,11 @@
 schema_version: 1
+auto_repick_enabled: true
 step_mode_enabled: false
 tray_seek_stability_sec: 1.0
 tray_intercept_x_offset_mm: 0.0
 tray_intercept_y_offset_mm: 0.0
 tray_ee_angle_deg: 0.0
-window_geometry: 1392x1016
+eye_on_hand_calibration_file: /home/erds/DOBOT_pickn_place/calibration/axab_calibration_eyeonhand_03062026.yaml
+eye_to_hand_calibration_file: /home/erds/DOBOT_pickn_place/calibration/axab_calibration_eyetohand_09062026_192.168.20.202.yaml
+platform_calibration_file: /home/erds/DOBOT_pickn_place/calibration/platform_calibration_platform_reference.yaml
+window_geometry: 1321x1010
