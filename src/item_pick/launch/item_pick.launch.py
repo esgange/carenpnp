@@ -44,6 +44,7 @@ FLOAT_PARAMS = (
     'approach_z_up_mm',
     'final_z_up_mm',
     'pick_motion_speed_percent',
+    'suction_settle_sec',
     'command_hysteresis_sec',
     'tool_offset_x_mm',
     'tool_offset_y_mm',

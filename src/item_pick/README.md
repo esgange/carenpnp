@@ -102,7 +102,7 @@ Robot service clients use the DOBOT bringup service root:
 
 Main robot services used:
 
-- `GetPose`
+- `GetPose` (one-shot current TCP read before pick-orientation selection)
 - `GetAngle`
 - `MovJ`
 - `MovL`
@@ -131,7 +131,8 @@ The DI status topic defaults to `/dobot_bringup_ros2/DIStatus_200mS`.
 
 Each item-detect profile requires saved tool teach data before arming. The
 `tool_teach` block inside the item profile stores the Link6/tool offset,
-operator pick heights, and pick move speed for that active item teach.
+operator pick heights, pick move speed, and pick-depth suction settle time for
+that active item teach.
 
 Embedded profile block:
 
@@ -165,13 +166,15 @@ On trigger, the node arms for a fresh `bin_seek_pose`. When the pose arrives, it
    The GUI/launch setting accepts `1..100%` and defaults to `10%`. `DO4`
    exhaust is forced off at the start of descent, and `DO3` suction turns on
    halfway down.
-7. Immediately queues a `MovL` return to the approach pose at the same speed,
-   with the gripper still open and suction active. `RobotMode` must show the
-   queued motion has finished and the controller has been idle for 100 ms.
-8. Reads the first fresh `DI1` sample only after the retract motion is finished.
+7. Waits for the descent to finish, then holds at pick depth with suction active
+   for the configured `0.1..1.0s` suction settle time.
+8. Queues a `MovL` return to the approach pose at the same speed, with the
+   gripper still open and suction active. `RobotMode` must show the queued
+   motion has finished and the controller has been idle for 100 ms.
+9. Reads the first fresh `DI1` sample only after the retract motion is finished.
    When `DI1` is active, the node closes the gripper, queues final Z-up, and
    only then calls `item_detect/seek_complete`.
-9. When that fresh `DI1` sample is inactive, final Z-up is skipped immediately
+10. When that fresh `DI1` sample is inactive, final Z-up is skipped immediately
    and Seek remains ON. With **Auto Repick** enabled, the node automatically
    performs the same 300 ms release pulse as the **Release 300ms** button,
    returns by joint-mode `MovJ` to the saved repick start, re-arms itself, and

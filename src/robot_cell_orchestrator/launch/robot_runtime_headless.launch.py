@@ -52,6 +52,7 @@ OPTIONAL_NODE_PARAMETER_OVERRIDES = {
         'item_standoff_z_mm': ('item_pick.parameters.item_standoff_z_mm', 'item_standoff_z_mm'),
         'item_approach_z_up_mm': ('item_pick.parameters.approach_z_up_mm', 'approach_z_up_mm'),
         'item_final_z_up_mm': ('item_pick.parameters.final_z_up_mm', 'final_z_up_mm'),
+        'item_suction_settle_sec': ('item_pick.parameters.suction_settle_sec', 'suction_settle_sec'),
         'item_repick_start_stability_sec': (
             'item_pick.parameters.repick_start_stability_sec',
             'repick_start_stability_sec',
@@ -855,6 +856,7 @@ def generate_launch_description():
                 'item_standoff_z_mm',
                 'item_approach_z_up_mm',
                 'item_final_z_up_mm',
+                'item_suction_settle_sec',
                 'item_repick_start_stability_sec',
                 'item_command_hysteresis_sec',
                 'tray_detect_params_file',
