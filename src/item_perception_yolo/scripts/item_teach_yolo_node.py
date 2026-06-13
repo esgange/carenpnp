@@ -746,7 +746,6 @@ class ItemTeachYoloNode(Node):
             self.get_logger().warn(f"Could not clear old runtime folder {path}: {exc}")
 
     def reset_runtime_for_item_name(self, new_name: str) -> None:
-        old_session_dir = self.session_dir
         self.clear_prompts(save=False)
         self.item_name = new_name
         self.item_name_edit_buffer = new_name
@@ -782,6 +781,17 @@ class ItemTeachYoloNode(Node):
 
     def save_session(self) -> None:
         active_bin = self.active_bin
+        review_recording_path = (
+            self.video_recordings[self.review_recording_index].path
+            if 0 <= self.review_recording_index < len(self.video_recordings) else None
+        )
+        review_frame = self.current_review_frame_record()
+        review_frame_status = str(review_frame.get("status", "")) if review_frame else ""
+        review_frame_sample_stems = self.review_frame_sample_stems(review_frame)
+        review_recording_entry = (
+            self.video_recordings[self.review_recording_index]
+            if 0 <= self.review_recording_index < len(self.video_recordings) else None
+        )
         data = {
             "item_teach_yolo_session": {
                 "item_name": self.item_name,
@@ -807,11 +817,16 @@ class ItemTeachYoloNode(Node):
                 "video_recording_count": len(self.video_recordings),
                 "recording_active": self.recording_active,
                 "review_mode": self.review_mode,
-                "review_recording": (
-                    str(self.video_recordings[self.review_recording_index].path)
-                    if 0 <= self.review_recording_index < len(self.video_recordings) else ""
-                ),
+                "review_recording": str(review_recording_path) if review_recording_path else "",
+                "review_recording_name": review_recording_path.name if review_recording_path else "",
                 "review_frame_index": self.review_frame_index,
+                "review_frame_status": review_frame_status,
+                "review_frame_sample_stems": review_frame_sample_stems,
+                "review_recording_frame_count": review_recording_entry.frame_count if review_recording_entry else 0,
+                "review_recording_annotated_count": (
+                    review_recording_entry.annotated_count if review_recording_entry else 0
+                ),
+                "review_recording_skipped_count": review_recording_entry.skipped_count if review_recording_entry else 0,
                 "active_bin_name": active_bin.bin_name if active_bin else "",
                 "active_bin_file": str(active_bin.path) if active_bin else "",
                 "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
@@ -1272,6 +1287,105 @@ class ItemTeachYoloNode(Node):
                 -1,
             )
 
+    def recording_index_for_session_ref(self, recording_text: str, recording_name: str = "") -> int:
+        reference_path: Optional[Path] = None
+        if recording_text:
+            try:
+                reference_path = resolve_path(recording_text)
+            except Exception:
+                reference_path = Path(recording_text)
+        recording_name = recording_name.strip()
+        for index, entry in enumerate(self.video_recordings):
+            if reference_path is not None:
+                try:
+                    if entry.path.resolve() == reference_path.resolve():
+                        return index
+                except Exception:
+                    pass
+                if entry.path.name == reference_path.name:
+                    return index
+            if recording_name and entry.path.name == recording_name:
+                return index
+        return -1
+
+    def review_resume_recording_index(self) -> int:
+        in_progress_pending: List[Tuple[float, int]] = []
+        multi_frame_pending: List[Tuple[float, int]] = []
+        pending_only: List[Tuple[float, int]] = []
+        completed_with_progress: List[Tuple[float, int]] = []
+        multi_frame_completed: List[Tuple[float, int]] = []
+        completed_without_progress: List[Tuple[float, int]] = []
+        for index, entry in enumerate(self.video_recordings):
+            try:
+                root = self.read_recording_metadata(entry.path)
+                recording = root.get("recording", {})
+                frames = recording.get("frames", []) if isinstance(recording, dict) else []
+                if not isinstance(frames, list) or not frames:
+                    continue
+                has_pending = any(
+                    isinstance(frame, dict) and frame.get("status", "pending") == "pending"
+                    for frame in frames
+                )
+                has_progress = entry.annotated_count > 0 or entry.skipped_count > 0
+                is_multi_frame = entry.frame_count > 1
+                if has_pending:
+                    if has_progress:
+                        in_progress_pending.append((entry.modified_time, index))
+                    elif is_multi_frame:
+                        multi_frame_pending.append((entry.modified_time, index))
+                    else:
+                        pending_only.append((entry.modified_time, index))
+                elif has_progress:
+                    completed_with_progress.append((entry.modified_time, index))
+                elif is_multi_frame:
+                    multi_frame_completed.append((entry.modified_time, index))
+                else:
+                    completed_without_progress.append((entry.modified_time, index))
+            except Exception as exc:
+                self.get_logger().warn(f"Could not inspect ROI review state {entry.path}: {exc}")
+        if in_progress_pending:
+            return max(in_progress_pending, key=lambda item: item[0])[1]
+        if completed_with_progress:
+            return max(completed_with_progress, key=lambda item: item[0])[1]
+        if multi_frame_pending:
+            return max(multi_frame_pending, key=lambda item: item[0])[1]
+        if multi_frame_completed:
+            return max(multi_frame_completed, key=lambda item: item[0])[1]
+        if pending_only:
+            return min(pending_only, key=lambda item: item[0])[1]
+        if completed_without_progress:
+            return max(completed_without_progress, key=lambda item: item[0])[1]
+        return 0 if self.video_recordings else -1
+
+    def restore_video_review_from_session(self, params: Dict) -> bool:
+        review_requested = as_bool(params.get("review_mode", False))
+        recording_text = str(params.get("review_recording", "")).strip()
+        recording_name = str(params.get("review_recording_name", "")).strip()
+        if not review_requested and not recording_text and not recording_name:
+            return False
+        index = self.recording_index_for_session_ref(recording_text, recording_name)
+        if index < 0:
+            return False
+        try:
+            frame_index = max(0, int(params.get("review_frame_index", 0)))
+        except (TypeError, ValueError):
+            frame_index = 0
+        self.enter_video_review(index, frame_index=frame_index)
+        return self.review_mode
+
+    def resume_existing_video_review(self) -> bool:
+        self.refresh_video_recordings()
+        if not self.video_recordings:
+            return False
+        index = self.review_resume_recording_index()
+        if index < 0:
+            return False
+        entry = self.video_recordings[index]
+        if entry.frame_count <= 1 and entry.annotated_count <= 0 and entry.skipped_count <= 0:
+            return False
+        self.enter_video_review(index)
+        return self.review_mode
+
     def select_review_image_path(self) -> Optional[Path]:
         initial_dir = self.videos_dir if self.videos_dir.exists() else self.session_dir
         try:
@@ -1435,6 +1549,15 @@ class ItemTeachYoloNode(Node):
                         frame_record["raw_file"] = str(raw_path)
                     if isinstance(source_rect, list):
                         frame_record["source_roi_crop_rect"] = list(source_rect[:4])
+                    for key in (
+                        "status",
+                        "updated_at",
+                        "sample_stem",
+                        "sample_stems",
+                        "sample_count",
+                    ):
+                        if key in source_frame:
+                            frame_record[key] = source_frame[key]
             except Exception as exc:
                 self.get_logger().warn(f"Could not read ROI image metadata {metadata_path}: {exc}")
         return frame_record
@@ -1652,6 +1775,29 @@ class ItemTeachYoloNode(Node):
         if self.training_thread is not None and self.training_thread.is_alive():
             self.status = "Cannot review images while training"
             return
+        if self.resume_existing_video_review():
+            return
+        if self.videos_dir.exists():
+            has_session_images = any(
+                path.is_file()
+                and path.suffix.lower() in IMAGE_FILE_SUFFIXES
+                and not self.is_raw_capture_image(path)
+                for path in self.videos_dir.iterdir()
+            )
+            if has_session_images:
+                review_path = self.import_review_folder(self.videos_dir)
+                if review_path is not None:
+                    self.refresh_video_recordings()
+                    review_index = next(
+                        (
+                            index for index, entry in enumerate(self.video_recordings)
+                            if entry.path.resolve() == review_path.resolve()
+                        ),
+                        -1,
+                    )
+                    if review_index >= 0:
+                        self.enter_video_review(review_index)
+                        return
         selected_folder = self.select_review_image_folder()
         if selected_folder is None:
             self.status = "Image folder review selection canceled"
@@ -1981,7 +2127,7 @@ class ItemTeachYoloNode(Node):
         finally:
             cap.release()
 
-    def enter_video_review(self, index: int = 0) -> None:
+    def enter_video_review(self, index: int = 0, frame_index: Optional[int] = None) -> None:
         if self.recording_active:
             self.status = "Stop recording before reviewing"
             return
@@ -1996,14 +2142,15 @@ class ItemTeachYoloNode(Node):
             self.review_recording_meta = self.read_recording_metadata(recording_path)
             self.review_mode = True
             frames = self.review_frame_records()
-            pending_index = next(
-                (
-                    i for i, frame in enumerate(frames)
-                    if isinstance(frame, dict) and frame.get("status", "pending") == "pending"
-                ),
-                0,
-            )
-            self.load_review_frame(pending_index, clear_prompts=True)
+            if frame_index is None:
+                frame_index = next(
+                    (
+                        i for i, frame in enumerate(frames)
+                        if isinstance(frame, dict) and frame.get("status", "pending") == "pending"
+                    ),
+                    0,
+                )
+            self.load_review_frame(frame_index, clear_prompts=True)
         except Exception as exc:
             self.status = f"Could not open ROI image review: {exc}"
             self.get_logger().warn(self.status)
@@ -2045,23 +2192,52 @@ class ItemTeachYoloNode(Node):
     def has_any_prompt(self) -> bool:
         return bool(self.positive_points or self.negative_points)
 
-    def review_frame_sample_count(self, frame: Optional[Dict] = None) -> int:
+    def review_frame_sample_stems(self, frame: Optional[Dict] = None) -> List[str]:
         frame = frame if frame is not None else self.current_review_frame_record()
         if not isinstance(frame, dict):
-            return 0
-        stems = []
+            return []
+        stems: List[str] = []
         raw_stems = frame.get("sample_stems", [])
         if isinstance(raw_stems, list):
             stems.extend(str(stem).strip() for stem in raw_stems if str(stem).strip())
         sample_stem = str(frame.get("sample_stem", "")).strip()
         if sample_stem and sample_stem not in stems:
             stems.append(sample_stem)
+        return stems
+
+    def review_frame_sample_count(self, frame: Optional[Dict] = None) -> int:
+        frame = frame if frame is not None else self.current_review_frame_record()
+        if not isinstance(frame, dict):
+            return 0
+        stems = self.review_frame_sample_stems(frame)
         if stems:
             return len(stems)
         try:
             return max(0, int(frame.get("sample_count", 0)))
         except (TypeError, ValueError):
             return 0
+
+    def load_saved_review_mask(self, frame: Dict) -> str:
+        if str(frame.get("status", "pending")) != "annotated":
+            return ""
+        if self.frozen_crop_bgr is None:
+            return ""
+        stems = self.review_frame_sample_stems(frame)
+        if not stems:
+            return ""
+        for stem in reversed(stems):
+            mask_path = self.masks_dir / f"{stem}.png"
+            if not mask_path.exists():
+                continue
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                continue
+            crop_h, crop_w = self.frozen_crop_bgr.shape[:2]
+            if mask.shape[:2] != (crop_h, crop_w):
+                mask = cv2.resize(mask, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
+            self.current_mask = (mask > 0).astype(np.uint8) * 255
+            return f" | loaded mask {stem}"
+        return f" | {len(stems)} saved sample(s)"
 
     def load_review_frame(self, index: int, clear_prompts: bool = True) -> None:
         frames = self.review_frame_records()
@@ -2104,7 +2280,8 @@ class ItemTeachYoloNode(Node):
             self.current_mask = None
         self.sam2_image_key = None
         self.prediction_dirty = False
-        self.status = self.review_status_label()
+        restored_annotation = self.load_saved_review_mask(frame) if clear_prompts else ""
+        self.status = f"{self.review_status_label()}{restored_annotation}"
         self.save_session()
 
     def review_previous_frame(self) -> None:
@@ -2435,13 +2612,24 @@ class ItemTeachYoloNode(Node):
                 return
 
             old_session_dir = self.session_dir
+            review_was_active = self.review_mode
+            review_recording_path = self.current_review_recording_path()
+            review_recording_name = review_recording_path.name if review_recording_path else ""
+            review_frame_index = self.review_frame_index
             target = self.unique_saved_session_dir()
             shutil.copytree(old_session_dir, target)
             self.session_dir = target
             self.configure_session_storage()
             self.write_dataset_yaml()
             self.refresh_video_recordings()
-            self.reset_video_review_state(clear_prompts=True)
+            if review_was_active and review_recording_name:
+                review_index = self.recording_index_for_session_ref("", review_recording_name)
+                if review_index >= 0:
+                    self.enter_video_review(review_index, frame_index=review_frame_index)
+                else:
+                    self.reset_video_review_state(clear_prompts=True)
+            else:
+                self.reset_video_review_state(clear_prompts=True)
             self.save_session()
             self.refresh_saved_sessions()
             self.status = f"Saved session: {target.name}"
@@ -2491,7 +2679,6 @@ class ItemTeachYoloNode(Node):
                 self.status = "Load session failed: missing session metadata"
                 return
 
-            old_session_dir = self.session_dir
             self.clear_prompts(save=False)
             self.session_dir = resolved_path
             self.configure_session_storage()
@@ -2545,7 +2732,9 @@ class ItemTeachYoloNode(Node):
             self.recording_video_path = None
             self.recording_frame_count = 0
             self.refresh_video_recordings()
-            self.reset_video_review_state(clear_prompts=True)
+            review_restored = self.restore_video_review_from_session(params)
+            if not review_restored:
+                self.reset_video_review_state(clear_prompts=True)
             self.write_dataset_yaml()
             self.save_session()
             self.request_teach_joint_snapshot("loaded teach")
@@ -2553,7 +2742,8 @@ class ItemTeachYoloNode(Node):
             self.load_session_dropdown_open = False
             self.status = (
                 f"Loaded session: {self.item_name or self.session_dir.name} | "
-                f"{self.sample_count_label()} | updating teach position")
+                f"{self.sample_count_label()} | updating teach position"
+                f"{' | review restored' if review_restored else ''}")
         except Exception as exc:
             self.status = f"Load session failed: {exc}"
             self.get_logger().warn(self.status)
@@ -3938,7 +4128,13 @@ class ItemTeachYoloNode(Node):
             self.draw_button(canvas, "clear_prompts", (x, y, 132, BUTTON_HEIGHT),
                              "Clear Prompt", self.has_any_prompt() or self.current_mask is not None, role="danger")
             x += 142
-            save_enabled = self.has_item_name() and (self.current_mask is not None or self.has_any_prompt())
+            frame = self.current_review_frame_record()
+            frame_status = str(frame.get("status", "pending")) if frame else "pending"
+            save_enabled = (
+                self.has_item_name()
+                and (self.current_mask is not None or self.has_any_prompt())
+                and (frame_status != "annotated" or self.has_any_prompt())
+            )
             self.draw_button(canvas, "save_review_frame", (x, y, 176, BUTTON_HEIGHT),
                              "Save Sample", save_enabled, role="save")
             x += 186

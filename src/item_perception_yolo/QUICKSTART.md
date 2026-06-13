@@ -43,6 +43,9 @@ Teach flow:
 
 For stable backgrounds, keep background images around 10-20% of the total
 training images. `Save BG` writes an empty YOLO label file for that ROI crop.
+Use `Save Session` to keep both the generated dataset and ROI review progress.
+Reloaded sessions resume saved ROI captures with annotated/skipped frame status
+intact, and annotated frames show their saved mask overlay.
 
 The final YOLO teach bundle is written to:
 

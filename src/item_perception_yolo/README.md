@@ -139,6 +139,12 @@ Background samples are saved with empty YOLO label files. Keep them around
 Use `Save Session` before leaving a weak or unfinished training run if you want
 to continue it later. `Load Session` lists saved sessions by item name and
 sample counts, and its dropdown also includes a delete action for saved sessions.
+Saved sessions keep ROI review progress as well: each ROI frame's pending,
+annotated, or skipped status is stored in the recording metadata, and annotated
+frames reload their saved sample mask overlay when reviewed again. When a saved
+session already has a grouped review or annotated frames, `Review Images`
+resumes that progress; otherwise it groups the session's captured ROI images and
+keeps any sidecar frame status instead of importing them as all-pending.
 
 ## Generated Files
 
