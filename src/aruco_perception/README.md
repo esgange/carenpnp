@@ -74,13 +74,14 @@ ros2 launch aruco_perception aruco_perception.launch.py \
 
 ## Calibration Behavior
 
-- With `use_calibration=true`, launch loads the newest non-empty current-robot YAML in
-  `WORKSPACE_ROOT/calibration` unless `calibration_file` is set.
+- With `use_calibration=true`, launch loads the newest non-empty YAML tagged for
+  the current robot IP in `WORKSPACE_ROOT/calibration` unless
+  `calibration_file` is set.
 - For robot IP `192.168.200.1`, automatic selection is disabled and launch opens
   a filtered chooser. Headless and direct node starts must provide
   `calibration_file` explicitly.
-- If calibration is enabled and no usable file exists, launch fails early with a
-  clear error.
+- If calibration is enabled and no exact-IP file exists, launch fails early with
+  a clear error and prompts for an explicit file.
 - The loaded YAML is expected to include `transform.rotation` and
   `transform.translation`.
 - When calibration is enabled, marker poses are published in

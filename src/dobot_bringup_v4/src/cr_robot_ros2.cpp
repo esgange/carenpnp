@@ -645,6 +645,11 @@ bool CRRobotRos2::isConnected() const
     return commander_->isConnected();
 }
 
+uint16_t CRRobotRos2::getRobotMode() const
+{
+    return commander_->getRobotMode();
+}
+
 void CRRobotRos2::getToolVectorActual(double *val)
 {
     commander_->getToolVectorActual(val);

@@ -111,8 +111,9 @@ Defaults:
 | `child_frame` | `arm_calibrated_camera_link` |
 | `calibration_dir` | `WORKSPACE_ROOT/calibration` |
 
-If calibration is enabled and no usable YAML is available, launch shows an error
-dialog and exits.
+If calibration is enabled and no usable exact-IP YAML is available, launch shows
+an error dialog and exits. Auto-discovery only accepts calibration files tagged
+for the current robot IP.
 
 For robot IP `192.168.200.1`, `tray_detect.launch.py` does not auto-select an
 eye-on-hand file. It opens a filtered chooser, or requires

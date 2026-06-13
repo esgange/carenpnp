@@ -127,21 +127,11 @@ def sanitize_filename_token(value: str) -> str:
   return "".join(token).strip("_")
 
 
-def looks_like_ip_token(token: str) -> bool:
-  return "." in token and all(ch.isdigit() or ch == "." for ch in token)
-
-
-def classify_robot_file(path: Path, robot_ip_address: str) -> str:
+def calibration_matches_robot_ip(path: Path, robot_ip_address: str) -> bool:
   ip_token = sanitize_filename_token(robot_ip_address)
   if not ip_token:
-    return "legacy"
-  stem = path.stem
-  if stem.endswith(f"_{ip_token}"):
-    return "exact"
-  last_token = stem.rsplit("_", 1)[-1]
-  if looks_like_ip_token(last_token):
-    return "different"
-  return "legacy"
+    return False
+  return path.stem.endswith(f"_{ip_token}")
 
 
 def _ros_domain_action():
@@ -256,11 +246,18 @@ def launch_setup(context, *args, **kwargs):
           robot_ip_address,
         )
       if not selected_file:
-        msg = (
-          f"[aruco_perception.launch] No non-empty calibration YAML matching {calibration_file_prefix!r} "
-          f"for robot IP {robot_ip_address or 'auto'} found in "
-          f"{calibration_dir}. Provide one via calibration_file:=<path>."
-        )
+        if robot_ip_address:
+          msg = (
+            f"[aruco_perception.launch] No non-empty calibration YAML matching "
+            f"{calibration_file_prefix!r} and tagged for robot IP {robot_ip_address} "
+            f"found in {calibration_dir}. Provide one via calibration_file:=<path>."
+          )
+        else:
+          msg = (
+            "[aruco_perception.launch] No robot IP was resolved for calibration "
+            "auto-selection. Provide robot_ip_address:=<ip> or "
+            "calibration_file:=<path>."
+          )
         show_missing_calibration_dialog(msg)
         raise RuntimeError(
           msg
@@ -303,6 +300,10 @@ def launch_setup(context, *args, **kwargs):
 
 def find_latest_calibration(calibration_dir: str, filename_prefix: str, robot_ip_address: str = "") -> str:
   try:
+    robot_ip_address = str(robot_ip_address or "").strip()
+    if not robot_ip_address:
+      print("[aruco_perception.launch] Robot IP is not set; cannot auto-select an exact calibration file.")
+      return ""
     base = Path(calibration_dir).expanduser()
     if not base.exists() or not base.is_dir():
       return ""
@@ -312,8 +313,7 @@ def find_latest_calibration(calibration_dir: str, filename_prefix: str, robot_ip
         continue
       name = path.name
       if name.startswith(filename_prefix):
-        classification = classify_robot_file(path, robot_ip_address)
-        if classification == "exact":
+        if calibration_matches_robot_ip(path, robot_ip_address):
           exact_files.append(path)
     if not exact_files:
       return ""

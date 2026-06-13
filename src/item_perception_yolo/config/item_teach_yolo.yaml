@@ -1,7 +1,7 @@
 item_teach_yolo:
   ros__parameters:
     color_topic: /bin_camera/color/image_raw
-    joint_states_topic: /joint_states_robot
+    motion_service_root: /dobot_bringup_ros2/srv
     item_name: ""
     saved_sessions_root: config/item_perception_yolo/item_teach_yolo_saved_sessions
     depth_topic: /bin_camera/depth/image_raw

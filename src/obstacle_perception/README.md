@@ -45,12 +45,13 @@ ros2 launch obstacle_perception obstacle_perception.launch.py \
 The launch file starts:
 
 - `aruco_perception.launch.py` with calibration enabled, so
-  `Link6 -> arm_calibrated_camera_link` is published from the latest calibration;
+  `Link6 -> arm_calibrated_camera_link` is published from the latest exact-IP
+  calibration;
 - `obstacle_perception_node` for live obstacles;
 - `obstacle_memory_node` when `enable_memory=true`.
 
-If calibration is enabled and no usable calibration YAML exists, launch fails
-early with a clear error.
+If calibration is enabled and no usable exact-IP calibration YAML exists, launch
+fails early with a clear error.
 
 Because this launch includes `aruco_perception`, robot IP `192.168.200.1`
 requires the operator to choose the eye-on-hand calibration. Pass

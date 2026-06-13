@@ -69,8 +69,11 @@ int main(int argc, char *argv[])
     tool_vector_pub->publish(tool_vector_actual_msg);
 
     // publish robot status
+    const uint16_t robot_mode = robot->getRobotMode();
     robot_status_msg.is_enable = robot->isEnable();
     robot_status_msg.is_connected = robot->isConnected();
+    robot_status_msg.robot_mode = static_cast<int32_t>(robot_mode);
+    robot_status_msg.is_idle = robot_mode == 5;
     robot_status_pub->publish(robot_status_msg);
     rclcpp::spin_some(robot);
     rate.sleep();

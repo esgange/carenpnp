@@ -147,5 +147,7 @@ Repo cleanup policy
 Do not delete user calibration/teach/runtime files during cleanup unless the
 operator explicitly asks for a reset. Do not commit build/install/log outputs,
 third_party binary payloads, Python caches, ROS bags, model runs, or local
-station secrets. Keep package-specific operator details in the package README
-that owns the motion or perception behavior.
+station secrets. `NoMachine/debs/` is the one intentional remote-access
+installer cache; keep its SHA256SUMS in sync when refreshing it. Keep
+package-specific operator details in the package README that owns the motion or
+perception behavior.

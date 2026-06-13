@@ -145,7 +145,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "calibration_file",
                 default_value="",
-                description="Optional explicit calibration YAML; empty means auto-discover newest eye-on-hand calibration in calibration_dir.",
+                description="Optional explicit calibration YAML; empty means auto-discover newest exact-IP eye-on-hand calibration in calibration_dir.",
             ),
             DeclareLaunchArgument(
                 "robot_ip_address",

@@ -56,7 +56,7 @@ flowchart LR
     Bringup -->|"/joint_states_robot"| RSP
     RSP -->|"/tf"| RViz
     Bringup -->|"DIStatus"| ItemPick
-    Orchestrator -. "GetAngle" .-> Bringup
+    Bringup -->|"RobotStatus"| Orchestrator
 
     ItemDetect -->|"bin_seek_pose + selected_profile"| ItemPick
     ItemDetect -->|"bin_overlay"| Orchestrator
@@ -107,7 +107,7 @@ Published state:
 | Topic | Main consumers |
 | --- | --- |
 | `/joint_states_robot` | `robot_state_publisher`, `motion_debug`, YOLO teach |
-| `dobot_msgs_v4/msg/RobotStatus` | `motion_debug` |
+| `dobot_msgs_v4/msg/RobotStatus` | `robot_cell_orchestrator`, `motion_debug` |
 | `dobot_msgs_v4/msg/ToolVectorActual` | calibration, bin teach, movement calibration, motion debug |
 | `/dobot_bringup_ros2/msg/FeedInfo` | diagnostics |
 | `/dobot_bringup_ros2/DIStatus_200mS` | `item_pick`, `gripper_control` |
@@ -259,7 +259,7 @@ flowchart TD
 
 ## 5. Teaching Nodes
 
-### `bin_teach` (classic and YOLO packages)
+### `bin_teach` (classic item perception package)
 
 ```mermaid
 flowchart TD
@@ -306,7 +306,7 @@ flowchart TD
     Prompt["SAM2 point/box prompts"]
     Samples["Generate YOLO segmentation samples"]
     Train["Train YOLO segmentation model"]
-    Export["Save best.pt, best.onnx, and item YAML"]
+    Export["Save best.onnx and item YAML"]
 
     Camera --> Prompt
     BinProfile -.-> Prompt
@@ -528,8 +528,7 @@ Orchestrator ROS interfaces:
 | Service | `robot_cell_orchestrator/start_online` |
 | Service | `robot_cell_orchestrator/place_online` |
 | Publisher | `robot_cell_orchestrator/events` |
-| Subscribers | `bin_overlay`, `tray_overlay` |
-| Robot client | `/dobot_bringup_ros2/srv/GetAngle` |
+| Subscribers | `dobot_msgs_v4/msg/RobotStatus`, `bin_overlay`, `tray_overlay` |
 
 `robot_runtime_headless.launch.py` is a launch composition, not a ROS node. It
 can start the configured camera drivers, `item_detect`, `item_pick`,
@@ -642,7 +641,6 @@ flowchart LR
 | `item_perception` | Bin teaching | `bin_teach` |
 | `item_perception` | Classic item teaching | `item_teach` |
 | `item_perception` | Classic item detection | `item_detect` |
-| `item_perception_yolo` | Bin teaching | `bin_teach` |
 | `item_perception_yolo` | SAM2/YOLO teaching | `item_teach_yolo_node.py` |
 | `item_perception_yolo` | YOLO runtime detection | `item_detect_yolo_node.py` |
 | `tray_perception` | Tray teaching | `tray_teach_node` |

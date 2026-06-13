@@ -23,7 +23,7 @@ working directory, the running source/launch file, or colcon environment paths.
 | --- | --- | --- |
 | Camera calibration | `WORKSPACE_ROOT/calibration` | `camera_calibration` |
 | Platform calibration | `WORKSPACE_ROOT/calibration` | `platform_calibration` |
-| Bin teach files | `WORKSPACE_ROOT/teach/bin_teach` | `item_perception/bin_teach`, `item_perception_yolo/bin_teach` |
+| Bin teach files | `WORKSPACE_ROOT/teach/bin_teach` | `item_perception/bin_teach` |
 | Item teach profiles | `WORKSPACE_ROOT/teach/item_teach` | `item_perception/item_teach`, `item_pick` tool teach |
 | Item runtime state | `WORKSPACE_ROOT/config/item_perception` | `item_perception/item_detect`, `item_pick`, `robot_cell_orchestrator` |
 | YOLO item final bundles | `WORKSPACE_ROOT/teach/item_teach_yolo` | `item_perception_yolo/item_teach_yolo_node.py`, `item_detect_yolo_node.py` |
@@ -124,13 +124,10 @@ Executable: `item_detect`
 
 ### `item_perception_yolo`
 
-Installed C++ executable: `bin_teach`
-
-- The C++ `bin_teach` node writes bin teach YAMLs with the same file behavior as
-  `item_perception/bin_teach`.
-- The current package no longer installs a classic C++ `item_teach` or
-  `item_detect` executable. Use `item_perception` for the classic item workflow,
-  and use the Python YOLO teach/detect nodes below for the YOLO/SAM2 workflow.
+The YOLO package consumes bin teach YAMLs from `WORKSPACE_ROOT/teach/bin_teach`
+but does not install its own `bin_teach` executable or launch file. Use
+`item_perception/bin_teach` to teach or update bin ROI/depth-plane profiles, and
+use the Python YOLO teach/detect nodes below for the YOLO/SAM2 workflow.
 - `item_perception_yolo/launch/item_detect_yolo.launch.py` launches the Python
   YOLO detect node.
 
@@ -148,7 +145,7 @@ Executable: `item_teach_yolo_node.py`
   Ultralytics.
 - Promotion creates a final detector-ready teach bundle under
   `WORKSPACE_ROOT/teach/item_teach_yolo/item_<item>[_bin_<bin>]_<ddmmyyyy>`.
-- The final bundle contains `best.pt`, `best.onnx`, and
+- The final bundle contains `best.onnx` and
   `item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml`.
 - Saved teach sessions are stored under
   `WORKSPACE_ROOT/config/item_perception_yolo/item_teach_yolo_saved_sessions`.
@@ -324,7 +321,7 @@ Executable: `robot_cell_orchestrator_gui`
 | Eye-on-hand camera calibration | `calibration/axab_calibration_eyeonhand_<ddmmyyyy>.yaml` | `camera_calibration/eye_on_hand_calibrator` |
 | Eye-to-hand camera calibration | `calibration/axab_calibration_eyetohand_<ddmmyyyy>.yaml` | `camera_calibration/eye_on_hand_calibrator` |
 | Platform calibration | `calibration/platform_calibration_<name>_<ddmmyyyy>_<robot_ip>.yaml` | `platform_calibration` |
-| Bin teach | `teach/bin_teach/bin_<bin>_<ddmmyyyy>.yaml` | `item_perception/bin_teach`, `item_perception_yolo/bin_teach` |
+| Bin teach | `teach/bin_teach/bin_<bin>_<ddmmyyyy>.yaml` | `item_perception/bin_teach` |
 | Item teach/profile | `teach/item_teach/item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml` | `item_perception/item_teach` |
 | Item YOLO teach bundle | `teach/item_teach_yolo/item_<item>[_bin_<bin>]_<ddmmyyyy>/...` | `item_perception_yolo/item_teach_yolo_node.py` |
 | Tray teach/profile | `teach/tray_teach/tray_<tray>_<ddmmyyyy>.yaml` | `tray_perception/tray_teach_node` |
@@ -360,8 +357,8 @@ moved, because some entries point to trained model bundles and dataset snapshots
   cleanup safer.
 - `debug files/robot_cell_orchestrator_movement_deltas` is debug-only and stores one text
   file per robot cycle, updated as movement tracker events arrive.
-- `item_perception_yolo` shares the classic bin-teach path through its C++
-  `bin_teach` executable, but its final YOLO item bundles live under
+- `item_perception_yolo` reads classic bin-teach YAMLs from `teach/bin_teach`,
+  but its final YOLO item bundles live under
   `teach/item_teach_yolo` and do not write classic item profiles under
   `teach/item_teach`.
 - `item_pick` now stores tool teach data inside each dated item profile. Legacy

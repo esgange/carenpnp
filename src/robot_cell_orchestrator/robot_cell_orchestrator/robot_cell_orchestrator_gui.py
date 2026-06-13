@@ -2,7 +2,6 @@ import json
 import ipaddress
 import os
 import queue
-import re
 import shlex
 import shutil
 import signal
@@ -20,7 +19,8 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from dobot_msgs_v4.srv import GetAngle, LoadOnlineProgram, TrayInterceptStart
+from dobot_msgs_v4.msg import RobotStatus
+from dobot_msgs_v4.srv import LoadOnlineProgram, TrayInterceptStart
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -49,18 +49,17 @@ ONLINE_START_SERVICE_DEFAULT = 'robot_cell_orchestrator/start_online'
 ONLINE_LOAD_PROGRAM_SERVICE_DEFAULT = 'robot_cell_orchestrator/load_online_program'
 ONLINE_VALIDATE_SERVICE_DEFAULT = 'robot_cell_orchestrator/validate_online_program'
 ONLINE_PLACE_SERVICE_DEFAULT = 'robot_cell_orchestrator/place_online'
+NOMACHINE_SERVICE_DISPLAY = './NoMachine/remote_ready_ubuntu22.sh'
 PHASE_EVENT_TOPIC_DEFAULT = 'robot_cell_orchestrator/events'
-MOTION_SERVICE_ROOT_DEFAULT = '/dobot_bringup_ros2/srv'
+ROBOT_STATUS_TOPIC_DEFAULT = 'dobot_msgs_v4/msg/RobotStatus'
 BIN_DETECT_OVERLAY_TOPIC_DEFAULT = 'bin_overlay'
 TRAY_DETECT_OVERLAY_TOPIC_DEFAULT = 'tray_overlay'
 
-ROBOT_JOINT_MOVE_EPS_DEG = 1.0
 ROBOT_STABILITY_SEC_DEFAULT = 0.5
 TIMING_SLIDER_MIN_SEC = 0.1
 TIMING_SLIDER_MAX_SEC = 1.0
 TIMING_SLIDER_STEP_SEC = 0.1
-ROBOT_JOINT_STALE_SEC = 1.0
-ROBOT_JOINT_POLL_SEC = 0.1
+ROBOT_STATUS_STALE_SEC = 1.0
 ROBOT_MONITOR_TIMEOUT_SEC = 30.0
 SEEK_STATUS_POLL_SEC = 0.1
 SEEK_STATUS_RESPONSE_TIMEOUT_SEC = 0.2
@@ -84,6 +83,7 @@ PROCESS_SCAN_MS = 1000
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
 PROCESS_STOP_TIMEOUT_SEC = 3.0
 PROCESS_TERMINAL_PID_WAIT_SEC = 2.0
+NOMACHINE_STATUS_CACHE_SEC = 5.0
 RUNNING_BUTTON_BG = '#d9ead3'
 CAMERA_VIEW_WIDTH = 720
 CAMERA_VIEW_HEIGHT = 405
@@ -93,6 +93,14 @@ CAMERA_WINDOW_DEFAULT_WIDTH = CAMERA_VIEW_WIDTH + 70
 CAMERA_WINDOW_DEFAULT_HEIGHT = (CAMERA_VIEW_HEIGHT * 2) + 150
 CAMERA_VIEW_REFRESH_MS = 120
 CAMERA_VIEW_STALE_SEC = 2.0
+
+ROBOT_MODE_ENABLED = 5
+ROBOT_MODE_RUNNING = 7
+ROBOT_MODE_ERROR = 9
+ROBOT_MODE_PAUSED = 10
+ROBOT_MODE_JOGGING = 11
+ROBOT_MODE_ACTIVE_CODES = (ROBOT_MODE_RUNNING, ROBOT_MODE_JOGGING)
+ROBOT_MODE_FAILURE_CODES = (ROBOT_MODE_ERROR, ROBOT_MODE_PAUSED)
 
 MODE_OFFLINE = 'offline'
 MODE_ONLINE = 'online'
@@ -717,13 +725,10 @@ class RobotCellOrchestratorNode(Node):
             'phase_event_topic',
             PHASE_EVENT_TOPIC_DEFAULT,
         )
-        self.motion_service_root = self._declare_name_parameter(
-            'motion_service_root',
-            MOTION_SERVICE_ROOT_DEFAULT,
-        ).rstrip('/') or MOTION_SERVICE_ROOT_DEFAULT
-        self.robot_joint_service = f'{self.motion_service_root}/GetAngle'
-        self._joint_angle_request_in_flight = False
-        self._joint_angle_warning_logged = False
+        self.robot_status_topic = self._declare_name_parameter(
+            'robot_status_topic',
+            ROBOT_STATUS_TOPIC_DEFAULT,
+        )
         self.bin_detect_overlay_topic = self._declare_name_parameter(
             'bin_detect_overlay_topic',
             BIN_DETECT_OVERLAY_TOPIC_DEFAULT,
@@ -734,7 +739,6 @@ class RobotCellOrchestratorNode(Node):
         )
         self._tray_arm_client = self.create_client(TrayInterceptStart, self.tray_arm_service)
         self._item_auto_repick_client = self.create_client(SetBool, self.item_auto_repick_service)
-        self._get_angle_client = self.create_client(GetAngle, self.robot_joint_service)
 
         self._trigger_clients: dict[str, tuple[str, object]] = {
             'item_go_to_teach': (self.item_go_to_teach_service, self.create_client(Trigger, self.item_go_to_teach_service)),
@@ -750,6 +754,8 @@ class RobotCellOrchestratorNode(Node):
         }
         self._startup_service_result: TriggerResult | None = None
         self._startup_service_lock = threading.Lock()
+        self._nomachine_status_checked_at = 0.0
+        self._nomachine_status_ready = False
         self._online_load_program_handler: Callable[[OnlineProgramLoad], OnlineProgramLoadResult] | None = None
         self._online_load_program_handler_lock = threading.Lock()
         self._online_start_handler: Callable[[], TriggerResult] | None = None
@@ -773,16 +779,23 @@ class RobotCellOrchestratorNode(Node):
         self._phase_event_pub = self.create_publisher(String, self.phase_event_topic, 10)
         self._phase_event_seq = 0
         self._phase_event_lock = threading.Lock()
-        self._joint_condition = threading.Condition()
-        self._joint_seq = 0
-        self._latest_joint_angles: tuple[float, float, float, float, float, float] | None = None
-        self._last_joint_receive_time = 0.0
+        self._robot_status_condition = threading.Condition()
+        self._robot_status_seq = 0
+        self._latest_robot_mode: int | None = None
+        self._latest_robot_idle = False
+        self._latest_robot_connected = False
+        self._last_robot_status_receive_time = 0.0
         self._camera_bridge = CvBridge()
         self._camera_frame_lock = threading.Lock()
         self._camera_frames: dict[str, CameraViewFrame] = {}
         self._camera_error_log_time: dict[str, float] = {}
 
-        self._joint_angle_timer = self.create_timer(ROBOT_JOINT_POLL_SEC, self._poll_joint_angles)
+        self.create_subscription(
+            RobotStatus,
+            self.robot_status_topic,
+            self._robot_status_callback,
+            10,
+        )
         self.create_subscription(
             Image,
             self.bin_detect_overlay_topic,
@@ -899,13 +912,13 @@ class RobotCellOrchestratorNode(Node):
     def _required_service_clients(self) -> list[tuple[str, object]]:
         return [
             *self._trigger_clients.values(),
-            (self.robot_joint_service, self._get_angle_client),
             (self.item_auto_repick_service, self._item_auto_repick_client),
             (self.tray_arm_service, self._tray_arm_client),
         ]
 
     def service_names(self) -> list[tuple[str, str]]:
         return [
+            ('NoMachine Remote Access', NOMACHINE_SERVICE_DISPLAY),
             ('Item Go Teach', self.item_go_to_teach_service),
             ('Item Pick Arm', self.item_arm_service),
             ('Item Pick Arm Status', self.item_arm_status_service),
@@ -922,11 +935,11 @@ class RobotCellOrchestratorNode(Node):
             ('Online Start', self.online_start_service),
             ('Online Validate', self.online_validate_service),
             ('Online Place', self.online_place_service),
-            ('Robot Joint Angles', self.robot_joint_service),
         ]
 
     def topic_names(self) -> list[tuple[str, str]]:
         return [
+            ('Robot Status', self.robot_status_topic),
             ('Bin Detect Overlay', self.bin_detect_overlay_topic),
             ('Tray Detect Overlay', self.tray_detect_overlay_topic),
         ]
@@ -975,20 +988,57 @@ class RobotCellOrchestratorNode(Node):
             for service_name, client in self._required_service_clients()
             if not client.service_is_ready()
         ]
+        missing_topics = []
+        if self.count_publishers(self.robot_status_topic) < 1:
+            missing_topics.append(self.robot_status_topic)
         if missing_names:
-            return TriggerResult(False, 'Required services unavailable: ' + ', '.join(missing_names))
-        return TriggerResult(True, f'All {len(self._required_service_clients())} services ready')
+            message = 'Required services unavailable: ' + ', '.join(missing_names)
+            if missing_topics:
+                message += '; required topics unavailable: ' + ', '.join(missing_topics)
+            return TriggerResult(False, message)
+        if missing_topics:
+            return TriggerResult(False, 'Required topics unavailable: ' + ', '.join(missing_topics))
+        return TriggerResult(
+            True,
+            f'All {len(self._required_service_clients())} services ready; robot status topic publishing',
+        )
 
     def service_readiness_map(self) -> dict[str, bool]:
         readiness = {
             service_name: bool(client.service_is_ready())
             for service_name, client in self._required_service_clients()
         }
+        readiness[NOMACHINE_SERVICE_DISPLAY] = self.nomachine_remote_access_ready()
         readiness[self.online_load_program_service] = True
         readiness[self.online_start_service] = True
         readiness[self.online_validate_service] = True
         readiness[self.online_place_service] = True
         return readiness
+
+    def nomachine_remote_access_ready(self) -> bool:
+        now = time.monotonic()
+        if now - self._nomachine_status_checked_at < NOMACHINE_STATUS_CACHE_SEC:
+            return self._nomachine_status_ready
+        self._nomachine_status_checked_at = now
+        nxserver = Path('/etc/NX/nxserver')
+        if not nxserver.exists():
+            self._nomachine_status_ready = False
+            return False
+        try:
+            result = subprocess.run(
+                [str(nxserver), '--status'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.5,
+                check=False,
+            )
+            self._nomachine_status_ready = result.returncode == 0
+        except Exception:
+            self._nomachine_status_ready = False
+        return self._nomachine_status_ready
+
+    def invalidate_nomachine_remote_access_status(self) -> None:
+        self._nomachine_status_checked_at = 0.0
 
     def _cache_startup_service_result(self, result: TriggerResult) -> None:
         with self._startup_service_lock:
@@ -1018,67 +1068,76 @@ class RobotCellOrchestratorNode(Node):
     def _require_startup_services(self) -> TriggerResult:
         return self.check_trigger_services_now()
 
-    def robot_joint_snapshot(self) -> tuple[float, float, float, float, float, float] | None:
-        with self._joint_condition:
-            return self._latest_joint_angles
+    def robot_mode_snapshot(self) -> int | None:
+        with self._robot_status_condition:
+            return self._latest_robot_mode
 
-    def wait_for_robot_stable(self, stop_event: threading.Event, stability_sec: float) -> TriggerResult:
+    def wait_for_robot_idle(self, stop_event: threading.Event, stability_sec: float) -> TriggerResult:
         stability_sec = max(0.0, float(stability_sec))
-        deadline = time.monotonic() + ROBOT_MONITOR_TIMEOUT_SEC
-        stable_anchor_joints: tuple[float, float, float, float, float, float] | None = None
-        stable_since: float | None = None
-        stable_elapsed = 0.0
-        last_seq = -1
-        last_joint_delta = 0.0
-        with self._joint_condition:
+        started = time.monotonic()
+        deadline = started + ROBOT_MONITOR_TIMEOUT_SEC
+        idle_since: float | None = None
+        idle_elapsed = 0.0
+        saw_active_motion = False
+        last_mode: int | None = None
+
+        with self._robot_status_condition:
             while rclpy.ok():
                 now = time.monotonic()
-                if (
-                    self._latest_joint_angles is not None and
-                    (now - self._last_joint_receive_time) <= ROBOT_JOINT_STALE_SEC
-                ):
-                    if stable_anchor_joints is None:
-                        stable_anchor_joints = self._latest_joint_angles
-                        stable_since = self._last_joint_receive_time
-                        last_seq = self._joint_seq
-                    elif self._joint_seq != last_seq:
-                        joint_delta = self._joint_delta_deg(self._latest_joint_angles, stable_anchor_joints)
-                        last_joint_delta = joint_delta
-                        if joint_delta > ROBOT_JOINT_MOVE_EPS_DEG:
-                            stable_anchor_joints = self._latest_joint_angles
-                            stable_since = self._last_joint_receive_time
-                            last_joint_delta = 0.0
-                        last_seq = self._joint_seq
+                status_age = now - self._last_robot_status_receive_time
+                fresh_status = (
+                    self._latest_robot_mode is not None and
+                    self._last_robot_status_receive_time >= started and
+                    status_age <= ROBOT_STATUS_STALE_SEC
+                )
 
-                    if stable_since is not None:
-                        stable_elapsed = max(0.0, self._last_joint_receive_time - stable_since)
-                    if stable_since is not None and stable_elapsed >= stability_sec:
-                        return TriggerResult(
-                            True,
-                            'Robot joints stable for '
-                            f'{stable_elapsed:.2f}s from {self.robot_joint_service} '
-                            f'(window max joint delta {last_joint_delta:.2f}deg)',
-                        )
+                if fresh_status:
+                    last_mode = self._latest_robot_mode
+                    if not self._latest_robot_connected:
+                        return TriggerResult(False, f'Robot status reports disconnected on {self.robot_status_topic}')
+                    if last_mode in ROBOT_MODE_FAILURE_CODES:
+                        return TriggerResult(False, f'Robot mode {last_mode} while waiting for idle')
+                    if last_mode in ROBOT_MODE_ACTIVE_CODES:
+                        saw_active_motion = True
+                        idle_since = None
+                        idle_elapsed = 0.0
+                    elif self._latest_robot_idle:
+                        if saw_active_motion or (now - started) >= 1.0:
+                            if idle_since is None:
+                                idle_since = self._last_robot_status_receive_time
+                            idle_elapsed = max(0.0, self._last_robot_status_receive_time - idle_since)
+                            if idle_elapsed >= stability_sec:
+                                return TriggerResult(
+                                    True,
+                                    'Robot idle for '
+                                    f'{idle_elapsed:.2f}s from {self.robot_status_topic} '
+                                    f'(mode {last_mode})',
+                                )
+                        else:
+                            idle_since = None
+                            idle_elapsed = 0.0
+                    else:
+                        idle_since = None
+                        idle_elapsed = 0.0
+
                 if stop_event.is_set():
-                    return TriggerResult(False, 'Stopped while monitoring robot stability')
+                    return TriggerResult(False, 'Stopped while monitoring robot idle status')
                 if now >= deadline:
-                    if self._latest_joint_angles is None:
-                        return TriggerResult(False, f'No joint feedback received from {self.robot_joint_service}')
-                    joint_age = now - self._last_joint_receive_time
-                    if joint_age > ROBOT_JOINT_STALE_SEC:
+                    if self._latest_robot_mode is None:
+                        return TriggerResult(False, f'No robot status received on {self.robot_status_topic}')
+                    if status_age > ROBOT_STATUS_STALE_SEC:
                         return TriggerResult(
                             False,
-                            f'Joint feedback stale from {self.robot_joint_service}: last update {joint_age:.2f}s ago',
+                            f'Robot status stale on {self.robot_status_topic}: last update {status_age:.2f}s ago',
                         )
                     return TriggerResult(
                         False,
-                        'Robot did not become stable within '
+                        'Robot did not report idle within '
                         f'{ROBOT_MONITOR_TIMEOUT_SEC:.1f}s '
-                        f'(stable time {stable_elapsed:.2f}/{stability_sec:.2f}s, '
-                        f'window max joint delta {last_joint_delta:.2f}deg)',
+                        f'(idle time {idle_elapsed:.2f}/{stability_sec:.2f}s, last mode {last_mode})',
                     )
-                self._joint_condition.wait(timeout=0.1)
-        return TriggerResult(False, f'ROS shutdown while monitoring {self.robot_joint_service}')
+                self._robot_status_condition.wait(timeout=0.1)
+        return TriggerResult(False, f'ROS shutdown while monitoring {self.robot_status_topic}')
 
     def click_trigger(self, client_key: str, wait_response_sec: float | None = None) -> TriggerResult:
         service_name, client = self._trigger_clients[client_key]
@@ -1237,90 +1296,17 @@ class RobotCellOrchestratorNode(Node):
             return SeekStatusResult(False, False, f'{service_name} returned no response')
         return SeekStatusResult(True, bool(response.success), f'{service_name}: {response.message}')
 
-    def _update_joint_angle_cache(self, joints: tuple[float, float, float, float, float, float]) -> None:
+    def _robot_status_callback(self, msg: RobotStatus) -> None:
         now = time.monotonic()
-        with self._joint_condition:
-            self._joint_seq += 1
-            self._latest_joint_angles = joints
-            self._last_joint_receive_time = now
-            self._joint_condition.notify_all()
-
-    def _poll_joint_angles(self) -> None:
-        if self._joint_angle_request_in_flight:
-            return
-        if not self._get_angle_client.service_is_ready():
-            if not self._joint_angle_warning_logged:
-                self.get_logger().warning(f'Joint angle service is not ready: {self.robot_joint_service}')
-                self._joint_angle_warning_logged = True
-            return
-
-        self._joint_angle_request_in_flight = True
-        future = self._get_angle_client.call_async(GetAngle.Request())
-        future.add_done_callback(self._handle_joint_angle_response)
-
-    def _handle_joint_angle_response(self, future) -> None:
-        self._joint_angle_request_in_flight = False
-        try:
-            response = future.result()
-        except Exception as exc:
-            if not self._joint_angle_warning_logged:
-                self.get_logger().warning(f'GetAngle call failed while caching robot joints: {exc}')
-                self._joint_angle_warning_logged = True
-            return
-
-        if response is None or int(getattr(response, 'res', -1)) < 0:
-            if not self._joint_angle_warning_logged:
-                self.get_logger().warning(
-                    f'GetAngle failed while caching robot joints: '
-                    f'res={getattr(response, "res", None)}, '
-                    f'return={getattr(response, "robot_return", "")}'
-                )
-                self._joint_angle_warning_logged = True
-            return
-
-        values = self._parse_six_values_from_robot_return(getattr(response, 'robot_return', ''))
-        if values is None:
-            if not self._joint_angle_warning_logged:
-                self.get_logger().warning(
-                    f'Could not parse GetAngle reply while caching robot joints: '
-                    f'{getattr(response, "robot_return", "")}'
-                )
-                self._joint_angle_warning_logged = True
-            return
-
-        self._joint_angle_warning_logged = False
-        self._update_joint_angle_cache(values)
-
-    @staticmethod
-    def _parse_six_values_from_robot_return(
-        robot_return: object,
-    ) -> tuple[float, float, float, float, float, float] | None:
-        text = str(robot_return or '')
-        if not text:
-            return None
-        float_pattern = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
-        for content in re.findall(r'\{([^{}]+)\}', text):
-            values = [float(token) for token in re.findall(float_pattern, content)]
-            if len(values) == 6:
-                return tuple(values)  # type: ignore[return-value]
-        values = [float(token) for token in re.findall(float_pattern, text)]
-        if len(values) == 6:
-            return tuple(values)  # type: ignore[return-value]
-        return None
-
-    @staticmethod
-    def _joint_delta_deg(
-        lhs: tuple[float, float, float, float, float, float],
-        rhs: tuple[float, float, float, float, float, float],
-    ) -> float:
-        return max(
-            RobotCellOrchestratorNode._angle_delta_deg(left, right)
-            for left, right in zip(lhs, rhs)
-        )
-
-    @staticmethod
-    def _angle_delta_deg(lhs: float, rhs: float) -> float:
-        return abs((float(lhs) - float(rhs) + 180.0) % 360.0 - 180.0)
+        mode = int(getattr(msg, 'robot_mode', ROBOT_MODE_ENABLED if bool(msg.is_enable) else -1))
+        is_idle = bool(getattr(msg, 'is_idle', False)) or mode == ROBOT_MODE_ENABLED
+        with self._robot_status_condition:
+            self._robot_status_seq += 1
+            self._latest_robot_mode = mode
+            self._latest_robot_idle = is_idle
+            self._latest_robot_connected = bool(msg.is_connected)
+            self._last_robot_status_receive_time = now
+            self._robot_status_condition.notify_all()
 
 
 class RobotCellOrchestratorGui:
@@ -1372,6 +1358,9 @@ class RobotCellOrchestratorGui:
         self._cell_bridge_process_group: int | None = None
         self._cell_bridge_mode: str | None = None
         self._cell_bridge_button: tk.Button | None = None
+        self._nomachine_process: subprocess.Popen | None = None
+        self._nomachine_process_group: int | None = None
+        self._nomachine_auto_started = False
         self._robot_ip_entry: tk.Entry | None = None
         self._robot_ip_save_button: tk.Button | None = None
         self._robot_ip_reload_button: tk.Button | None = None
@@ -1428,6 +1417,7 @@ class RobotCellOrchestratorGui:
         self.root.after(CAMERA_VIEW_REFRESH_MS, self._periodic_camera_view_refresh)
         self.root.after(READINESS_SCAN_MS, self._periodic_readiness_scan)
         self.root.after(PROCESS_SCAN_MS, self._periodic_process_scan)
+        self.root.after(500, self._ensure_nomachine_remote_access)
 
     def _make_scrollable_side_panel(self, parent: tk.Widget) -> tuple[tk.Frame, tk.Frame]:
         container = tk.Frame(parent)
@@ -1493,10 +1483,6 @@ class RobotCellOrchestratorGui:
     @property
     def item_teach_dir(self) -> Path:
         return workspace_path('teach', 'item_teach')
-
-    @property
-    def item_detect_profile_dir(self) -> Path:
-        return workspace_path('teach', 'item_teach_yolo')
 
     @property
     def tray_teach_dir(self) -> Path:
@@ -1811,11 +1797,8 @@ class RobotCellOrchestratorGui:
         offline_tray_teach = lambda mode, headless: [f'profiles_dir:={self.tray_teach_dir}']
 
         def item_detect(mode: str, headless: bool) -> list[str]:
-            profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.item_detect_profile_dir
-            args = [
-                f'profiles_dir:={profiles_dir}',
-                f'model_root:={profiles_dir}',
-            ]
+            profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.item_teach_dir
+            args = [f'profiles_dir:={profiles_dir}']
             args.extend(self._selected_detect_profile_launch_args(TEACH_KIND_ITEM, mode))
             args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
             if headless:
@@ -1902,8 +1885,8 @@ class RobotCellOrchestratorGui:
             'item_pick': LaunchSpec('Item Pick', 'item_pick', 'item_pick.launch.py', item_pick, headless_label='Item Pick Headless'),
             'item_detect': LaunchSpec(
                 'Item Detect',
-                'item_perception_yolo',
-                'item_detect_yolo.launch.py',
+                'item_perception',
+                'item_detect.launch.py',
                 item_detect,
                 CALIBRATION_EYE_TO_HAND,
                 headless_label='Item Detect Headless',
@@ -2116,7 +2099,7 @@ class RobotCellOrchestratorGui:
         dropdown_frame.columnconfigure(1, weight=1)
         dropdown_frame.columnconfigure(2, weight=0)
         self._make_teach_picker_button(dropdown_frame, 'Bin', TEACH_KIND_BIN, self.bin_teach_var, self.bin_teach_dir, 0)
-        self._make_teach_picker_button(dropdown_frame, 'Item', TEACH_KIND_ITEM, self.item_teach_var, self.item_detect_profile_dir, 1)
+        self._make_teach_picker_button(dropdown_frame, 'Item', TEACH_KIND_ITEM, self.item_teach_var, self.item_teach_dir, 1)
         self._make_teach_picker_button(dropdown_frame, 'Tray', TEACH_KIND_TRAY, self.tray_teach_var, self.tray_teach_dir, 2)
 
         calibration_frame = tk.LabelFrame(right, text='Calibration Files', padx=10, pady=8)
@@ -2494,25 +2477,12 @@ class RobotCellOrchestratorGui:
         return scan
 
     def _teach_paths_by_kind(self, directory: Path, kind: str) -> list[Path]:
-        candidates = yaml_files_in(directory)
-        if kind == TEACH_KIND_ITEM:
-            try:
-                if directory.resolve() == self.item_detect_profile_dir.resolve():
-                    candidates = sorted(
-                        [
-                            candidate for candidate in directory.rglob('*')
-                            if candidate.is_file() and candidate.suffix in ('.yaml', '.yml')
-                        ],
-                        key=lambda candidate: str(candidate.relative_to(directory)).lower(),
-                    )
-            except Exception:
-                pass
-        return [path for path in candidates if classify_teach_yaml(path) == kind]
+        return [path for path in yaml_files_in(directory) if classify_teach_yaml(path) == kind]
 
     def _refresh_teach_buttons(self) -> None:
         self._teach_options = {
             TEACH_KIND_BIN: self._teach_paths_by_kind(self.bin_teach_dir, TEACH_KIND_BIN),
-            TEACH_KIND_ITEM: self._teach_paths_by_kind(self.item_detect_profile_dir, TEACH_KIND_ITEM),
+            TEACH_KIND_ITEM: self._teach_paths_by_kind(self.item_teach_dir, TEACH_KIND_ITEM),
             TEACH_KIND_TRAY: self._teach_paths_by_kind(self.tray_teach_dir, TEACH_KIND_TRAY),
         }
         self._ensure_teach_selection(TEACH_KIND_BIN, self.bin_teach_var)
@@ -2556,7 +2526,7 @@ class RobotCellOrchestratorGui:
             if not path.is_absolute():
                 path = {
                     TEACH_KIND_BIN: self.bin_teach_dir,
-                    TEACH_KIND_ITEM: self.item_detect_profile_dir,
+                    TEACH_KIND_ITEM: self.item_teach_dir,
                     TEACH_KIND_TRAY: self.tray_teach_dir,
                 }[kind] / path
             if path.exists() and path.is_file() and classify_teach_yaml(path) == kind:
@@ -2752,11 +2722,10 @@ class RobotCellOrchestratorGui:
         if error:
             return OnlineProgramLoadResult(False, error)
         item_path, error = self._resolve_requested_teach_file(
-            self.item_detect_profile_dir,
+            self.item_teach_dir,
             load.item_teach_file,
             TEACH_KIND_ITEM,
             'item',
-            recursive=True,
         )
         if error:
             return OnlineProgramLoadResult(False, error)
@@ -2935,6 +2904,17 @@ class RobotCellOrchestratorGui:
             if self._process_group_alive(pgid):
                 self._log(f'Cell External Bridge {mode_label} exited but child processes are still running; cleaning up')
                 self._stop_process(process, f'Cell External Bridge {mode_label}', pgid)
+        if self._nomachine_process is not None and self._nomachine_process.poll() is not None:
+            process = self._nomachine_process
+            pgid = self._nomachine_process_group
+            return_code = process.returncode
+            self._nomachine_process = None
+            self._nomachine_process_group = None
+            self.node.invalidate_nomachine_remote_access_status()
+            self._log(f'NoMachine Remote Access installer exited with code {return_code}')
+            if self._process_group_alive(pgid):
+                self._log('NoMachine Remote Access installer exited but child processes are still running; cleaning up')
+                self._stop_process(process, 'NoMachine Remote Access installer', pgid)
         self._refresh_status_views()
         self.root.after(PROCESS_SCAN_MS, self._periodic_process_scan)
 
@@ -3155,6 +3135,48 @@ class RobotCellOrchestratorGui:
             pass
         except Exception as exc:
             self._log(f'Failed to stop {label}: {exc}')
+
+    def _ensure_nomachine_remote_access(self) -> None:
+        if self._nomachine_auto_started:
+            return
+        self._nomachine_auto_started = True
+        self.node.invalidate_nomachine_remote_access_status()
+        if self.node.nomachine_remote_access_ready():
+            self._log('NoMachine Remote Access already ready')
+            self._refresh_status_views()
+            return
+        self._log('NoMachine Remote Access not ready; launching installer/startup automatically')
+        self._start_nomachine_remote_access()
+
+    def _is_nomachine_installer_running(self) -> bool:
+        return self._nomachine_process is not None and self._nomachine_process.poll() is None
+
+    def _start_nomachine_remote_access(self) -> bool:
+        script_path = workspace_root() / NOMACHINE_SERVICE_DISPLAY
+        if not script_path.exists():
+            message = f'NoMachine installer not found: {script_path}'
+            self._log(message)
+            messagebox.showerror('NoMachine Installer Missing', message, parent=self.root)
+            return False
+        env = os.environ.copy()
+        env['DOBOT_PICKN_PLACE_ROOT'] = str(workspace_root())
+        shell_command = (
+            f'cd {shlex.quote(str(workspace_root()))}; '
+            f'exec {shell_join(["bash", NOMACHINE_SERVICE_DISPLAY])}'
+        )
+        started = self._start_visible_terminal_process(
+            'NoMachine Remote Access',
+            shell_command,
+            env,
+        )
+        if started is None:
+            return False
+        process, pgid = started
+        self._nomachine_process = process
+        self._nomachine_process_group = pgid
+        self._log(f'Launched NoMachine Remote Access installer in terminal: {NOMACHINE_SERVICE_DISPLAY}')
+        self._refresh_status_views()
+        return True
 
     def _cell_bridge_clicked(self) -> None:
         if self._is_cell_bridge_running():
@@ -3661,20 +3683,20 @@ class RobotCellOrchestratorGui:
             return False
         if stability_sec is not None and stability_sec > 0.0:
             self._log(
-                f'[{cycle_index}] {arm_label}: armed; confirming robot stability '
+                f'[{cycle_index}] {arm_label}: armed; waiting for robot idle '
                 f'for {stability_sec:.1f}s before seek...'
             )
 
-            self._set_status(f'Cycle {cycle_index}: confirming robot stability before {seek_label}')
-            pre_seek_result = self.node.wait_for_robot_stable(self._stop_event, stability_sec)
+            self._set_status(f'Cycle {cycle_index}: waiting for robot idle before {seek_label}')
+            pre_seek_result = self.node.wait_for_robot_idle(self._stop_event, stability_sec)
             self._log(
                 f'[{cycle_index}] {seek_label}: '
-                f'{"STABLE" if pre_seek_result.success else "FAIL"} before seek - {pre_seek_result.message}'
+                f'{"IDLE" if pre_seek_result.success else "FAIL"} before seek - {pre_seek_result.message}'
             )
             if not pre_seek_result.success or self._stop_event.is_set():
                 if self._mode == MODE_ONLINE and (
                     'timed out' in pre_seek_result.message.lower()
-                    or 'did not become stable' in pre_seek_result.message.lower()
+                    or 'did not report idle' in pre_seek_result.message.lower()
                 ):
                     self.node.publish_phase_event(
                         'timeout',
@@ -3683,7 +3705,7 @@ class RobotCellOrchestratorGui:
                     )
                 return False
         else:
-            self._log(f'[{cycle_index}] {arm_label}: armed; skipping robot stability wait before {seek_label}.')
+            self._log(f'[{cycle_index}] {arm_label}: armed; skipping robot idle wait before {seek_label}.')
 
         if not self._click_step(cycle_index, seek_label, seek_client_key):
             return False

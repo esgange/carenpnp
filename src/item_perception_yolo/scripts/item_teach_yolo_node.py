@@ -15,10 +15,10 @@ import numpy as np
 import rclpy
 import torch
 import yaml
+from dobot_msgs_v4.srv import GetAngle
 from orbbec_camera_msgs.srv import SetInt32
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
 from sensor_msgs.msg import Image
 from std_srvs.srv import SetBool
 
@@ -159,6 +159,13 @@ def as_bool(value) -> bool:
     return bool(value)
 
 
+def normalize_service_root(root: object, fallback: str = "/dobot_bringup_ros2/srv") -> str:
+    value = str(root or "").strip()
+    while value.endswith("/") and len(value) > 1:
+        value = value[:-1]
+    return value or fallback
+
+
 def clamp_exposure_percent(percent: int) -> int:
     return max(EXPOSURE_PERCENT_MIN, min(EXPOSURE_PERCENT_MAX, int(percent)))
 
@@ -224,7 +231,9 @@ class ItemTeachYoloNode(Node):
         self.bridge = CvBridge()
 
         self.color_topic = self.declare_parameter("color_topic", BIN_CAMERA_COLOR_TOPIC).value
-        self.joint_states_topic = self.declare_parameter("joint_states_topic", "/joint_states_robot").value
+        self.motion_service_root = normalize_service_root(
+            self.declare_parameter("motion_service_root", "/dobot_bringup_ros2/srv").value)
+        self.get_angle_service_name = f"{self.motion_service_root}/GetAngle"
         self.item_name = str(self.declare_parameter("item_name", "").value).strip()
         self.bin_teach_dir = resolve_path(
             self.declare_parameter(
@@ -328,6 +337,12 @@ class ItemTeachYoloNode(Node):
         self.latest_header_stamp = ""
         self.latest_joint_positions_deg = [0.0] * 6
         self.has_joint_positions = False
+        self.teach_joints_source = ""
+        self.get_angle_request_in_flight = False
+        self.pending_teach_joint_snapshot_reason = ""
+        self.pending_teach_joint_snapshot_save = False
+        self.pending_teach_joint_snapshot_update_profile = False
+        self.get_angle_warning_logged = False
 
         self.bin_entries: List[BinEntry] = []
         self.active_bin_index = -1
@@ -416,13 +431,11 @@ class ItemTeachYoloNode(Node):
         self.refresh_video_recordings()
         self.save_session()
 
+        self.get_angle_client = self.create_client(GetAngle, self.get_angle_service_name)
         self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
-        self.joint_state_sub = self.create_subscription(
-            JointState,
-            self.joint_states_topic,
-            self.joint_state_callback,
-            10,
-        )
+        self.teach_joint_snapshot_timer = self.create_timer(
+            0.5, self.try_pending_teach_joint_snapshot)
+        self.request_teach_joint_snapshot("node start")
         self.create_camera_exposure_clients()
         self.camera_exposure_timer = self.create_timer(
             0.2, self.apply_pending_camera_exposure_settings)
@@ -755,6 +768,7 @@ class ItemTeachYoloNode(Node):
         self.write_dataset_yaml()
         self.status = f"Item name changed to {self.item_name}; new session created"
         self.save_session()
+        self.request_teach_joint_snapshot("new item teach")
 
     def write_dataset_yaml(self) -> None:
         class_name = self.item_name.strip() if self.has_item_name() else "unnamed_item"
@@ -813,7 +827,10 @@ class ItemTeachYoloNode(Node):
                 "color_exposure_max_us": self.color_exposure_max_us,
                 "depth_exposure_min_us": self.depth_exposure_min_us,
                 "depth_exposure_max_us": self.depth_exposure_max_us,
+                "motion_service_root": self.motion_service_root,
+                "get_angle_service": self.get_angle_service_name,
                 "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
+                "teach_joints_source": self.teach_joints_source,
                 "positive_prompt_count": len(self.positive_points),
                 "negative_prompt_count": len(self.negative_points),
             }
@@ -821,6 +838,133 @@ class ItemTeachYoloNode(Node):
         tmp_path = self.session_yaml_path.with_suffix(".tmp")
         tmp_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         tmp_path.replace(self.session_yaml_path)
+
+    def request_teach_joint_snapshot(
+        self,
+        reason: str,
+        save_on_success: bool = True,
+        update_profile_on_success: bool = True,
+    ) -> None:
+        self.pending_teach_joint_snapshot_reason = reason or "teach"
+        self.pending_teach_joint_snapshot_save = (
+            self.pending_teach_joint_snapshot_save or save_on_success)
+        self.pending_teach_joint_snapshot_update_profile = (
+            self.pending_teach_joint_snapshot_update_profile or update_profile_on_success)
+        self.try_pending_teach_joint_snapshot()
+
+    def try_pending_teach_joint_snapshot(self) -> None:
+        if not self.pending_teach_joint_snapshot_reason or self.get_angle_request_in_flight:
+            return
+        if not hasattr(self, "get_angle_client") or self.get_angle_client is None:
+            return
+        if not self.get_angle_client.service_is_ready():
+            if not self.get_angle_warning_logged:
+                self.get_logger().warn(
+                    f"Robot joint snapshot service not available: {self.get_angle_service_name}")
+                self.get_angle_warning_logged = True
+            return
+
+        reason = self.pending_teach_joint_snapshot_reason
+        save_on_success = self.pending_teach_joint_snapshot_save
+        update_profile_on_success = self.pending_teach_joint_snapshot_update_profile
+        self.pending_teach_joint_snapshot_reason = ""
+        self.pending_teach_joint_snapshot_save = False
+        self.pending_teach_joint_snapshot_update_profile = False
+        self.get_angle_request_in_flight = True
+        future = self.get_angle_client.call_async(GetAngle.Request())
+        future.add_done_callback(
+            lambda done_future: self.handle_teach_joint_snapshot_response(
+                done_future,
+                reason,
+                save_on_success,
+                update_profile_on_success,
+            )
+        )
+
+    def requeue_teach_joint_snapshot(
+        self,
+        reason: str,
+        save_on_success: bool,
+        update_profile_on_success: bool,
+    ) -> None:
+        self.pending_teach_joint_snapshot_reason = reason or "teach"
+        self.pending_teach_joint_snapshot_save = (
+            self.pending_teach_joint_snapshot_save or save_on_success)
+        self.pending_teach_joint_snapshot_update_profile = (
+            self.pending_teach_joint_snapshot_update_profile or update_profile_on_success)
+
+    def handle_teach_joint_snapshot_response(
+        self,
+        future,
+        reason: str,
+        save_on_success: bool,
+        update_profile_on_success: bool,
+    ) -> None:
+        self.get_angle_request_in_flight = False
+        try:
+            response = future.result()
+        except Exception as exc:
+            if not self.get_angle_warning_logged:
+                self.get_logger().warn(f"GetAngle call failed while saving teach joints: {exc}")
+                self.get_angle_warning_logged = True
+            self.requeue_teach_joint_snapshot(reason, save_on_success, update_profile_on_success)
+            return
+
+        if response is None or int(getattr(response, "res", -1)) < 0:
+            if not self.get_angle_warning_logged:
+                self.get_logger().warn(
+                    "GetAngle failed while saving teach joints: "
+                    f"res={getattr(response, 'res', None)}, "
+                    f"return={getattr(response, 'robot_return', '')}")
+                self.get_angle_warning_logged = True
+            self.requeue_teach_joint_snapshot(reason, save_on_success, update_profile_on_success)
+            return
+
+        joints_deg = self.parse_six_values_from_robot_return(
+            getattr(response, "robot_return", ""))
+        if joints_deg is None:
+            if not self.get_angle_warning_logged:
+                self.get_logger().warn(
+                    "Could not parse GetAngle reply while saving teach joints: "
+                    f"{getattr(response, 'robot_return', '')}")
+                self.get_angle_warning_logged = True
+            self.requeue_teach_joint_snapshot(reason, save_on_success, update_profile_on_success)
+            return
+
+        self.latest_joint_positions_deg = [float(value) for value in joints_deg]
+        self.has_joint_positions = True
+        self.teach_joints_source = "GetAngle"
+        self.get_angle_warning_logged = False
+        self.get_logger().info(
+            f"Saved YOLO teach joints from {self.get_angle_service_name} ({reason}): "
+            f"[{', '.join(f'{value:.3f}' for value in self.latest_joint_positions_deg)}]")
+
+        if save_on_success:
+            self.save_session()
+        if update_profile_on_success and self.final_model_dir:
+            try:
+                self.write_profile()
+            except Exception as exc:
+                self.get_logger().warn(f"Could not update YOLO teach profile joints: {exc}")
+        if reason != "node start":
+            self.status = f"Teach position saved from robot: {reason}"
+
+    @staticmethod
+    def parse_six_values_from_robot_return(
+        robot_return: object,
+    ) -> Optional[Tuple[float, float, float, float, float, float]]:
+        text = str(robot_return or "")
+        if not text:
+            return None
+        float_pattern = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+        for content in re.findall(r"\{([^{}]+)\}", text):
+            values = [float(token) for token in re.findall(float_pattern, content)]
+            if len(values) == 6:
+                return tuple(values)  # type: ignore[return-value]
+        values = [float(token) for token in re.findall(float_pattern, text)]
+        if len(values) == 6:
+            return tuple(values)  # type: ignore[return-value]
+        return None
 
     def reset_video_review_state(self, clear_prompts: bool = True) -> None:
         self.review_mode = False
@@ -880,7 +1024,11 @@ class ItemTeachYoloNode(Node):
             return False
         if str(recording.get("raw_image_file", "")).strip():
             return True
-        return frame_source in {"raw_camera_full_roi_pair", "raw_camera_roi_crop_pair"}
+        return frame_source in {
+            "raw_camera_full_roi_masked",
+            "raw_camera_full_roi_pair",
+            "raw_camera_roi_crop_pair",
+        }
 
     def recording_image_path_from_meta(self, recording_path: Path, recording: Dict) -> Optional[Path]:
         image_text = str(recording.get("image_file", "")).strip()
@@ -1567,7 +1715,6 @@ class ItemTeachYoloNode(Node):
         _, rect, _, full_roi_frame, _ = roi
         capture_path = self.unique_recording_dir()
         image_path = self.default_recording_image_path(capture_path)
-        raw_image_path = self.raw_capture_image_path(capture_path)
         now_text = _dt.datetime.now().isoformat(timespec="seconds")
         metadata = {
             "recording": {
@@ -1577,20 +1724,16 @@ class ItemTeachYoloNode(Node):
                 "bin_name": self.active_bin.bin_name if self.active_bin else "",
                 "bin_file": str(self.active_bin.path) if self.active_bin else "",
                 "image_file": image_path.name,
-                "raw_image_file": raw_image_path.name,
-                "frame_source": "raw_camera_full_roi_pair",
+                "frame_source": "raw_camera_full_roi_masked",
                 "mask_mode": "outside_roi_black",
                 "image_width": int(full_roi_frame.shape[1]),
                 "image_height": int(full_roi_frame.shape[0]),
-                "raw_width": int(frame.shape[1]),
-                "raw_height": int(frame.shape[0]),
                 "roi_crop_rect": list(rect),
                 "source_roi_crop_rect": list(rect),
                 "frame_count": 1,
                 "frames": [{
                     "index": 1,
                     "file": image_path.name,
-                    "raw_file": raw_image_path.name,
                     "captured_at": _dt.datetime.now().isoformat(timespec="milliseconds"),
                     "frame_view": "full_roi_masked",
                     "width": int(full_roi_frame.shape[1]),
@@ -1602,21 +1745,20 @@ class ItemTeachYoloNode(Node):
             }
         }
         try:
-            cv2.imwrite(str(image_path), full_roi_frame)
-            cv2.imwrite(str(raw_image_path), frame)
+            if not cv2.imwrite(str(image_path), full_roi_frame):
+                raise RuntimeError(f"cv2.imwrite returned false for {image_path}")
             metadata_path = self.recording_metadata_path(capture_path)
             tmp_path = metadata_path.with_suffix(".tmp")
             tmp_path.write_text(yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")
             tmp_path.replace(metadata_path)
             self.refresh_video_recordings()
             self.status = (
-                f"Captured ROI pair {full_roi_frame.shape[1]}x{full_roi_frame.shape[0]} "
-                f"masked + raw: {image_path.name}"
+                f"Captured ROI image {full_roi_frame.shape[1]}x{full_roi_frame.shape[0]}: "
+                f"{image_path.name}"
             )
             self.save_session()
         except Exception as exc:
             image_path.unlink(missing_ok=True)
-            raw_image_path.unlink(missing_ok=True)
             self.recording_metadata_path(capture_path).unlink(missing_ok=True)
             self.status = f"ROI capture failed: {exc}"
             self.get_logger().warn(self.status)
@@ -1968,12 +2110,20 @@ class ItemTeachYoloNode(Node):
     def review_previous_frame(self) -> None:
         if not self.review_mode:
             return
-        self.load_review_frame(self.review_frame_index - 1, clear_prompts=True)
+        frames = self.review_frame_records()
+        if not frames:
+            self.status = "Selected ROI image has no frames"
+            return
+        self.load_review_frame((self.review_frame_index - 1) % len(frames), clear_prompts=True)
 
     def review_next_frame(self) -> None:
         if not self.review_mode:
             return
-        self.load_review_frame(self.review_frame_index + 1, clear_prompts=True)
+        frames = self.review_frame_records()
+        if not frames:
+            self.status = "Selected ROI image has no frames"
+            return
+        self.load_review_frame((self.review_frame_index + 1) % len(frames), clear_prompts=True)
 
     def delete_current_review_frame(self) -> None:
         if not self.review_mode:
@@ -2373,8 +2523,10 @@ class ItemTeachYoloNode(Node):
             if isinstance(teach_joints, list) and len(teach_joints) >= 6:
                 self.latest_joint_positions_deg = [float(value) for value in teach_joints[:6]]
                 self.has_joint_positions = True
+                self.teach_joints_source = str(params.get("teach_joints_source", "saved_session"))
             else:
                 self.has_joint_positions = False
+                self.teach_joints_source = ""
             if "color_exposure_us" in params:
                 self.color_exposure_us = clamp_exposure_usec_or_auto(
                     int(params.get("color_exposure_us", self.color_exposure_us)),
@@ -2396,9 +2548,12 @@ class ItemTeachYoloNode(Node):
             self.reset_video_review_state(clear_prompts=True)
             self.write_dataset_yaml()
             self.save_session()
+            self.request_teach_joint_snapshot("loaded teach")
             self.refresh_saved_sessions()
             self.load_session_dropdown_open = False
-            self.status = f"Loaded session: {self.item_name or self.session_dir.name} | {self.sample_count_label()}"
+            self.status = (
+                f"Loaded session: {self.item_name or self.session_dir.name} | "
+                f"{self.sample_count_label()} | updating teach position")
         except Exception as exc:
             self.status = f"Load session failed: {exc}"
             self.get_logger().warn(self.status)
@@ -2522,34 +2677,6 @@ class ItemTeachYoloNode(Node):
         with self.lock:
             self.latest_bgr = bgr.copy()
             self.latest_header_stamp = f"{msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}"
-
-    def joint_state_callback(self, msg: JointState) -> None:
-        if not msg.position:
-            return
-        rad_to_deg = 57.29577951308232
-        joints_deg = [0.0] * 6
-        found = [False] * 6
-        joint_index = {
-            "joint1": 0,
-            "joint2": 1,
-            "joint3": 2,
-            "joint4": 3,
-            "joint5": 4,
-            "joint6": 5,
-        }
-        for i, name in enumerate(msg.name[:len(msg.position)]):
-            index = joint_index.get(name)
-            if index is not None:
-                joints_deg[index] = float(msg.position[i]) * rad_to_deg
-                found[index] = True
-        valid = all(found)
-        if not valid and len(msg.position) >= 6:
-            joints_deg = [float(value) * rad_to_deg for value in msg.position[:6]]
-            valid = True
-        if not valid:
-            return
-        self.latest_joint_positions_deg = joints_deg
-        self.has_joint_positions = True
 
     def select_bin(self, index: int) -> None:
         if self.recording_active:
@@ -3079,9 +3206,7 @@ class ItemTeachYoloNode(Node):
         from ultralytics import YOLO
 
         model_dir = self.unique_model_dir()
-        final_pt = model_dir / "best.pt"
         final_onnx = model_dir / "best.onnx"
-        shutil.copy2(best_path, final_pt)
 
         try:
             trained_model = YOLO(str(best_path))
@@ -3096,12 +3221,15 @@ class ItemTeachYoloNode(Node):
             exported_file = Path(str(exported))
             if exported_file.exists():
                 shutil.copy2(exported_file, final_onnx)
+            if not final_onnx.exists():
+                raise FileNotFoundError(f"YOLO ONNX export did not create {final_onnx}")
         except Exception as exc:
-            self.get_logger().warn(f"YOLO ONNX export failed; detect needs ONNX for CPU speed: {exc}")
+            shutil.rmtree(model_dir, ignore_errors=True)
+            raise RuntimeError(f"YOLO ONNX export failed; detect requires ONNX: {exc}") from exc
 
         self.final_model_dir = str(model_dir)
-        self.trained_model_path = str(final_pt)
-        self.trained_onnx_path = str(final_onnx) if final_onnx.exists() else ""
+        self.trained_model_path = ""
+        self.trained_onnx_path = str(final_onnx)
 
     def write_profile(self) -> None:
         if not self.final_model_dir:
@@ -3154,9 +3282,11 @@ class ItemTeachYoloNode(Node):
             "detection_mode": "yolo_depth",
             "depth_window_mm": 50,
             "align_item_z_axis_to_depth_plane": True,
-            "joint_states_topic": self.joint_states_topic,
+            "motion_service_root": self.motion_service_root,
+            "get_angle_service": self.get_angle_service_name,
             "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
             "has_teach_joints": self.has_joint_positions,
+            "teach_joints_source": self.teach_joints_source,
             "roi_points": [
                 int(round(value))
                 for point in (active_bin.roi_points if active_bin else [])

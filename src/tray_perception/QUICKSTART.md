@@ -97,7 +97,7 @@ ros2 service call /tray_detect/get_tray_dimensions dobot_msgs_v4/srv/GetTrayDime
 - No profile selected: use `Open Teach` to choose a tray teach YAML, or teach
   and save a profile first.
 - Missing calibration: pass `calibration_file:=/abs/path/to/file.yaml` or add a
-  valid YAML to `WORKSPACE_ROOT/calibration`.
+  valid exact-IP YAML to `WORKSPACE_ROOT/calibration`.
 - Overlay appears but no `tray_pose`: loosen area/depth tolerance or retune the
   tray ROI and thresholds.
 - Unstable output: re-teach the profile with a cleaner ROI and stronger edge or

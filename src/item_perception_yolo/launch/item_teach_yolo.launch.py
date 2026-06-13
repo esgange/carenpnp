@@ -69,7 +69,7 @@ def _ros_domain_action():
 def generate_launch_description():
     params_file = LaunchConfiguration("params_file")
     color_topic = LaunchConfiguration("color_topic")
-    joint_states_topic = LaunchConfiguration("joint_states_topic")
+    motion_service_root = LaunchConfiguration("motion_service_root")
     item_name = LaunchConfiguration("item_name")
     bin_teach_dir = LaunchConfiguration("bin_teach_dir")
     runtime_root = LaunchConfiguration("runtime_root")
@@ -106,7 +106,7 @@ def generate_launch_description():
             default_value=_repo_path("src", "item_perception_yolo", "config", "item_teach_yolo.yaml"),
         ),
         DeclareLaunchArgument("color_topic", default_value=BIN_CAMERA_COLOR_TOPIC),
-        DeclareLaunchArgument("joint_states_topic", default_value="/joint_states_robot"),
+        DeclareLaunchArgument("motion_service_root", default_value="/dobot_bringup_ros2/srv"),
         DeclareLaunchArgument("item_name", default_value=""),
         DeclareLaunchArgument("bin_teach_dir", default_value=_repo_path("teach", "bin_teach")),
         DeclareLaunchArgument(
@@ -163,7 +163,7 @@ def generate_launch_description():
                 params_file,
                 {
                     "color_topic": color_topic,
-                    "joint_states_topic": joint_states_topic,
+                    "motion_service_root": motion_service_root,
                     "item_name": item_name,
                     "bin_teach_dir": bin_teach_dir,
                     "runtime_root": runtime_root,

@@ -8,22 +8,22 @@ Cycle sequence:
 Readiness gate:
 
 - Create the service clients once when the node starts.
-- Scan calibration files, teach/runtime files, and service availability while
-  the GUI is open.
-- Re-check all required services at the start of every cycle; stop the cycle if
-  any required service is unavailable.
+- Scan calibration files, teach/runtime files, service availability, and the
+  robot status publisher while the GUI is open.
+- Re-check all required services and topics at the start of every cycle; stop
+  the cycle if any required interface is unavailable.
 
 1. `/item_detect/go_to_teach`
 2. `/item_pick/track`
 3. Verify `/item_pick/track_status` reports armed
-4. Monitor robot TCP feedback until it is stable
+4. Wait for `RobotStatus` to report controller idle
 5. `/item_detect/seek`
 6. Wait for `/item_detect/seek_status` to turn on, remain on through any
    `item_detect/repick` attempts, then turn off only after successful final Z-up
 7. `/tray_detect/go_to_teach`
 8. `/tray_intercept/start_sequence` with the orchestrator tray X/Y/RZ settings
 9. Verify `/tray_intercept/track_status` reports armed
-10. Monitor robot TCP feedback until it is stable
+10. Wait for `RobotStatus` to report controller idle
 11. `/tray_detect/seek`
 12. Wait for `/tray_detect/seek_status` to turn on, then off
 
@@ -36,20 +36,19 @@ for each detect node's Seek status to turn on after the seek command, then turn
 off again, so an old OFF state cannot be mistaken for completion. The detect
 node's configurable seek window controls each acquisition window; if no valid
 item is found, Item Detect starts another window while keeping Seek ON. The
-orchestrator caches robot joint angles from `/dobot_bringup_ros2/srv/GetAngle`
-through `motion_service_root`. After each arm/start call, the GUI verifies the
-corresponding armed-status service before waiting for joint stability and
-sending seek.
+orchestrator listens to `dobot_msgs_v4/msg/RobotStatus` and waits for controller
+idle after each arm/start call and armed-status acknowledgement before sending
+seek.
 
 Item Pick owns failed-suction repicks. The orchestrator does not restart the
 pick side between attempts; its existing Seek ON-to-OFF wait acts as the
 success gate and prevents placement after a failed pickup.
 
-The robot is treated as stable when all joints stay within 1 degree for the
-selected stability time. The stability timer is based on cached `GetAngle`
-update time, not a fixed number of frames. A 30 second internal watchdog
-prevents robot monitoring from hanging forever and logs the last observed joint
-delta when it cannot classify stability.
+The robot is treated as arrived when `RobotStatus.robot_mode` reports enabled
+idle (`5`) for the selected stability time. A fresh status sample after the
+arm/start acknowledgement is required, so an old idle state cannot complete the
+wait. A 30 second internal watchdog prevents robot monitoring from hanging
+forever and logs the last observed mode when it cannot classify arrival.
 
 ## Launch
 
@@ -119,9 +118,9 @@ ros2 run robot_cell_orchestrator robot_cell_orchestrator_gui
 ```
 
 `robot_cell_orchestrator_gui` arms `item_pick` and `tray_intercept`, then coordinates the
-shared `item_detect` and `tray_detect` seek services. Its joint stability monitor
-uses `/dobot_bringup_ros2/srv/GetAngle` by default; override
-`motion_service_root` if the DOBOT services are rooted somewhere else.
+shared `item_detect` and `tray_detect` seek services. Its robot-arrival monitor
+listens to `dobot_msgs_v4/msg/RobotStatus`; override `robot_status_topic` if
+the status stream is remapped.
 
 Robot Cell Orchestrator GUI runtime knobs and window size are saved in:
 
@@ -171,11 +170,11 @@ nodes are launched manually.
 
 ```text
 WORKSPACE_ROOT/teach/bin_teach
-WORKSPACE_ROOT/teach/item_teach_yolo
+WORKSPACE_ROOT/teach/item_teach
 WORKSPACE_ROOT/teach/tray_teach
 ```
 
-The offline dropdowns choose the bin, YOLO item, and tray teach files used for
+The offline dropdowns choose the bin, item, and tray teach files used for
 the manual cycle gate. When Robot Cell Orchestrator launches offline item/tray
 detect nodes, it passes the selected item/tray teach file as
 `selected_profile_path:=...`. It does not copy teach files or remember the

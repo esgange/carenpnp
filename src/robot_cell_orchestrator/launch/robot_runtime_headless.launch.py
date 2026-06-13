@@ -535,10 +535,9 @@ def _launch_setup(context, *args, **kwargs):
     if _flag(context, settings, workspace_root, 'launch_item_detect', 'launch.item_detect'):
         item_detect_camera_args = dict(item_camera_args)
         item_detect_camera_args.pop('camera_control_service_root', None)
-        actions.append(_include('item_perception_yolo', 'item_detect_yolo.launch.py', {
+        actions.append(_include('item_perception', 'item_detect.launch.py', {
             'params_file': _optional_setting(context, settings, workspace_root, 'item_detect_params_file', 'item_detect.params_file', path=True),
             'profiles_dir': item_profiles_dir,
-            'model_root': item_profiles_dir,
             'selected_profile_path': _selected_profile_path(
                 context,
                 settings,

@@ -2,7 +2,7 @@ schema_version: 1
 
 mode: online
 runtime_dir: runtime
-offline_item_profiles_dir: teach/item_teach_yolo
+offline_item_profiles_dir: teach/item_teach
 offline_tray_profiles_dir: teach/tray_teach
 
 profiles:
@@ -64,7 +64,7 @@ item_detect:
   calibration_parent_frame: base_link
   calibration_child_frame: bin_calibrated_camera_link
   camera_frame: ""
-  runtime_settings_file: config/item_perception_yolo/item_detect_yolo_runtime_settings.yaml
+  runtime_settings_file: config/item_perception/item_detect_runtime_settings.yaml
   selected_profile_export_file: config/item_perception/item_detect_selected_profile.txt
   pose_topic: bin_seek_pose
   pose_array_topic: bin_item_poses

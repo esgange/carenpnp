@@ -1,13 +1,14 @@
 {
-  "schema_version": 9,
+  "schema_version": 10,
   "tf_only_mode": false,
-  "auto_repick_on_failed_suction": false,
+  "auto_repick_on_failed_suction": true,
   "item_pose_wait_timeout_sec": 60.0,
   "ee_intercept_speed_mm_s": 350.0,
   "tray_intercept_x_offset_mm": 0.0,
   "tray_intercept_y_offset_mm": 0.0,
-  "item_standoff_z_mm": 100.0,
-  "approach_z_up_mm": 50.0,
+  "item_standoff_z_mm": 111.0,
+  "approach_z_up_mm": 80.0,
   "final_z_up_mm": 90.0,
-  "pick_motion_speed_percent": 10.0
+  "pick_motion_speed_percent": 7.0,
+  "suction_settle_sec": 0.1
 }

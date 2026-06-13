@@ -37,6 +37,13 @@ DOBOT_pickn_place/
   third_party/yolo/
 ```
 
+For full GUI remote desktop access to the robot/node PC, include `NoMachine/`.
+The repository copy can then run:
+
+```bash
+./NoMachine/remote_ready_ubuntu22.sh
+```
+
 Quick check from the workspace root:
 
 ```bash

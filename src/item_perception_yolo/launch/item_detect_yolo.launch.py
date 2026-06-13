@@ -139,49 +139,33 @@ def _sanitize_filename_token(value: str) -> str:
     return "".join(token).strip("_")
 
 
-def _looks_like_ip_token(token: str) -> bool:
-    return "." in token and all(ch.isdigit() or ch == "." for ch in token)
-
-
-def _classify_robot_file(path: Path, robot_ip_address: str) -> str:
+def _calibration_matches_robot_ip(path: Path, robot_ip_address: str) -> bool:
     ip_token = _sanitize_filename_token(robot_ip_address)
     if not ip_token:
-        return "legacy"
-    stem = path.stem
-    if stem.endswith(f"_{ip_token}"):
-        return "exact"
-    last_token = stem.rsplit("_", 1)[-1]
-    if _looks_like_ip_token(last_token):
-        return "different"
-    return "legacy"
+        return False
+    return path.stem.endswith(f"_{ip_token}")
 
 
 def _find_latest_calibration(calibration_dir: str, robot_ip_address: str = "") -> str:
     try:
+        robot_ip_address = str(robot_ip_address or "").strip()
+        if not robot_ip_address:
+            print("[item_detect_yolo.launch] Robot IP is not set; cannot auto-select an exact calibration file.")
+            return ""
         base = Path(calibration_dir).expanduser()
         if not base.exists() or not base.is_dir():
             return ""
         exact_files = []
-        legacy_files = []
         for path in base.iterdir():
             if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
                 continue
             name = path.name
             if name.startswith("axab_calibration_eyetohand_"):
-                classification = _classify_robot_file(path, robot_ip_address)
-                if classification == "exact":
+                if _calibration_matches_robot_ip(path, robot_ip_address):
                     exact_files.append(path)
-                elif classification == "legacy":
-                    legacy_files.append(path)
-        candidates = exact_files or legacy_files
-        if not candidates:
+        if not exact_files:
             return ""
-        latest = max(candidates, key=lambda p: p.stat().st_mtime)
-        if not exact_files and robot_ip_address:
-            print(
-                "[item_detect_yolo.launch] No eye-to-hand calibration tagged for robot IP "
-                f"{robot_ip_address}; using legacy unsuffixed file: {latest}"
-            )
+        latest = max(exact_files, key=lambda p: p.stat().st_mtime)
         return str(latest)
     except Exception as exc:
         print(f"[item_detect_yolo.launch] Failed to search calibrations in {calibration_dir}: {exc}")
@@ -279,11 +263,18 @@ def _launch_setup(context, *args, **kwargs):
             else:
                 selected_file = _find_latest_calibration(calibration_dir, robot_ip_address)
             if not selected_file:
-                msg = (
-                    "[item_detect_yolo.launch] No non-empty eye-to-hand calibration YAML "
-                    f"for robot IP {robot_ip_address or 'auto'} found in "
-                    f"{calibration_dir}. Provide one via calibration_file:=<path>."
-                )
+                if robot_ip_address:
+                    msg = (
+                        "[item_detect_yolo.launch] No non-empty eye-to-hand calibration YAML "
+                        f"tagged for robot IP {robot_ip_address} found in {calibration_dir}. "
+                        "Provide one via calibration_file:=<path>."
+                    )
+                else:
+                    msg = (
+                        "[item_detect_yolo.launch] No robot IP was resolved for calibration "
+                        "auto-selection. Provide robot_ip_address:=<ip> or "
+                        "calibration_file:=<path>."
+                    )
                 _show_missing_calibration_dialog(msg)
                 raise RuntimeError(msg)
         print(f"[item_detect_yolo.launch] Using calibration file: {selected_file}")

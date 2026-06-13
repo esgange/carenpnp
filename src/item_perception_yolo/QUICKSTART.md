@@ -22,7 +22,7 @@ ros2 launch platform_calibration platform_calibration.launch.py
 Then teach or update the bin:
 
 ```bash
-ros2 launch item_perception_yolo bin_teach.launch.py
+ros2 launch item_perception bin_teach.launch.py
 ```
 
 ## 3. Teach A YOLO Item
@@ -54,7 +54,6 @@ That folder contains the detector profile and final model files:
 
 ```text
 item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml
-best.pt
 best.onnx
 ```
 

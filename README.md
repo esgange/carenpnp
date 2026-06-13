@@ -101,6 +101,7 @@ Optional pieces are isolated:
 | --- | --- |
 | YOLO/SAM2 item teach/detect | `third_party/.venv`, `third_party/sam2`, `third_party/yolo`, `requirements.lock.txt` |
 | RabbitMQ external bridge | `cell_external_bridge` installed into `third_party/.venv` |
+| Full remote desktop access | `NoMachine/` helper scripts and bundled `amd64` installer |
 | Fully offline client PC | `third_party/debs`, `third_party/wheels`, `tools/deps/install_offline_deps.sh` |
 
 On an internet-connected staging machine, prepare the offline bundle with:
@@ -189,6 +190,11 @@ The orchestrator camera feeds are opened from the **Camera Views** section with
 **Open Camera Window**. The camera viewer stays in its own window so the main
 operator controls remain visible; clicking the button again brings the camera
 window to the front.
+
+NoMachine remote desktop setup is available from `NoMachine/`. Robot Cell
+Orchestrator checks it on startup and can launch the bootstrap helper when the
+service is missing; see [NoMachine/README.md](NoMachine/README.md) for manual
+install and connection details.
 
 `ROS_DOMAIN_ID` is normally inherited from the shell environment. Set it before
 launching if you need a non-default domain:
@@ -354,6 +360,8 @@ Keep source and generated data separate:
   `third_party/sam2`, and `third_party/yolo` are for offline transfer bundles.
   A plain git clone should be usable for source work, while a client-PC archive
   should include those ignored payloads.
+- `NoMachine/debs/` is an intentional station-access installer cache; update its
+  checksum file whenever the bundled installer changes.
 - Prefer package-level README files for operator details, because robot motion
   workflows are safer when the launch commands and IO assumptions stay close to
   the package that owns them.

@@ -21,6 +21,9 @@ source install/setup.bash
 | `ToolVectorActual.msg` | Actual TCP/tool pose feedback from the robot controller. |
 | `TrayVector.msg` | Tray pose, timing, velocity, and motion direction used by tray intercept. |
 
+`RobotStatus.msg` includes controller connectivity, the raw DOBOT
+`robot_mode`, and `is_idle` for the normal enabled-idle mode (`5`).
+
 `TrayVector.msg` includes:
 
 - tray pose in millimeters and degrees;

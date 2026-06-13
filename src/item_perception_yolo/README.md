@@ -8,7 +8,6 @@ trains a YOLO11-seg model, exports an ONNX model, and runs the YOLO detector.
 
 | Node | Purpose |
 | --- | --- |
-| `bin_teach` | ArUco-assisted bin-frame teaching utility used to provide the ROI and depth plane for YOLO teach. |
 | `item_teach_yolo_node.py` | SAM2 prompt-based teach UI that saves YOLO11 segmentation samples and trains a YOLO11-seg model. |
 | `item_detect_yolo_node.py` | Runtime YOLO11 segmentation detector. It loads ONNX profiles, runs ROI-crop inference on CPU, and publishes item pose outputs/services. |
 
@@ -34,10 +33,10 @@ python -c "import torch, torchvision, ultralytics, onnxruntime, sam2"
 
 ## Launch
 
-Teach or update a bin ROI first:
+Teach or update a bin ROI first with the classic item perception package:
 
 ```bash
-ros2 launch item_perception_yolo bin_teach.launch.py
+ros2 launch item_perception bin_teach.launch.py
 ```
 
 Teach YOLO11 segmentation samples with SAM2 prompts:
@@ -69,13 +68,12 @@ ros2 launch item_perception_yolo item_detect_yolo.launch.py
 ```
 
 YOLO detection uses the fixed `/bin_camera`, so calibration auto-discovery
-selects the newest eye-to-hand file for the current robot IP. A legacy
-unsuffixed eye-to-hand file is used only when no exact-IP file exists. Override
-the selection with `calibration_file:=/abs/path/to/calibration.yaml`.
+selects the newest eye-to-hand file tagged for the current robot IP. If no
+exact-IP calibration file exists, launch fails and prompts for an explicit file.
+Override the selection with `calibration_file:=/abs/path/to/calibration.yaml`.
 For the shared/default robot IP `192.168.200.1`, automatic selection is disabled
 and launch asks the operator to choose an eye-to-hand file. Headless launches
-must pass `calibration_file` explicitly. YOLO bin teach applies the same rule to
-its camera calibration and platform calibration.
+must pass `calibration_file` explicitly.
 
 The YOLO detector keeps the external ROS node name `item_detect`, so existing
 topics/services such as `item_detect/seek`, `item_detect/repick`,
@@ -126,10 +124,10 @@ detect can still run the model on the full frame, but plane alignment and
 Important ROI terminology: in this package, "cropped ROI" means a full camera
 resolution image with pixels outside the selected bin ROI erased to black. It
 does not mean saving or reviewing a physically smaller image. `Capture ROI`
-saves the ROI-masked full-frame image plus a raw full-frame companion, and
-`Review Images` should show the ROI-masked image at the same resolution as the
-raw camera frame. The SAM2/YOLO annotation logic may use the ROI rectangle
-internally, but the review image stays full-frame with black outside the ROI.
+saves only the ROI-masked full-frame image. `Review Images` should show that
+ROI-masked image at the same resolution as the raw camera frame. The SAM2/YOLO
+annotation logic may use the ROI rectangle internally, but the review image stays
+full-frame with black outside the ROI.
 
 The teach UI saves samples from the selected bin ROI and blacks out pixels
 outside that ROI. It also saves the current six robot joint angles when
@@ -171,7 +169,7 @@ Bundle folders follow the item/bin/date naming standard:
 item_<item>[_bin_<bin>]_<ddmmyyyy>/
 ```
 
-Each bundle contains `best.pt`, `best.onnx`, and
+Each bundle contains `best.onnx` and
 `item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml`. The profile stores camera topics,
 ROI points, bin association, depth plane data from `bin_teach`, model paths,
 training metadata, item/background sample counts, and teach joints.

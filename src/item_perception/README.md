@@ -116,14 +116,15 @@ starts another window and also keeps Seek ON.
 Both nodes default to the current eye-to-hand calibration workflow.
 
 - Calibration files are discovered from `WORKSPACE_ROOT/calibration` unless
-  `calibration_file` is provided.
+  `calibration_file` is provided. Auto-discovery requires a non-empty file tagged
+  for the current robot IP.
 - For robot IP `192.168.200.1`, launch requires operator selection instead of
   choosing the newest file.
 - `item_teach` and `item_detect` publish the static calibration transform in-node
   when calibration is enabled.
 - Item poses are parented to `arm_calibrated_camera_link`.
-- If no usable calibration YAML is available and calibration is enabled, launch
-  fails early with a clear error.
+- If no exact-IP calibration YAML is available and calibration is enabled,
+  launch fails early with a clear error and prompts for an explicit file.
 
 ## Teach Workflow
 

@@ -51,14 +51,14 @@ def _ros_domain_action():
 def generate_launch_description():
     return LaunchDescription([
         _ros_domain_action(),
-        DeclareLaunchArgument('motion_service_root', default_value='/dobot_bringup_ros2/srv'),
+        DeclareLaunchArgument('robot_status_topic', default_value='dobot_msgs_v4/msg/RobotStatus'),
         Node(
             package='robot_cell_orchestrator',
             executable='robot_cell_orchestrator_gui',
             name='robot_cell_orchestrator_gui',
             output='screen',
             parameters=[{
-                'motion_service_root': LaunchConfiguration('motion_service_root'),
+                'robot_status_topic': LaunchConfiguration('robot_status_topic'),
             }],
             additional_env={
                 'PYTHONPATH': _robot_cell_orchestrator_pythonpath(),

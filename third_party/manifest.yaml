@@ -2232,10 +2232,6 @@ workspace:
     - ament_index_python
     - launch
     - launch_ros
-    src/item_perception_yolo/launch/bin_teach.launch.py:
-    - ament_index_python
-    - launch
-    - launch_ros
     src/item_perception_yolo/launch/item_detect_yolo.launch.py:
     - launch
     - launch_ros

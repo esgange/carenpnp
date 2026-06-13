@@ -126,6 +126,7 @@ public:
     void getJointState(double *point);
     bool isEnable() const;
     bool isConnected() const;
+    uint16_t getRobotMode() const;
     void getToolVectorActual(double *val);
 
 protected:
