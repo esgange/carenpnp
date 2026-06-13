@@ -2239,7 +2239,12 @@ class ItemTeachYoloNode(Node):
             return f" | loaded mask {stem}"
         return f" | {len(stems)} saved sample(s)"
 
-    def load_review_frame(self, index: int, clear_prompts: bool = True) -> None:
+    def load_review_frame(
+        self,
+        index: int,
+        clear_prompts: bool = True,
+        restore_saved_annotation: bool = True,
+    ) -> None:
         frames = self.review_frame_records()
         if not frames:
             self.status = "Selected ROI image has no frames"
@@ -2280,7 +2285,10 @@ class ItemTeachYoloNode(Node):
             self.current_mask = None
         self.sam2_image_key = None
         self.prediction_dirty = False
-        restored_annotation = self.load_saved_review_mask(frame) if clear_prompts else ""
+        restored_annotation = (
+            self.load_saved_review_mask(frame)
+            if clear_prompts and restore_saved_annotation else ""
+        )
         self.status = f"{self.review_status_label()}{restored_annotation}"
         self.save_session()
 
@@ -2395,7 +2403,11 @@ class ItemTeachYoloNode(Node):
         if not self.review_mode:
             self.status = "Open a ROI image review first"
             return
-        self.load_review_frame(self.review_frame_index, clear_prompts=True)
+        self.load_review_frame(
+            self.review_frame_index,
+            clear_prompts=True,
+            restore_saved_annotation=False,
+        )
         self.status = "Add positive/negative SAM2 prompts on this ROI frame"
 
     def request_review_sam2_annotation(self) -> None:
@@ -2432,7 +2444,11 @@ class ItemTeachYoloNode(Node):
 
     def reload_current_review_frame_after_save(self, status_text: str) -> None:
         if self.review_mode and self.review_frame_records():
-            self.load_review_frame(self.review_frame_index, clear_prompts=True)
+            self.load_review_frame(
+                self.review_frame_index,
+                clear_prompts=True,
+                restore_saved_annotation=False,
+            )
         self.status = status_text
         self.save_session()
 
